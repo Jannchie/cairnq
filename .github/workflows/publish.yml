@@ -1,0 +1,94 @@
+name: Publish
+
+# Publishes both SDKs to their public registries.
+#   - push a tag `vX.Y.Z`           -> real publish (version must match the tag)
+#   - run manually (workflow_dispatch) -> dry-run by default; untick to publish
+# Auth is OIDC trusted publishing — no tokens stored. One-time registry setup is
+# required (PyPI pending publisher + npm trusted publisher); see RELEASING.md.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and validate only — do not publish to the registry"
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC trusted publishing + provenance attestation
+      contents: read
+    defaults:
+      run:
+        working-directory: cairnq-node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: cairnq-node/pnpm-lock.yaml
+      # OIDC trusted publishing needs npm >= 11.5.1; node 22 still ships npm 10.
+      - run: npm install -g npm@latest
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm build
+      # tsc never copies .sql — vendor the protocol into dist/ AFTER the build so
+      # the runtime loader finds dist/_protocol next to the compiled module.
+      - run: node ../scripts/vendor-protocol.mjs
+      - name: Verify tag matches package version
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          [ "$tag" = "$pkg" ] || { echo "::error::tag $tag != package.json $pkg"; exit 1; }
+      - name: Publish to npm
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        run: npm publish --access public --provenance
+      - name: Dry run (pack only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: npm publish --dry-run --access public
+
+  pypi:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC trusted publishing
+      contents: read
+    defaults:
+      run:
+        working-directory: cairnq-py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: uv run pytest -q
+      # Vendor the protocol into cairnq/_protocol; hatchling force-includes it in
+      # the wheel (see [tool.hatch.build.targets.wheel].artifacts). Uses the
+      # runner's preinstalled Node to run the shared vendor script.
+      - run: node ../scripts/vendor-protocol.mjs
+      - run: uv build
+      - name: Verify tag matches package version
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(uv run python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          [ "$tag" = "$pkg" ] || { echo "::error::tag $tag != pyproject $pkg"; exit 1; }
+      - name: Publish to PyPI
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: cairnq-py/dist
