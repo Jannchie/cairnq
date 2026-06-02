@@ -6,9 +6,12 @@ tag.
 
 ## Cutting a release
 
-1. Bump the version in **both** packages (keep them identical):
-   - `cairnq-node/package.json` → `version`
-   - `cairnq-py/pyproject.toml` → `[project].version`
+1. Bump the shared version with one command (both packages stay identical):
+   ```bash
+   node scripts/bump-version.mjs minor     # or: major | patch | an explicit 1.2.3
+   ```
+   Run it with no argument anytime to print both versions and confirm they are
+   in sync — it exits non-zero on drift, so it also works as a CI guard.
 2. Commit, then tag and push:
    ```bash
    git commit -am "chore: release v0.2.0"
