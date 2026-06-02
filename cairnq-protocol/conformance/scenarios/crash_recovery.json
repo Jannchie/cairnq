@@ -1,0 +1,12 @@
+{
+  "name": "crash_recovery",
+  "description": "§32.6 — worker claims, does not heartbeat, lease expires, another worker reclaims",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 150 }, "save": "c1", "expect": { "length": 1 } },
+    { "op": "sleep", "args": { "ms": 300 } },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w2", "lease_ms": 5000 }, "save": "c2", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$c2.0.id", "equalsRef": "$t.id" },
+    { "op": "expect", "target": "$c2.0", "equals": { "status": "running", "worker_id": "w2", "attempt": 2 } }
+  ]
+}

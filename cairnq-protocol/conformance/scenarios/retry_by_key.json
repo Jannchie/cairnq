@@ -1,0 +1,11 @@
+{
+  "name": "retry_by_key",
+  "description": "retry_by_key re-enqueues the (terminal) task the key points at; reset_attempt zeroes the counter",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "K", "max_attempts": 1 }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$t.id", "worker_id": "w1", "error": { "code": "boom" }, "retryable": false }, "expect": { "equals": { "status": "failed" } } },
+    { "op": "retry_by_key", "args": { "key": "K", "reset_attempt": true }, "save": "r", "expect": { "equals": { "status": "queued", "attempt": 0 } } },
+    { "op": "expect", "target": "$r.id", "equalsRef": "$t.id" }
+  ]
+}

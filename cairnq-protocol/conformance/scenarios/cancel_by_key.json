@@ -1,0 +1,10 @@
+{
+  "name": "cancel_by_key",
+  "description": "cancel_by_key cancels the task the key currently points at (queued -> canceled immediately)",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "K" }, "save": "t" },
+    { "op": "cancel_by_key", "args": { "key": "K" }, "save": "c", "expect": { "equals": { "status": "canceled" } } },
+    { "op": "expect", "target": "$c.id", "equalsRef": "$t.id" },
+    { "op": "cancel_by_key", "args": { "key": "missing" }, "save": "none", "expect": { "isNull": ["id"] } }
+  ]
+}

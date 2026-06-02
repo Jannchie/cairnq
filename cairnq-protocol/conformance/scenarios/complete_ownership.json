@@ -1,0 +1,10 @@
+{
+  "name": "complete_ownership",
+  "description": "complete by a non-owning worker is rejected with LostLease — complete is ownership-checked like every other worker write (the normal finalize path, not just succeed)",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "complete", "args": { "id": "$t.id", "worker_id": "intruder", "result": {} }, "expectError": "LostLease" },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g", "expect": { "equals": { "status": "running", "worker_id": "w1" } } }
+  ]
+}

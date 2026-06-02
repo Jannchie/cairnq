@@ -1,0 +1,11 @@
+{
+  "name": "complete_success",
+  "description": "complete with no pending cancel finalizes as succeeded with the result",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "save": "c", "expect": { "length": 1 } },
+    { "op": "complete", "args": { "id": "$t.id", "worker_id": "w1", "result": { "ok": true } }, "save": "done", "expect": { "equals": { "status": "succeeded", "progress": 1.0 } } },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g" },
+    { "op": "expect", "target": "$g.result", "equals": { "ok": true } }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "basic_submit_get",
+  "description": "submit returns a queued task; get returns the same row",
+  "steps": [
+    { "op": "submit", "args": { "name": "echo", "payload": { "x": 1 } }, "save": "t", "expect": { "equals": { "status": "queued", "name": "echo" } } },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g" },
+    { "op": "expect", "target": "$g.id", "equalsRef": "$t.id" }
+  ]
+}

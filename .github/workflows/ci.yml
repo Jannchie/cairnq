@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # TypeScript SDK: typecheck + SQLite conformance/sdk/translator tests.
+  node:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cairnq-node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: cairnq-node/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  # Python SDK: SQLite conformance/store/client-worker/translator tests.
+  python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cairnq-py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: uv run pytest -q
+
+  # Cross-language end-to-end over one shared SQLite db (TS API <-> Py worker, both
+  # directions). run.mjs spawns the workers, so both SDKs must be installed.
+  cross-lang:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: pnpm install --frozen-lockfile
+        working-directory: cairnq-node
+      - run: uv sync --extra dev
+        working-directory: cairnq-py
+      - run: node conformance/cross-lang/run.mjs
+
+  # Live Postgres: spin up a real PG and run each SDK's live smoke against it.
+  # This is the only job that actually executes PostgresStore.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cairnq
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CAIRNQ_TEST_PG_DSN: postgresql://postgres:postgres@localhost:5432/cairnq
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: cairnq-node/pnpm-lock.yaml
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # node: `pg` is an optionalDependency, installed by default.
+      - run: pnpm install --frozen-lockfile
+        working-directory: cairnq-node
+      - run: pnpm exec vitest run test/postgres.live.test.ts
+        working-directory: cairnq-node
+      # python: asyncpg comes from the `postgres` extra.
+      - run: uv sync --extra dev --extra postgres
+        working-directory: cairnq-py
+      - run: uv run pytest tests/test_postgres_live.py -q
+        working-directory: cairnq-py

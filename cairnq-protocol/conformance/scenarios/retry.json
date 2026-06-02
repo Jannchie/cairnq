@@ -1,0 +1,10 @@
+{
+  "name": "retry",
+  "description": "§32.8 — fail retryable=true with attempt<max re-queues with run_at in future window",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "max_attempts": 3 }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "save": "c1", "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$t.id", "worker_id": "w1", "error": { "type": "E", "code": "e", "message": "boom", "retryable": true }, "retryable": true, "delay_ms": 0 }, "save": "f1", "expect": { "equals": { "status": "queued", "attempt": 1 } } },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g", "expect": { "equals": { "status": "queued" } } }
+  ]
+}

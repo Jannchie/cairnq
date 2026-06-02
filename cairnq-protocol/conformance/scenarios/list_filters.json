@@ -1,0 +1,14 @@
+{
+  "name": "list_filters",
+  "description": "list applies name / queue / correlation_id filters independently, each returning only the matching task",
+  "steps": [
+    { "op": "submit", "args": { "name": "alpha", "payload": {}, "queue": "q1", "correlation_id": "r1" }, "save": "a" },
+    { "op": "submit", "args": { "name": "beta", "payload": {}, "queue": "q2", "correlation_id": "r2" }, "save": "b" },
+    { "op": "list", "args": { "name": "alpha" }, "save": "byname", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$byname.0.id", "equalsRef": "$a.id" },
+    { "op": "list", "args": { "queue": "q2" }, "save": "byqueue", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$byqueue.0.id", "equalsRef": "$b.id" },
+    { "op": "list", "args": { "correlation_id": "r1" }, "save": "bycorr", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$bycorr.0.id", "equalsRef": "$a.id" }
+  ]
+}

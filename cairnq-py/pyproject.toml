@@ -1,0 +1,51 @@
+[project]
+name = "cairnq"
+version = "0.1.0"
+description = "SQLite-first, cross-language, storage-centered durable task runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jannchie", email = "jannchie@gmail.com" }]
+keywords = [
+    "sqlite",
+    "task-queue",
+    "job-queue",
+    "durable",
+    "task-runtime",
+    "worker",
+    "cross-language",
+    "aiosqlite",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Distributed Computing",
+    "Operating System :: OS Independent",
+]
+dependencies = ["aiosqlite>=0.19"]
+
+[project.urls]
+Homepage = "https://github.com/Jannchie/cairnq"
+Repository = "https://github.com/Jannchie/cairnq"
+Issues = "https://github.com/Jannchie/cairnq/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+postgres = ["asyncpg>=0.29"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cairnq"]
+# _protocol is vendored by scripts/vendor-protocol.mjs at publish time and is
+# gitignored; force-include it in the wheel when present.
+artifacts = ["cairnq/_protocol/**"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

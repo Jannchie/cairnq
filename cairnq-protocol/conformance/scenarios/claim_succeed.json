@@ -1,0 +1,13 @@
+{
+  "name": "claim_succeed",
+  "description": "worker happy path: claim -> progress -> succeed",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 2 } }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "save": "c", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$c.0.id", "equalsRef": "$t.id" },
+    { "op": "expect", "target": "$c.0", "equals": { "status": "running", "worker_id": "w1", "attempt": 1 } },
+    { "op": "progress", "args": { "id": "$t.id", "worker_id": "w1", "progress": 0.5, "message": "half" } },
+    { "op": "succeed", "args": { "id": "$t.id", "worker_id": "w1", "result": { "ok": true } } },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "done", "expect": { "equals": { "status": "succeeded", "progress": 1.0 } } }
+  ]
+}

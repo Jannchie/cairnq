@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, fields
+from typing import Any, Generic, Literal, TypeVar, get_args
+
+# TaskStatus is the canonical declaration within the Python SDK; STATUSES derives
+# from it (via get_args) so the type and the runtime set can't drift apart. The
+# cross-language source of truth is the status CHECK constraint in cairnq-protocol's
+# migration, which the conformance suite pins this set against.
+TaskStatus = Literal["queued", "running", "succeeded", "failed", "canceled"]
+STATUSES: tuple[TaskStatus, ...] = get_args(TaskStatus)
+
+_JSON_COLUMNS = ("payload", "result", "error", "metadata")
+TERMINAL: tuple[TaskStatus, ...] = ("succeeded", "failed", "canceled")
+
+P = TypeVar("P")
+R = TypeVar("R")
+
+
+@dataclass(frozen=True)
+class TaskDef(Generic[P, R]):
+    """A typed task handle. Define a task once and reference the same symbol from
+    the worker (`@worker.task(my_task)`) and the client (`tasks.call(my_task, …)`),
+    so the name lives in one place (no string drift), editors autocomplete it and
+    find every caller, and `call(my_task, …)` is typed as the task's result.
+
+    Opt-in: every API still accepts a plain name string, and cross-language callers
+    keep using the string (only the name crosses the DB). The P/R type params are
+    for the type checker only — nothing about them is stored or sent."""
+
+    name: str
+
+
+def task_name(task: "str | TaskDef[Any, Any]") -> str:
+    """Resolve a task name from either a plain string or a TaskDef."""
+    return task if isinstance(task, str) else task.name
+
+
+@dataclass
+class Task:
+    id: str
+    name: str
+    queue: str
+    status: TaskStatus
+    payload: dict[str, Any]
+    metadata: dict[str, Any]
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    progress: float | None = None
+    message: str | None = None
+    attempt: int = 0
+    max_attempts: int = 3
+    priority: int = 0
+    worker_id: str | None = None
+    lease_until_ms: int | None = None
+    run_at_ms: int = 0
+    cancel_requested_at_ms: int | None = None
+    parent_id: str | None = None
+    root_id: str | None = None
+    correlation_id: str | None = None
+    created_at_ms: int = 0
+    updated_at_ms: int = 0
+    completed_at_ms: int | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> "Task":
+        d = dict(row)
+        for col in _JSON_COLUMNS:
+            v = d.get(col)
+            # The driver decides a JSON column's wire form: SQLite (TEXT) hands
+            # back a str to parse; a jsonb-aware driver hands back a decoded
+            # object. Parse only a str — never assume one backend.
+            d[col] = json.loads(v) if isinstance(v, str) else v
+        return cls(**{k: v for k, v in d.items() if k in _TASK_FIELDS})
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self.cancel_requested_at_ms is not None
+
+    # Status predicates — read `if task.succeeded:` instead of memorizing the
+    # status strings. Each mirrors one value of TaskStatus.
+    @property
+    def queued(self) -> bool:
+        return self.status == "queued"
+
+    @property
+    def running(self) -> bool:
+        return self.status == "running"
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "succeeded"
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
+
+    @property
+    def canceled(self) -> bool:
+        return self.status == "canceled"
+
+
+# Field-name set used by from_row to drop unknown columns; computed once here
+# rather than re-introspecting the dataclass on every row mapped.
+_TASK_FIELDS = frozenset(f.name for f in fields(Task))

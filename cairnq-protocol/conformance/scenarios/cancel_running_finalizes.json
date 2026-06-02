@@ -1,0 +1,12 @@
+{
+  "name": "cancel_running_finalizes",
+  "description": "§32.10 cont. — a running task that was cancel-requested finalizes as 'canceled' (cancel wins, result discarded)",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "save": "c", "expect": { "length": 1 } },
+    { "op": "cancel", "args": { "id": "$t.id" }, "save": "cr", "expect": { "equals": { "status": "running" } } },
+    { "op": "complete", "args": { "id": "$t.id", "worker_id": "w1", "result": { "ok": true } }, "save": "done", "expect": { "equals": { "status": "canceled" } } },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g", "expect": { "equals": { "status": "canceled" } } },
+    { "op": "expect", "target": "$g", "isNull": ["result"] }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "json_roundtrip",
+  "description": "payload and result survive the storage round-trip unchanged: null, nested objects, arrays, empty containers, and non-ASCII text. Guards the JSON boundary on every backend (TEXT on sqlite, jsonb on postgres).",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": { "a": null, "nested": { "x": [1, 2, 3] }, "u": "café — 日本語 — ü", "empty": {}, "arr": [] } }, "save": "t" },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g" },
+    { "op": "expect", "target": "$g.payload", "equals": { "a": null, "nested": { "x": [1, 2, 3] }, "u": "café — 日本語 — ü", "empty": {}, "arr": [] } },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "succeed", "args": { "id": "$t.id", "worker_id": "w1", "result": { "out": [null, { "k": "ü" }], "n": 0 } } },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g2" },
+    { "op": "expect", "target": "$g2.result", "equals": { "out": [null, { "k": "ü" }], "n": 0 } }
+  ]
+}

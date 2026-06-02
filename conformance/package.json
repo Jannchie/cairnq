@@ -1,0 +1,12 @@
+{
+  "name": "cairnq-conformance",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "author": "Jannchie <jannchie@gmail.com>",
+  "type": "module",
+  "description": "Cross-language end-to-end orchestrator for CairnQ",
+  "scripts": {
+    "test:cross-lang": "node cross-lang/run.mjs"
+  }
+}

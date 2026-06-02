@@ -1,0 +1,8 @@
+{
+  "name": "key_reject",
+  "description": "§32.4 — second submit with conflict=reject raises AlreadyExists",
+  "steps": [
+    { "op": "submit", "args": { "name": "x", "payload": {}, "key": "A", "conflict": "reject" }, "save": "t1" },
+    { "op": "submit", "args": { "name": "x", "payload": {}, "key": "A", "conflict": "reject" }, "expectError": "AlreadyExists" }
+  ]
+}

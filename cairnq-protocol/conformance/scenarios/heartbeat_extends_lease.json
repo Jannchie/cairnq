@@ -1,0 +1,11 @@
+{
+  "name": "heartbeat_extends_lease",
+  "description": "heartbeat pushes lease_until_ms past the value set at claim, keeping the task owned. The sleep lets the clock advance so the new lease is strictly greater.",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "save": "c", "expect": { "length": 1 } },
+    { "op": "sleep", "args": { "ms": 10 } },
+    { "op": "heartbeat", "args": { "id": "$t.id", "worker_id": "w1", "lease_ms": 5000 }, "save": "h", "expect": { "equals": { "status": "running" } } },
+    { "op": "expect", "target": "$h.lease_until_ms", "greaterThanRef": "$c.0.lease_until_ms" }
+  ]
+}

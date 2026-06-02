@@ -1,0 +1,12 @@
+{
+  "name": "key_replace",
+  "description": "§32.5 — conflict=replace cancels old task, creates new, repoints key",
+  "steps": [
+    { "op": "submit", "args": { "name": "x", "payload": {}, "key": "A", "conflict": "replace" }, "save": "t1" },
+    { "op": "submit", "args": { "name": "x", "payload": {}, "key": "A", "conflict": "replace" }, "save": "t2" },
+    { "op": "expect", "target": "$t2.id", "notEqualsRef": "$t1.id" },
+    { "op": "get_by_key", "args": { "key": "A" }, "save": "cur" },
+    { "op": "expect", "target": "$cur.id", "equalsRef": "$t2.id" },
+    { "op": "get", "args": { "id": "$t1.id" }, "save": "old", "expect": { "equals": { "status": "canceled" } } }
+  ]
+}

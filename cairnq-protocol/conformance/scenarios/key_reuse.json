@@ -1,0 +1,9 @@
+{
+  "name": "key_reuse",
+  "description": "§32.3 — submit key=A conflict=reuse twice returns the same task",
+  "steps": [
+    { "op": "submit", "args": { "name": "image.generate", "payload": {}, "key": "A", "conflict": "reuse" }, "save": "t1", "expect": { "equals": { "status": "queued" } } },
+    { "op": "submit", "args": { "name": "image.generate", "payload": {}, "key": "A", "conflict": "reuse" }, "save": "t2" },
+    { "op": "expect", "target": "$t2.id", "equalsRef": "$t1.id" }
+  ]
+}

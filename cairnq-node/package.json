@@ -1,0 +1,57 @@
+{
+  "name": "cairnq",
+  "version": "0.1.0",
+  "description": "SQLite-first, cross-language, storage-centered durable task runtime",
+  "license": "MIT",
+  "author": "Jannchie <jannchie@gmail.com>",
+  "keywords": [
+    "sqlite",
+    "task-queue",
+    "job-queue",
+    "durable",
+    "task-runtime",
+    "worker",
+    "cross-language",
+    "better-sqlite3"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jannchie/cairnq.git",
+    "directory": "cairnq-node"
+  },
+  "homepage": "https://github.com/Jannchie/cairnq#readme",
+  "bugs": "https://github.com/Jannchie/cairnq/issues",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0"
+  },
+  "optionalDependencies": {
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.7.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+  }
+}
