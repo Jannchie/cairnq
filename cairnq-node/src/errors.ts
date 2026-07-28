@@ -17,7 +17,15 @@ export function errorEnvelope(e: {
   };
 }
 
-export class CairnQError extends Error {}
+export class CairnQError extends Error {
+  constructor(message?: string) {
+    super(message);
+    // Subclasses each set their own; without this a bare CairnQError reports
+    // "Error", and `err.name` is how callers (and the conformance runner) tell
+    // one apart from another.
+    this.name = "CairnQError";
+  }
+}
 
 export class AlreadyExists extends CairnQError {
   constructor(public key: string) {
