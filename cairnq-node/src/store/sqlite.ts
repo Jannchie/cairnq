@@ -21,6 +21,11 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/** Whether this path names an in-memory database rather than a file. */
+function isMemory(path: string): boolean {
+  return path === ":memory:" || path.includes("mode=memory");
+}
+
 /**
  * Serializes every SQLiteStore on one database file, process-wide.
  *
@@ -50,6 +55,10 @@ let memoryDbSeq = 0;
  * opening the same new database at once would otherwise get an instant "database
  * is locked". Retry briefly instead; the window is only as long as one other
  * opener's switch.
+ *
+ * Callers must skip in-memory databases: those report journal_mode = "memory" and
+ * can never be WAL, so waiting for one is waiting for something that will not
+ * happen.
  */
 function enableWal(db: DB): void {
   const deadline = Date.now() + WAL_RETRY_BUDGET_MS;
@@ -98,7 +107,7 @@ export class SQLiteStore extends TaskStore {
     this.statements = loadStatements("sqlite");
     // Two `:memory:` handles share a path but not a database, so they must not
     // share a lock either.
-    this.lockKey = path === ":memory:" ? `memory#${memoryDbSeq++}` : resolve(path);
+    this.lockKey = isMemory(path) ? `memory#${memoryDbSeq++}` : resolve(path);
   }
 
   async connect(): Promise<void> {
@@ -115,12 +124,15 @@ export class SQLiteStore extends TaskStore {
 
   private ensure(): DB {
     if (this.db) return this.db;
-    if (this.path !== ":memory:") mkdirSync(dirname(this.path), { recursive: true });
+    const memory = isMemory(this.path);
+    if (!memory) mkdirSync(dirname(this.path), { recursive: true });
     const db = new Database(this.path);
     // busy_timeout first, so every later statement waits out contention instead
     // of failing instantly.
     db.pragma(`busy_timeout = ${this.opts.busyTimeoutMs ?? 5000}`);
-    enableWal(db);
+    // WAL exists so several processes can share one file. An in-memory database
+    // is private to this connection, so there is nothing to share or wait for.
+    if (!memory) enableWal(db);
     db.pragma("foreign_keys = ON");
     this.applyMigrations(db);
     for (const [name, sql] of Object.entries(this.statements)) {

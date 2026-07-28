@@ -54,6 +54,11 @@ _WAL_RETRY_DELAY_S = 0.05
 _WAL_RETRY_BUDGET_S = 5.0
 
 
+def _is_memory(path: str) -> bool:
+    """Whether this path names an in-memory database rather than a file."""
+    return path == ":memory:" or "mode=memory" in path
+
+
 async def _enable_wal(conn: aiosqlite.Connection) -> None:
     """Put the database in WAL mode, waiting out a concurrent cold start.
 
@@ -64,6 +69,10 @@ async def _enable_wal(conn: aiosqlite.Connection) -> None:
     processes opening the same new database at once would otherwise get an
     instant "database is locked". Retry briefly instead; the window is only as
     long as one other opener's switch.
+
+    Callers must skip in-memory databases: those report journal_mode = "memory"
+    and can never be WAL, so waiting for one is waiting for something that will
+    not happen.
     """
     deadline = asyncio.get_running_loop().time() + _WAL_RETRY_BUDGET_S
     while True:
@@ -100,14 +109,19 @@ class SQLiteStore(TaskStore):
         async with self._init_lock:
             if self._conn is not None:
                 return
-            if self._path != ":memory:":
+            memory = _is_memory(self._path)
+            if not memory:
                 Path(self._path).parent.mkdir(parents=True, exist_ok=True)
             conn = await aiosqlite.connect(self._path, isolation_level=None)
             conn.row_factory = aiosqlite.Row
             # busy_timeout first, so every later statement waits out contention
             # instead of failing instantly.
             await conn.execute(f"pragma busy_timeout = {self._busy_timeout_ms}")
-            await _enable_wal(conn)
+            # WAL exists so several processes can share one file. An in-memory
+            # database is private to this connection, so there is nothing to
+            # share and nothing to wait for.
+            if not memory:
+                await _enable_wal(conn)
             await conn.execute("pragma foreign_keys = ON")
             await self._apply_migrations(conn)
             self._conn = conn
@@ -194,6 +208,11 @@ class SQLiteStore(TaskStore):
                 bound[name] = now - params["older_than_ms"]
             elif name == "queues":
                 bound[name] = json.dumps(list(params["queues"]))
+            elif name == "names":
+                # json_each needs a JSON array; null stays null so the SQL's
+                # `:names is null` arm means "no filter".
+                value = params["names"]
+                bound[name] = None if value is None else json.dumps(list(value))
             elif name in ("retryable", "reset_attempt"):
                 bound[name] = 1 if params[name] else 0
             else:

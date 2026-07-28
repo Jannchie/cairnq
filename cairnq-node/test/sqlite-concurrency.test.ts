@@ -37,4 +37,36 @@ describe("sqlite concurrency", () => {
       await b.close();
     }
   });
+
+  it("connects to an in-memory database", async () => {
+    // WAL is a property of an on-disk file; an in-memory database reports
+    // journal_mode = "memory" and can never become WAL. Waiting for it to turn
+    // WAL anyway burns the whole retry budget and then blames a lock that was
+    // never there.
+    const c = CairnQ.sqlite(":memory:");
+    await c.connect();
+    try {
+      const t = await c.submit("job", { n: 1 });
+      expect((await c.get(t.id))?.status).toBe("queued");
+    } finally {
+      await c.close();
+    }
+  });
+
+  it("keeps :memory: handles independent", async () => {
+    // Two :memory: databases share a path but not a database, so they must not
+    // share the file lock either — otherwise unrelated stores serialize forever.
+    const a = CairnQ.sqlite(":memory:");
+    const b = CairnQ.sqlite(":memory:");
+    await a.connect();
+    await b.connect();
+    try {
+      await Promise.all([a.submit("job", {}, { key: "k" }), b.submit("job", {}, { key: "k" })]);
+      expect(await a.getByKey("k")).not.toBeNull();
+      expect(await b.getByKey("k")).not.toBeNull();
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  });
 });
