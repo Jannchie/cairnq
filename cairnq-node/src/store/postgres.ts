@@ -27,6 +27,20 @@ async function loadPg(): Promise<typeof import("pg")> {
   return pg;
 }
 
+/**
+ * Roll back on the way out of a failed transaction, without letting the rollback
+ * become the error the caller sees. A dropped connection fails both the statement
+ * and the rollback, and it is the first one that says what went wrong.
+ */
+async function rollbackQuietly(client: PG.PoolClient): Promise<void> {
+  try {
+    await client.query("rollback");
+  } catch {
+    // Already rolled back, or the connection is gone. Either way the original
+    // error is the one worth propagating.
+  }
+}
+
 const translated = new Map<string, { text: string; order: readonly string[] }>();
 
 /**
@@ -166,7 +180,7 @@ export class PostgresStore extends TaskStore {
         }
         await client.query("commit");
       } catch (e) {
-        await client.query("rollback");
+        await rollbackQuietly(client);
         throw e;
       }
     }
@@ -208,7 +222,7 @@ export class PostgresStore extends TaskStore {
       await client.query("commit");
       return out;
     } catch (e) {
-      await client.query("rollback");
+      await rollbackQuietly(client);
       throw e;
     } finally {
       client.release();
