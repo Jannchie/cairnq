@@ -103,14 +103,21 @@ and a JSON protocol.
 - **Key conflict strategies**: `reuse` (idempotent submit), `reject`, `replace`.
 - **Lease-based claim** with heartbeat and automatic recovery — a crashed worker's
   task is redelivered after its lease expires.
-- **At-least-once execution** (honestly — see below). Retries with backoff,
-  `attempt` / `max_attempts`, queues, priority, progress, task chains
-  (`parent_id` / `root_id` / `correlation_id`).
+- **At-least-once execution** (honestly — see below). Retries with exponential
+  backoff (1s doubling to 30s by default), `attempt` / `max_attempts`, queues,
+  priority, progress, task chains (`parent_id` / `root_id` / `correlation_id`).
 - **Cooperative cancel**: cancelling a running task sets a flag; when the handler
-  returns after checking `ctx.canceled()`, the task finalizes as `canceled`
-  (the result is discarded — cancel wins). Cancelling a queued task is immediate.
+  returns after checking `ctx.canceled()`, the task finalizes as `canceled` (the
+  result is discarded — cancel wins). Cancelling a queued task is immediate. Cancel
+  outranks every other outcome: a cancelled task is never redelivered, even if its
+  attempt failed retryably or its worker crashed.
 - **Handler-controlled failure**: raise `TaskError(..., retryable=False)` to fail
   a task permanently; any other thrown error is retried up to `max_attempts`.
+- **Retention**: `purge` deletes terminal tasks past a cutoff — nothing else ever
+  removes rows, so call it on a schedule.
+- **Operational visibility**: an `on_error` / `onError` hook on the worker reports
+  what the run loop survived (a failed claim, a store write that blew up while
+  finalizing). Without it those are silent.
 
 ### At-least-once, not exactly-once
 
@@ -126,33 +133,39 @@ its state*, including a terminal `failed`/`canceled` one. To force a new run use
 
 ## Concurrency, limits & when *not* to use it
 
-- **Same host only.** SQLite (WAL) needs all processes on one machine and a local
-  disk — don't put the file on a network filesystem or share it across hosts.
-  Multi-host is a future Postgres backend (designed-for via the `TaskStore` seam,
-  not yet built).
-- **One writer at a time.** `claim` / `submit` / worker writes are short, but heavy
-  write concurrency serializes. Idle workers stay off the write lock (a read-only
-  probe gates each poll); busy ones still contend. This is built for low-write,
-  long-running AI work — not as a high-throughput message queue.
+- **Same host only, on SQLite.** WAL needs all processes on one machine and a local
+  disk — don't put the file on a network filesystem or share it across hosts. For
+  multi-host, switch the same code to Postgres: `CairnQ.postgres(dsn)` /
+  `Worker.postgres(dsn)`. Everything above the storage seam is identical, and both
+  backends run the same conformance suite.
+- **One writer at a time (SQLite).** `claim` / `submit` / worker writes are short,
+  but heavy write concurrency serializes. Idle workers stay off the write lock (a
+  read-only probe gates each poll); busy ones still contend. This is built for
+  low-write, long-running AI work — not as a high-throughput message queue.
+  Postgres has no such limit: it claims with `FOR UPDATE SKIP LOCKED`.
 - **A contended write can block the process.** The TypeScript SDK
   (`better-sqlite3`) is synchronous: on lock contention it blocks the event loop
   up to `busy_timeout` (5s default). Fine at low write rates.
+- **Nothing is deleted for you.** Terminal tasks accumulate until you call
+  `purge` — budget for a retention sweep on a long-lived database.
 - **Full trust on the file.** There is no in-database authorization — any process
   that can open the file has full access. Protect it with OS permissions.
 
 ## Layout
 
 ```
-cairnq-protocol/   schema + canonical SQLite SQL + conformance scenarios + PROTOCOL.md
-cairnq-py/         Python SDK (aiosqlite)
-cairnq-node/       TypeScript SDK (better-sqlite3)
+cairnq-protocol/   schema + canonical SQL (per dialect) + conformance scenarios + PROTOCOL.md
+cairnq-py/         Python SDK (aiosqlite / asyncpg)
+cairnq-node/       TypeScript SDK (better-sqlite3 / pg)
 conformance/       cross-language end-to-end orchestrator
 ```
 
-The protocol is the contract. `cairnq-protocol/sql/sqlite/*.sql` holds the
+The protocol is the contract. `cairnq-protocol/sql/<dialect>/*.sql` holds the
 **canonical state-transition statements**, loaded verbatim by both SDKs — that
-(plus a shared conformance suite) is how Python and TypeScript are kept from
-drifting. See [`cairnq-protocol/PROTOCOL.md`](cairnq-protocol/PROTOCOL.md).
+(plus a shared conformance suite both SDKs run against both dialects) is how four
+implementations are kept from drifting. Within each SDK, only the dialect layer
+differs: every operation is written once above the storage seam. See
+[`cairnq-protocol/PROTOCOL.md`](cairnq-protocol/PROTOCOL.md).
 
 ## Develop
 
@@ -167,4 +180,6 @@ cd cairnq-node && pnpm install && pnpm test
 cd conformance && pnpm test:cross-lang
 ```
 
-No database server to start — the runtime is the SQLite file.
+No database server to start — the runtime is the SQLite file. Set
+`CAIRNQ_TEST_PG_DSN` to additionally run both suites against a real Postgres
+(CI does this on every push).

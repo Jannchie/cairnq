@@ -62,5 +62,33 @@ const { summary } = await tasks.call(summarize, { text }); // typed result, no c
 
 Opt-in: every API still accepts a plain name string (cross-language callers use it).
 
+## Running it in production
+
+```ts
+const worker = Worker.sqlite("tasks.db", {
+  concurrency: 4,
+  retryBackoffMs: 1_000,   // doubles per attempt, capped by retryBackoffMaxMs (30s); 0 disables
+  onError: (err, info) => log.warn({ err, ...info }), // claims/writes the loop survived
+});
+
+// Nothing else deletes rows. Sweep terminal tasks on a schedule.
+await tasks.purge({ olderThanMs: 7 * 24 * 3600_000 });
+```
+
+A handler that does real side effects should bail out when it loses its lease —
+the task is already running on another worker and nothing it writes is recorded:
+
+```ts
+worker.task("long.job", async (ctx) => {
+  const res = await fetch(url, { signal: ctx.signal }); // aborts on lease loss
+  if (ctx.lostLease || (await ctx.canceled())) return;
+});
+```
+
+## Multi-host
+
+Same code, Postgres instead of the file — `CairnQ.postgres(dsn)` /
+`Worker.postgres(dsn)`. Requires the optional `pg` peer dependency (`npm i pg`).
+
 The protocol (schema + canonical SQL) lives in `../cairnq-protocol` and is shared
 verbatim with the Python SDK. See `../cairnq-protocol/PROTOCOL.md`.

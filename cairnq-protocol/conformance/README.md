@@ -1,9 +1,13 @@
 # CairnQ conformance scenarios
 
 Language-neutral behavior specs. Both SDKs ship a small interpreter that runs
-these **verbatim** against a fresh `tasks.db`, so Python and TypeScript are held
-to identical behavior. The shared `sql/sqlite/*.sql` pins the SQL; these pin the
-semantics layered on top (conflict branches, retry, lease recovery, cancel).
+these **verbatim**, so Python and TypeScript are held to identical behavior. The
+shared `sql/<dialect>/*.sql` pins the SQL; these pin the semantics layered on top
+(conflict branches, retry, lease recovery, cancel, retention).
+
+They are also **dialect-neutral**: each SDK runs the whole suite against a fresh
+`tasks.db`, and against Postgres too when `CAIRNQ_TEST_PG_DSN` is set (CI does).
+So a scenario constrains four implementations at once.
 
 ## Scenario shape
 
@@ -27,8 +31,9 @@ Any string argument of the form `$alias`, `$alias.field`, or `$alias.0.field`
 ## Ops
 
 Client-side: `submit`, `get`, `get_by_key`, `list`, `cancel`, `cancel_by_key`,
-`retry`, `retry_by_key`. Worker-side: `claim` (runs lease recovery then claim,
-like the worker loop; returns an array), `heartbeat`, `progress`, `succeed`,
+`retry`, `retry_by_key`, `purge` (`{ "older_than_ms": n, "limit": n }`; returns an
+array of deleted ids). Worker-side: `claim` (runs lease recovery then claim, like
+the worker loop; returns an array), `heartbeat`, `progress`, `succeed`,
 `complete`, `fail`. Control: `sleep` (`{ "ms": n }`), `expect`.
 
 `args` keys mirror the SDK call (e.g. `submit` takes `name`, `payload`, `key`,

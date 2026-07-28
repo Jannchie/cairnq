@@ -68,6 +68,15 @@ Need a dotted/namespaced name? Pass it explicitly: `@worker.task("summary.create
 automatic; you don't call `ctx.heartbeat()` unless a single step runs longer than
 the lease.
 
+`ctx.lostLease` / `ctx.lost_lease` (plus `ctx.signal`, an `AbortSignal`, in TS and
+`ctx.lease_lost`, an `asyncio.Event`, in Python) goes true when this worker's lease
+expired and another worker took the task over. Nothing you write after that is
+recorded and the task is running elsewhere — a handler doing real side effects
+should check it and return.
+
+`progress` treats null as "leave it alone": `progress(0.5)` keeps the previous
+message, `progress(null, "msg")` keeps the previous fraction.
+
 ## API side — submit and follow up
 
 ```python
@@ -98,7 +107,7 @@ if (got && isSucceeded(got)) use(got.result);   // also isFailed/isCanceled/isRu
 ```
 
 **Full surface** (by `task_id` or business `key`): `submit`, `get` / `getByKey`,
-`list`, `wait`, `call`, `cancel` / `cancelByKey`, `retry` / `retryByKey`.
+`list`, `wait`, `call`, `cancel` / `cancelByKey`, `retry` / `retryByKey`, `purge`.
 
 **`submit` options:** `key`, `queue` (default `"default"`), `conflict`
 (`"reuse"` | `"reject"` | `"replace"`, default `reuse`), `maxAttempts` (default 3),
@@ -121,11 +130,20 @@ if (got && isSucceeded(got)) use(got.result);   // also isFailed/isCanceled/isRu
 - **Cooperative cancel.** Cancelling a *queued* task is immediate. Cancelling a
   *running* one only sets a flag — the handler must `if await ctx.canceled(): return`.
   On return the task finalizes as `canceled` and **the result is discarded** (cancel
-  wins).
-- **Same host, one writer.** SQLite WAL needs all processes on one machine and a
-  local disk — never a network FS. Writes serialize; in TS (`better-sqlite3` is
+  wins). Cancel wins over *every* outcome: if the attempt instead throws, or the
+  worker dies and the lease expires, the task still ends `canceled` — never
+  redelivered.
+- **Nothing is deleted for you.** Terminal tasks stay forever until you call
+  `purge(olderThanMs=…)` / `purge(older_than_ms=…)`. Schedule it, or the database
+  grows without bound.
+- **Worker errors are silent unless you ask.** Pass `onError` / `on_error` to the
+  Worker to see what the run loop survived (a claim that threw, a store write that
+  failed while finalizing). Task *failures* go to the DB; these do not.
+- **Same host, one writer — on SQLite.** WAL needs all processes on one machine and
+  a local disk — never a network FS. Writes serialize; in TS (`better-sqlite3` is
   synchronous) a contended write blocks the event loop up to `busy_timeout` (5s).
-  Built for low-write, long-running AI jobs, not a high-throughput MQ.
+  Built for low-write, long-running AI jobs, not a high-throughput MQ. For
+  multi-host, use `CairnQ.postgres(dsn)` / `Worker.postgres(dsn)` — same API.
 - **No in-DB auth.** Any process that can open the file has full access — protect
   it with OS permissions.
 
