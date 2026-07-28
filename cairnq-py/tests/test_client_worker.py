@@ -46,7 +46,10 @@ async def test_worker_payload_signature(client, db_path):
 
 
 async def test_worker_retries_then_succeeds(client, db_path):
-    worker = Worker.sqlite(db_path, queues=["default"], poll_interval_ms=20, lease_ms=5000)
+    # retry_backoff_ms=0: this test is about the retry, not about waiting one out.
+    worker = Worker.sqlite(
+        db_path, queues=["default"], poll_interval_ms=20, lease_ms=5000, retry_backoff_ms=0
+    )
     seen = []
 
     @worker.task("flaky")

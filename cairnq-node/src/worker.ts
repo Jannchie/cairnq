@@ -11,12 +11,38 @@ export type Handler = (ctx: TaskContext, payload: any) => unknown | Promise<unkn
 /** Handler typed against a TaskDef<P, R>: payload is P, the return is R. */
 export type TypedHandler<P, R> = (ctx: TaskContext, payload: P) => R | Promise<R>;
 
+/** Where an error the worker recovered from came from. */
+export type ErrorPhase = "claim" | "execute";
+
 export interface WorkerOptions {
   concurrency?: number;
   leaseMs?: number;
   heartbeatIntervalMs?: number;
   pollIntervalMs?: number;
   claimBatch?: number;
+  /** Base delay before re-running a failed attempt; doubles per attempt. 0 disables. */
+  retryBackoffMs?: number;
+  /** Ceiling for the doubling. */
+  retryBackoffMaxMs?: number;
+  /**
+   * Called for errors the worker survived — a claim that threw, a store write
+   * that failed while finalizing a task. Without it these are silent: the run
+   * loop carries on either way, so this is the only place an operator learns a
+   * worker is limping. Must not throw.
+   */
+  onError?: (err: unknown, info: { phase: ErrorPhase; taskId?: string }) => void;
+}
+
+const DEFAULT_RETRY_BACKOFF_MS = 1_000;
+const DEFAULT_RETRY_BACKOFF_MAX_MS = 30_000;
+/** Wait after a failed claim, so a broken database is not polled in a tight loop. */
+const CLAIM_ERROR_BACKOFF_MS = 250;
+
+/** Exponential backoff for the next attempt of a task that just failed. */
+export function retryDelayMs(attempt: number, baseMs: number, maxMs: number): number {
+  if (baseMs <= 0) return 0;
+  const exponent = Math.max(0, attempt - 1);
+  return Math.min(maxMs, baseMs * 2 ** exponent);
 }
 
 function exceptionEnvelope(err: unknown): Record<string, unknown> {
@@ -33,7 +59,7 @@ export class Worker {
   private readonly handlers = new Map<string, Handler>();
   private readonly workerId = newId("worker");
   private stopped = false;
-  private stopResolvers: Array<() => void> = [];
+  private stopResolvers = new Set<() => void>();
   // True only when this worker created its own store (via Worker.sqlite); an
   // injected store may be shared, so serve()/background() must not close it.
   private ownsStore = false;
@@ -97,8 +123,8 @@ export class Worker {
 
   stop(): void {
     this.stopped = true;
-    const resolvers = this.stopResolvers;
-    this.stopResolvers = [];
+    const resolvers = [...this.stopResolvers];
+    this.stopResolvers.clear();
     for (const r of resolvers) r();
   }
 
@@ -114,6 +140,14 @@ export class Worker {
     if (this.ownsStore) await this.close();
   }
 
+  private report(err: unknown, info: { phase: ErrorPhase; taskId?: string }): void {
+    try {
+      this.opts.onError?.(err, info);
+    } catch {
+      // A reporting hook must never take the worker down with it.
+    }
+  }
+
   async run(opts: { concurrency?: number } = {}): Promise<void> {
     const concurrency = opts.concurrency ?? this.opts.concurrency ?? 1;
     const leaseMs = this.opts.leaseMs ?? 30_000;
@@ -125,15 +159,26 @@ export class Worker {
     while (!this.stopped) {
       const free = concurrency - running.size;
       if (free <= 0) {
-        await this.sleepOrStop(5);
+        // Wait for a slot rather than spinning. execute() never rejects, so
+        // racing these is safe.
+        await Promise.race([...running]);
         continue;
       }
-      const claimed = await this.store.claim({
-        queues: this.queues,
-        workerId: this.workerId,
-        leaseMs,
-        limit: Math.min(batch, free),
-      });
+      let claimed: Task[];
+      try {
+        claimed = await this.store.claim({
+          queues: this.queues,
+          workerId: this.workerId,
+          leaseMs,
+          limit: Math.min(batch, free),
+        });
+      } catch (err) {
+        // A claim can fail transiently (lock contention, a dropped connection).
+        // Report it and keep polling — one bad poll must not end the worker.
+        this.report(err, { phase: "claim" });
+        await this.sleepOrStop(CLAIM_ERROR_BACKOFF_MS);
+        continue;
+      }
       if (claimed.length === 0) {
         await this.sleepOrStop(pollMs);
         continue;
@@ -169,6 +214,11 @@ export class Worker {
     }
   }
 
+  /**
+   * Run one task to completion. Never rejects: a task-level failure is reported
+   * through onError and the loop moves on. (It used to reject into a promise
+   * nobody awaited — an unhandled rejection that took the process down.)
+   */
   private async execute(task: Task, leaseMs: number): Promise<void> {
     const ctx = new TaskContext(this.store, task, this.workerId, leaseMs);
     const hb = this.startHeartbeat(ctx, leaseMs);
@@ -176,7 +226,7 @@ export class Worker {
       const handler = this.handlers.get(task.name);
       if (!handler) {
         await this.safeFail(
-          task.id,
+          task,
           errorEnvelope({
             type: "NoHandler",
             code: "no_handler",
@@ -193,9 +243,9 @@ export class Worker {
       } catch (err) {
         if (err instanceof LostLease) return;
         if (err instanceof TaskError) {
-          await this.safeFail(task.id, err.envelope(), err.retryable);
+          await this.safeFail(task, err.envelope(), err.retryable);
         } else {
-          await this.safeFail(task.id, exceptionEnvelope(err), true);
+          await this.safeFail(task, exceptionEnvelope(err), true);
         }
         return;
       }
@@ -204,9 +254,14 @@ export class Worker {
         // requested while the handler ran, else succeeded.
         await this.store.complete({ taskId: task.id, workerId: this.workerId, result });
       } catch (err) {
-        if (err instanceof LostLease) return;
+        if (err instanceof LostLease) {
+          ctx.markLeaseLost();
+          return;
+        }
         throw err;
       }
+    } catch (err) {
+      this.report(err, { phase: "execute", taskId: task.id });
     } finally {
       hb.cancel();
       await hb.done;
@@ -236,7 +291,9 @@ export class Worker {
         try {
           await ctx.heartbeat();
         } catch (err) {
+          // ctx.heartbeat() already flagged the lease as lost for the handler.
           if (err instanceof LostLease) break;
+          this.report(err, { phase: "execute", taskId: ctx.taskId });
         }
       }
     })();
@@ -250,12 +307,25 @@ export class Worker {
   }
 
   private async safeFail(
-    taskId: string,
+    task: Task,
     envelope: Record<string, unknown>,
     retryable: boolean,
   ): Promise<void> {
+    const delayMs = retryable
+      ? retryDelayMs(
+          task.attempt,
+          this.opts.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS,
+          this.opts.retryBackoffMaxMs ?? DEFAULT_RETRY_BACKOFF_MAX_MS,
+        )
+      : 0;
     try {
-      await this.store.fail({ taskId, workerId: this.workerId, error: envelope, retryable });
+      await this.store.fail({
+        taskId: task.id,
+        workerId: this.workerId,
+        error: envelope,
+        retryable,
+        delayMs,
+      });
     } catch (err) {
       if (!(err instanceof LostLease)) throw err;
     }
@@ -269,10 +339,13 @@ export class Worker {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        // Drop the registration; otherwise every idle poll leaks one closure
+        // until stop() is finally called.
+        this.stopResolvers.delete(finish);
         resolve();
       };
       const timer = setTimeout(finish, ms);
-      this.stopResolvers.push(finish);
+      this.stopResolvers.add(finish);
     });
   }
 

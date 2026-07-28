@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import signal
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from ._ids import new_id
 from .context import TaskContext
@@ -14,6 +14,21 @@ from .store.base import TaskStore
 from .store.sqlite import SQLiteStore
 
 Handler = Callable[..., Any]
+# Where an error the worker recovered from came from.
+ErrorPhase = Literal["claim", "execute"]
+OnError = Callable[[BaseException, dict[str, Any]], None]
+
+DEFAULT_RETRY_BACKOFF_MS = 1_000
+DEFAULT_RETRY_BACKOFF_MAX_MS = 30_000
+# Wait after a failed claim, so a broken database is not polled in a tight loop.
+CLAIM_ERROR_BACKOFF_S = 0.25
+
+
+def retry_delay_ms(attempt: int, *, base_ms: int, max_ms: int) -> int:
+    """Exponential backoff for the next attempt of a task that just failed."""
+    if base_ms <= 0:
+        return 0
+    return min(max_ms, base_ms * 2 ** max(0, attempt - 1))
 
 
 def _exception_envelope(exc: BaseException) -> dict[str, Any]:
@@ -70,6 +85,9 @@ class Worker:
         heartbeat_interval_ms: int | None = None,
         poll_interval_ms: int = 500,
         claim_batch: int | None = None,
+        retry_backoff_ms: int = DEFAULT_RETRY_BACKOFF_MS,
+        retry_backoff_max_ms: int = DEFAULT_RETRY_BACKOFF_MAX_MS,
+        on_error: OnError | None = None,
     ):
         self._store = store
         self._queues = list(queues)
@@ -78,6 +96,13 @@ class Worker:
         self._hb_interval = heartbeat_interval_ms or max(1_000, lease_ms // 3)
         self._poll = poll_interval_ms
         self._batch = claim_batch
+        self._retry_backoff_ms = retry_backoff_ms
+        self._retry_backoff_max_ms = retry_backoff_max_ms
+        # Called for errors the worker survived — a claim that threw, a store
+        # write that failed while finalizing a task. Without it these are silent:
+        # the run loop carries on either way, so this is the only place an
+        # operator learns a worker is limping.
+        self._on_error = on_error
         # name -> (handler, wants_payload); the payload-arity decision is cached
         # here at registration so the worker hot path never re-inspects signatures.
         self._handlers: dict[str, tuple[Handler, bool]] = {}
@@ -178,6 +203,13 @@ class Worker:
 
         asyncio.run(_main())
 
+    def _report(self, exc: BaseException, **info: Any) -> None:
+        if self._on_error is None:
+            return
+        with contextlib.suppress(BaseException):
+            # A reporting hook must never take the worker down with it.
+            self._on_error(exc, info)
+
     # ----------------------------------------------------------------- run loop
     async def run(self, *, concurrency: int | None = None) -> None:
         if concurrency:
@@ -190,14 +222,24 @@ class Worker:
             while not self._stop.is_set():
                 free = self._concurrency - len(running)
                 if free <= 0:
-                    await self._sleep_or_stop(0.05)
+                    # Wait for a slot rather than polling for one. _execute never
+                    # raises, so waiting on it cannot surface an exception here.
+                    await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
                     continue
-                claimed = await self._store.claim(
-                    queues=self._queues,
-                    worker_id=self._worker_id,
-                    lease_ms=self._lease_ms,
-                    limit=min(batch, free),
-                )
+                try:
+                    claimed = await self._store.claim(
+                        queues=self._queues,
+                        worker_id=self._worker_id,
+                        lease_ms=self._lease_ms,
+                        limit=min(batch, free),
+                    )
+                except Exception as exc:
+                    # A claim can fail transiently (lock contention, a dropped
+                    # connection). Report it and keep polling — one bad poll must
+                    # not end the worker.
+                    self._report(exc, phase="claim")
+                    await self._sleep_or_stop(CLAIM_ERROR_BACKOFF_S)
+                    continue
                 if not claimed:
                     await self._sleep_or_stop(self._poll / 1000)
                     continue
@@ -210,13 +252,15 @@ class Worker:
                 await asyncio.gather(*running, return_exceptions=True)
 
     async def _execute(self, task: Task) -> None:
+        """Run one task to completion. Never raises: a task-level failure is
+        reported through on_error and the loop moves on."""
         ctx = TaskContext(self._store, task, self._worker_id, self._lease_ms)
         hb = asyncio.create_task(self._heartbeat_loop(ctx))
         try:
             entry = self._handlers.get(task.name)
             if entry is None:
                 await self._safe_fail(
-                    task.id,
+                    task,
                     error_envelope(
                         type="NoHandler",
                         code="no_handler",
@@ -232,10 +276,10 @@ class Worker:
             except LostLease:
                 return
             except TaskError as exc:  # handler chose how to fail
-                await self._safe_fail(task.id, exc.envelope(), retryable=exc.retryable)
+                await self._safe_fail(task, exc.envelope(), retryable=exc.retryable)
                 return
             except Exception as exc:  # any other handler error is retryable
-                await self._safe_fail(task.id, _exception_envelope(exc), retryable=True)
+                await self._safe_fail(task, _exception_envelope(exc), retryable=True)
                 return
             try:
                 # complete (not succeed): finalizes as canceled if a cancel was
@@ -244,7 +288,10 @@ class Worker:
                     task_id=task.id, worker_id=self._worker_id, result=result
                 )
             except LostLease:
+                ctx._mark_lease_lost()
                 return
+        except Exception as exc:
+            self._report(exc, phase="execute", task_id=task.id)
         finally:
             hb.cancel()
             with contextlib.suppress(BaseException):
@@ -257,15 +304,27 @@ class Worker:
                 try:
                     await ctx.heartbeat()
                 except LostLease:
+                    # ctx.heartbeat() already flagged the lease for the handler.
                     return
+                except Exception as exc:
+                    self._report(exc, phase="execute", task_id=ctx.task_id)
         except asyncio.CancelledError:
             return
 
-    async def _safe_fail(self, task_id: str, envelope: dict[str, Any], *, retryable: bool) -> None:
+    async def _safe_fail(self, task: Task, envelope: dict[str, Any], *, retryable: bool) -> None:
+        delay_ms = (
+            retry_delay_ms(
+                task.attempt,
+                base_ms=self._retry_backoff_ms,
+                max_ms=self._retry_backoff_max_ms,
+            )
+            if retryable
+            else 0
+        )
         try:
             await self._store.fail(
-                task_id=task_id, worker_id=self._worker_id, error=envelope,
-                retryable=retryable, delay_ms=0,
+                task_id=task.id, worker_id=self._worker_id, error=envelope,
+                retryable=retryable, delay_ms=delay_ms,
             )
         except LostLease:
             pass

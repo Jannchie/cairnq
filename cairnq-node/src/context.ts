@@ -1,3 +1,4 @@
+import { LostLease } from "./errors.js";
 import { cancelRequested, type Task } from "./models.js";
 import type { SubmitOptions } from "./client.js";
 import type { TaskStore } from "./store/base.js";
@@ -6,6 +7,12 @@ import { pollWait } from "./wait.js";
 
 /** Handed to a task handler. Worker-side capabilities mirror the Python SDK. */
 export class TaskContext {
+  private readonly abort = new AbortController();
+  private leaseLost = false;
+  // Cancellation is monotonic: once the DB has told us a cancel was requested it
+  // can't be taken back, so canceled() can answer from this without a re-read.
+  private cancelSeen = false;
+
   constructor(
     private readonly store: TaskStore,
     private readonly task: Task,
@@ -38,28 +45,72 @@ export class TaskContext {
     return this.task.payload;
   }
 
+  /**
+   * True once this worker has lost the task's lease — it expired and another
+   * worker reclaimed it. Nothing this handler writes will be recorded any more
+   * and the task is already running elsewhere, so a long handler should check
+   * this (or `signal`) and bail out instead of continuing to do side effects.
+   */
+  get lostLease(): boolean {
+    return this.leaseLost;
+  }
+
+  /** Aborts when the lease is lost. Pass it to fetch / any AbortSignal-aware API. */
+  get signal(): AbortSignal {
+    return this.abort.signal;
+  }
+
+  /** @internal Called by the worker when an owned write reports a lost lease. */
+  markLeaseLost(): void {
+    if (this.leaseLost) return;
+    this.leaseLost = true;
+    this.abort.abort(new LostLease(this.task.id));
+  }
+
+  // Every owned write returns the current row, so cancellation and lease loss
+  // ride along on writes the handler was making anyway.
+  private observe(task: Task): Task {
+    if (cancelRequested(task)) this.cancelSeen = true;
+    return task;
+  }
+
+  private async owned(write: () => Promise<Task>): Promise<Task> {
+    try {
+      return this.observe(await write());
+    } catch (err) {
+      if (err instanceof LostLease) this.markLeaseLost();
+      throw err;
+    }
+  }
+
   async progress(value: number | null, message: string | null = null): Promise<Task> {
-    return this.store.progress({
-      taskId: this.task.id,
-      workerId: this.workerId,
-      progress: value,
-      message,
-    });
+    return this.owned(() =>
+      this.store.progress({
+        taskId: this.task.id,
+        workerId: this.workerId,
+        progress: value,
+        message,
+      }),
+    );
   }
 
   async heartbeat(): Promise<Task> {
-    return this.store.heartbeat({
-      taskId: this.task.id,
-      workerId: this.workerId,
-      leaseMs: this.leaseMs,
-    });
+    return this.owned(() =>
+      this.store.heartbeat({
+        taskId: this.task.id,
+        workerId: this.workerId,
+        leaseMs: this.leaseMs,
+      }),
+    );
   }
 
-  /** Cooperative cancel check. */
+  /** Cooperative cancel check. Free once a heartbeat has already seen the flag. */
   async canceled(): Promise<boolean> {
+    if (this.cancelSeen) return true;
     const t = await this.store.get(this.task.id);
     if (!t) return true;
-    return cancelRequested(t) || t.status === "canceled";
+    if (cancelRequested(t)) this.cancelSeen = true;
+    return this.cancelSeen || t.status === "canceled";
   }
 
   /** Submit a child task; parent/root/correlation are wired automatically. */

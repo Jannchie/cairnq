@@ -58,7 +58,13 @@ describe("client/worker", () => {
   });
 
   it("retries a flaky handler then succeeds", async () => {
-    const worker = Worker.sqlite(dbPath, { queues: ["default"], pollIntervalMs: 20, leaseMs: 5000 });
+    // retryBackoffMs: 0 — this test is about the retry, not about waiting one out.
+    const worker = Worker.sqlite(dbPath, {
+      queues: ["default"],
+      pollIntervalMs: 20,
+      leaseMs: 5000,
+      retryBackoffMs: 0,
+    });
     const seen: number[] = [];
     worker.task("flaky", async (ctx) => {
       seen.push(ctx.attempt);
