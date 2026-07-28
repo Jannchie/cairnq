@@ -1,0 +1,11 @@
+{
+  "name": "progress_message_only_keeps_value",
+  "description": "progress(null, message) updates the message without wiping the recorded fraction — value and message are each coalesced, symmetrically",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "progress", "args": { "id": "$t.id", "worker_id": "w1", "progress": 0.5, "message": "reading" }, "expect": { "equals": { "progress": 0.5, "message": "reading" } } },
+    { "op": "progress", "args": { "id": "$t.id", "worker_id": "w1", "message": "writing" }, "expect": { "equals": { "progress": 0.5, "message": "writing" } } },
+    { "op": "progress", "args": { "id": "$t.id", "worker_id": "w1", "progress": 0.9 }, "expect": { "equals": { "progress": 0.9, "message": "writing" } } }
+  ]
+}
