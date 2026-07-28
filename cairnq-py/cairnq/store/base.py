@@ -1,16 +1,70 @@
-"""The storage seam. SQLiteStore is the only MVP implementation; PostgresStore /
-MemoryStore can slot in later behind this same interface. Users never touch a
-TaskStore directly — they use CairnQ / Worker / TaskContext."""
+"""The storage seam.
+
+A backend supplies three things: how to run one protocol statement, how to run
+several inside a transaction, and how its dialect binds parameters. Everything
+above that — the submit conflict branches, the *_by_key lookups, the recover-then-
+claim sequence, the ownership-checked writes — lives here once, because those are
+protocol decisions rather than storage decisions. Keeping them in one place is
+what stops SQLite and Postgres from drifting apart in behavior; the shared SQL
+already stops them from drifting in wording.
+
+Users never touch a TaskStore directly — they use CairnQ / Worker / TaskContext.
+"""
 
 from __future__ import annotations
 
+import json
+import re
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
+from functools import lru_cache
 from typing import Any
 
+from .._ids import new_id
+from ..errors import AlreadyExists, LostLease, error_envelope
 from ..models import Task
+
+# Runs one named protocol statement and returns its rows.
+Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
+
+LEASE_EXPIRED_ERROR_JSON = json.dumps(
+    error_envelope(
+        type="LeaseExpired",
+        code="lease_expired",
+        message="task lease expired and max attempts reached",
+        retryable=False,
+    )
+)
+
+# Strips SQL line comments, so a `:name` in a header comment isn't a parameter.
+COMMENT = re.compile(r"--[^\n]*")
+# A `:name` placeholder. The lookbehind spares Postgres `::type` casts.
+NAMED = re.compile(r"(?<!:):(\w+)")
+
+
+@lru_cache(maxsize=None)
+def statement_params(sql: str) -> tuple[str, ...]:
+    """The parameter names a statement binds, in first-appearance order.
+
+    Callers pass a superset of parameters and each dialect takes what its own SQL
+    asks for — that is what lets one call site serve both dialects even though
+    e.g. SQLite binds `:lease_until_ms` where Postgres binds `:lease_ms`. This is
+    the one place that decides what counts as a parameter; both dialects' binding
+    goes through it.
+
+    Memoized on the statement text, which is loaded once and never varies: every
+    dialect's binding path runs on each query, and re-scanning the SQL each time
+    would put a regex sweep on the worker's poll loop.
+    """
+    seen: dict[str, None] = {}
+    for match in NAMED.finditer(COMMENT.sub("", sql)):
+        seen.setdefault(match.group(1), None)
+    return tuple(seen)
 
 
 class TaskStore(ABC):
+    # ------------------------------------------------------------ dialect seam
     @abstractmethod
     async def connect(self) -> None: ...
 
@@ -20,8 +74,35 @@ class TaskStore(ABC):
     @abstractmethod
     async def protocol_version(self) -> int: ...
 
-    # --- client side ---
     @abstractmethod
+    async def _fetch(self, name: str, params: dict[str, Any]) -> list[Any]:
+        """Run one protocol statement outside a transaction, connecting if needed."""
+
+    @abstractmethod
+    def _transaction(self) -> AbstractAsyncContextManager[Fetch]:
+        """Run several statements atomically; yields a Fetch bound to the txn."""
+
+    async def _has_claimable_work(self, params: dict[str, Any]) -> bool:
+        """Whether it is worth opening the claim transaction at all. SQLite gates
+        its single write lock behind a read-only probe; Postgres readers don't
+        block writers, so it just says yes."""
+        return True
+
+    # --------------------------------------------------------------- internals
+    async def _owned_write(self, name: str, task_id: str, params: dict[str, Any]) -> Task:
+        """An ownership-checked worker write (heartbeat/progress/succeed/complete/
+        fail). Each statement's WHERE pins worker_id + a live lease, so 0 rows back
+        means the lease was lost — every such write reports it the same way."""
+        rows = await self._fetch(name, params)
+        if not rows:
+            raise LostLease(task_id)
+        return Task.from_row(rows[0])
+
+    @staticmethod
+    def _one(rows: list[Any]) -> Task | None:
+        return Task.from_row(rows[0]) if rows else None
+
+    # ------------------------------------------------------------- client side
     async def submit(
         self,
         *,
@@ -37,15 +118,47 @@ class TaskStore(ABC):
         root_id: str | None = None,
         correlation_id: str | None = None,
         run_at_delay_ms: int = 0,
-    ) -> Task: ...
+    ) -> Task:
+        task_id = new_id("task")
+        ins = {
+            "id": task_id,
+            "name": name,
+            "queue": queue,
+            "payload": json.dumps(payload if payload is not None else {}),
+            "metadata": json.dumps(metadata or {}),
+            "max_attempts": max_attempts,
+            "priority": priority,
+            "delay_ms": run_at_delay_ms,
+            "parent_id": parent_id,
+            "root_id": root_id or task_id,
+            "correlation_id": correlation_id,
+        }
+        if key is None:
+            return Task.from_row((await self._fetch("insert_task", ins))[0])
 
-    @abstractmethod
-    async def get(self, task_id: str) -> Task | None: ...
+        # A key makes submit a read-then-write, so it has to be one transaction:
+        # concurrent same-key submits must not both see "no existing task".
+        async with self._transaction() as fetch:
+            existing = await fetch("get_key", {"key": key})
+            if existing:
+                ex_id = existing[0]["task_id"]
+                if conflict == "reuse":
+                    return Task.from_row((await fetch("get", {"id": ex_id}))[0])
+                if conflict == "reject":
+                    raise AlreadyExists(key)
+                if conflict != "replace":
+                    raise ValueError(f"unknown conflict strategy: {conflict!r}")
+                await fetch("cancel", {"id": ex_id})
+            rows = await fetch("insert_task", ins)
+            await fetch("upsert_key", {"key": key, "task_id": task_id})
+            return Task.from_row(rows[0])
 
-    @abstractmethod
-    async def get_by_key(self, key: str) -> Task | None: ...
+    async def get(self, task_id: str) -> Task | None:
+        return self._one(await self._fetch("get", {"id": task_id}))
 
-    @abstractmethod
+    async def get_by_key(self, key: str) -> Task | None:
+        return self._one(await self._fetch("get_by_key", {"key": key}))
+
     async def list(
         self,
         *,
@@ -56,41 +169,103 @@ class TaskStore(ABC):
         correlation_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> list[Task]: ...
+    ) -> list[Task]:
+        rows = await self._fetch(
+            "list",
+            {
+                "status": status,
+                "queue": queue,
+                "name": name,
+                "root_id": root_id,
+                "correlation_id": correlation_id,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        return [Task.from_row(r) for r in rows]
 
-    @abstractmethod
-    async def cancel(self, task_id: str) -> Task | None: ...
+    async def cancel(self, task_id: str) -> Task | None:
+        return self._one(await self._fetch("cancel", {"id": task_id}))
 
-    @abstractmethod
-    async def cancel_by_key(self, key: str) -> Task | None: ...
+    async def retry(self, task_id: str, *, reset_attempt: bool = False) -> Task | None:
+        return self._one(
+            await self._fetch("retry", {"id": task_id, "reset_attempt": reset_attempt})
+        )
 
-    @abstractmethod
-    async def retry(self, task_id: str, *, reset_attempt: bool = False) -> Task | None: ...
+    async def cancel_by_key(self, key: str) -> Task | None:
+        return await self._by_key("cancel", key, {})
 
-    @abstractmethod
-    async def retry_by_key(self, key: str, *, reset_attempt: bool = False) -> Task | None: ...
+    async def retry_by_key(self, key: str, *, reset_attempt: bool = False) -> Task | None:
+        return await self._by_key("retry", key, {"reset_attempt": reset_attempt})
 
-    # --- worker side ---
-    @abstractmethod
+    async def _by_key(self, name: str, key: str, params: dict[str, Any]) -> Task | None:
+        """Resolve a key to the task it currently points at, then act on that task
+        — in one transaction, so a concurrent `replace` can't repoint the key
+        between the lookup and the write."""
+        async with self._transaction() as fetch:
+            existing = await fetch("get_key", {"key": key})
+            if not existing:
+                return None
+            rows = await fetch(name, {"id": existing[0]["task_id"], **params})
+            return self._one(rows)
+
+    # ------------------------------------------------------------- worker side
     async def claim(
         self, *, queues: list[str], worker_id: str, lease_ms: int = 30_000, limit: int = 1
-    ) -> list[Task]: ...
+    ) -> list[Task]:
+        params = {
+            "queues": list(queues),
+            "worker_id": worker_id,
+            "lease_ms": lease_ms,
+            "limit": limit,
+            "lease_expired_error": LEASE_EXPIRED_ERROR_JSON,
+        }
+        if not await self._has_claimable_work(params):
+            return []
+        # Recovery must share the claim's transaction: a lease reclaimed here has
+        # to be visible to the claim that follows, and to nobody in between.
+        async with self._transaction() as fetch:
+            await fetch("recover_leases", params)
+            rows = await fetch("claim", params)
+            return [Task.from_row(r) for r in rows]
 
-    @abstractmethod
-    async def heartbeat(self, *, task_id: str, worker_id: str, lease_ms: int = 30_000) -> Task: ...
+    async def heartbeat(self, *, task_id: str, worker_id: str, lease_ms: int = 30_000) -> Task:
+        return await self._owned_write(
+            "heartbeat", task_id, {"id": task_id, "worker_id": worker_id, "lease_ms": lease_ms}
+        )
 
-    @abstractmethod
     async def progress(
         self, *, task_id: str, worker_id: str, progress: float | None, message: str | None
-    ) -> Task: ...
+    ) -> Task:
+        return await self._owned_write(
+            "progress",
+            task_id,
+            {"id": task_id, "worker_id": worker_id, "progress": progress, "message": message},
+        )
 
-    @abstractmethod
-    async def succeed(self, *, task_id: str, worker_id: str, result: Any) -> Task: ...
+    async def succeed(self, *, task_id: str, worker_id: str, result: Any) -> Task:
+        return await self._owned_write(
+            "succeed",
+            task_id,
+            {
+                "id": task_id,
+                "worker_id": worker_id,
+                "result": None if result is None else json.dumps(result),
+                "message": None,
+            },
+        )
 
-    @abstractmethod
-    async def complete(self, *, task_id: str, worker_id: str, result: Any) -> Task: ...
+    async def complete(self, *, task_id: str, worker_id: str, result: Any) -> Task:
+        return await self._owned_write(
+            "complete",
+            task_id,
+            {
+                "id": task_id,
+                "worker_id": worker_id,
+                "result": None if result is None else json.dumps(result),
+            },
+        )
 
-    @abstractmethod
     async def fail(
         self,
         *,
@@ -99,4 +274,15 @@ class TaskStore(ABC):
         error: dict[str, Any],
         retryable: bool = True,
         delay_ms: int = 0,
-    ) -> Task: ...
+    ) -> Task:
+        return await self._owned_write(
+            "fail",
+            task_id,
+            {
+                "id": task_id,
+                "worker_id": worker_id,
+                "error": json.dumps(error),
+                "retryable": retryable,
+                "delay_ms": delay_ms,
+            },
+        )

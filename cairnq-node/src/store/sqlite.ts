@@ -3,44 +3,43 @@ import { dirname } from "node:path";
 
 import Database from "better-sqlite3";
 
-import { newId, nowMs } from "../ids.js";
-import { AlreadyExists, errorEnvelope, LostLease, ProtocolVersionMismatch } from "../errors.js";
-import { rowToTask, type Task } from "../models.js";
+import { nowMs } from "../ids.js";
+import { ProtocolVersionMismatch } from "../errors.js";
 import { loadMigrations, loadStatements } from "../sql.js";
-import type { ListInput, SubmitInput, TaskStore } from "./base.js";
+import { type Fetch, type Params, statementParams, TaskStore } from "./base.js";
 
 type DB = Database.Database;
 type Stmt = Database.Statement;
 
 const SUPPORTED_PROTOCOL_MAJOR = 1;
 
-const LEASE_EXPIRED_ERROR = errorEnvelope({
-  type: "LeaseExpired",
-  code: "lease_expired",
-  message: "task lease expired and max attempts reached",
-  retryable: false,
-});
-// Serialized once: it's an immutable constant bound on every claim that finds work.
-const LEASE_EXPIRED_ERROR_JSON = JSON.stringify(LEASE_EXPIRED_ERROR);
-
 /**
- * SQLiteStore — better-sqlite3 backend executing the shared cairnq-protocol SQL.
+ * SQLiteStore — the SQLite dialect of the shared cairnq-protocol SQL.
  *
- * The driver is synchronous, which suits SQLite's single writer: claim is one
- * short transaction, the handler runs outside any transaction, and
- * progress/heartbeat/succeed/fail are each their own short write. JS being
- * single-threaded means sync DB calls never interleave. Cross-process contention
- * (deployment mode B) is absorbed by busy_timeout.
+ * Everything protocol-shaped lives in TaskStore; this file is only what SQLite
+ * does differently: better-sqlite3's synchronous driver, BEGIN IMMEDIATE
+ * transactions, a read-only probe in front of the write lock, and time supplied
+ * by the SDK (`:now_ms`) rather than by the database.
+ *
+ * The driver being synchronous suits SQLite's single writer: claim is one short
+ * transaction, the handler runs outside any transaction, and
+ * progress/heartbeat/succeed/fail are each their own short write. Cross-process
+ * contention is absorbed by busy_timeout.
  */
-export class SQLiteStore implements TaskStore {
+export class SQLiteStore extends TaskStore {
   private db: DB | null = null;
   private stmts: Record<string, Stmt> = {};
   private readonly statements: Record<string, string>;
+  // Serializes operations within this process. The driver is synchronous, but a
+  // transaction here spans several awaits, and without this a second operation
+  // would resume in the gap and land its statements inside the open transaction.
+  private mutex: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly path: string,
     private readonly opts: { busyTimeoutMs?: number } = {},
   ) {
+    super();
     this.statements = loadStatements("sqlite");
   }
 
@@ -117,235 +116,104 @@ export class SQLiteStore implements TaskStore {
     return this.readProtocolVersion();
   }
 
-  private all(name: string, params: Record<string, unknown>): any[] {
-    return this.stmts[name].all(params) as any[];
-  }
-
-  private run(name: string, params: Record<string, unknown>): void {
-    this.stmts[name].run(params);
-  }
-
-  // An ownership-checked worker write (heartbeat/progress/succeed/complete/fail).
-  // Each statement's WHERE pins worker_id + a live lease, so 0 rows back means the
-  // lease was lost — every such write reports it the same way.
-  private ownedWrite(name: string, taskId: string, params: Record<string, unknown>): Task {
-    const rows = this.all(name, params);
-    if (!rows.length) throw new LostLease(taskId);
-    return rowToTask(rows[0]);
-  }
-
-  // ------------------------------------------------------------- client side
-  async submit(input: SubmitInput): Promise<Task> {
-    this.ensure();
+  // ------------------------------------------------------------ dialect seam
+  /**
+   * Adapt the dialect-neutral parameters to what this statement binds.
+   *
+   * SQLite statements carry no DB clock, so every absolute `*_ms` is derived here
+   * from one `now`, and booleans cross as 0/1. The result is narrowed to the
+   * names the SQL actually uses, which is what makes it safe for a caller to pass
+   * one superset of parameters for both dialects.
+   *
+   * Each derivation writes a name Postgres does not use (`lease_until_ms` from
+   * `lease_ms`, and so on), so a statement binds one or the other, never both —
+   * which is why the derived values can be computed unconditionally and left for
+   * the narrowing step to discard.
+   */
+  private bind(sql: string, params: Params): Params {
     const now = nowMs();
-    const id = newId("task");
-    const ins = {
-      id,
-      name: input.name,
-      queue: input.queue ?? "default",
-      payload: JSON.stringify(input.payload ?? {}),
-      metadata: JSON.stringify(input.metadata ?? {}),
-      max_attempts: input.maxAttempts ?? 3,
-      priority: input.priority ?? 0,
-      run_at_ms: now + (input.runAtDelayMs ?? 0),
-      parent_id: input.parentId ?? null,
-      root_id: input.rootId ?? id,
-      correlation_id: input.correlationId ?? null,
-      now_ms: now,
-    };
-    const key = input.key ?? null;
-    const conflict = input.conflict ?? "reuse";
-
-    const txn = this.db!.transaction(() => {
-      if (key === null) return this.all("insert_task", ins)[0];
-      const existing = this.all("get_key", { key }) as { task_id: string }[];
-      if (existing.length) {
-        const exId = existing[0].task_id;
-        if (conflict === "reuse") return this.all("get", { id: exId })[0];
-        if (conflict === "reject") throw new AlreadyExists(key);
-        if (conflict === "replace") {
-          this.all("cancel", { id: exId, now_ms: now });
-          const row = this.all("insert_task", ins)[0];
-          this.run("upsert_key", { key, task_id: id, now_ms: now });
-          return row;
-        }
-        throw new Error(`unknown conflict strategy: ${conflict}`);
+    const bound: Params = {};
+    for (const name of statementParams(sql)) {
+      switch (name) {
+        case "now_ms":
+          bound[name] = now;
+          break;
+        case "lease_until_ms":
+          bound[name] = now + (params.lease_ms as number);
+          break;
+        case "run_at_ms":
+          bound[name] = now + (params.delay_ms as number);
+          break;
+        case "before_ms":
+          bound[name] = now - (params.older_than_ms as number);
+          break;
+        case "queues":
+          bound[name] = JSON.stringify(params.queues);
+          break;
+        case "retryable":
+        case "reset_attempt":
+          bound[name] = params[name] ? 1 : 0;
+          break;
+        default:
+          bound[name] = params[name];
       }
-      const row = this.all("insert_task", ins)[0];
-      this.run("upsert_key", { key, task_id: id, now_ms: now });
-      return row;
-    });
-    return rowToTask(txn.immediate());
+    }
+    return bound;
   }
 
-  async get(taskId: string): Promise<Task | null> {
-    this.ensure();
-    const rows = this.all("get", { id: taskId });
-    return rows.length ? rowToTask(rows[0]) : null;
+  private runNow(name: string, params: Params): any[] {
+    const stmt = this.stmts[name];
+    const bound = this.bind(this.statements[name], params);
+    // Nearly every protocol statement ends in RETURNING; upsert_key does not, and
+    // better-sqlite3 refuses .all() on a statement that yields no rows.
+    if (!stmt.reader) {
+      stmt.run(bound);
+      return [];
+    }
+    return stmt.all(bound) as any[];
   }
 
-  async getByKey(key: string): Promise<Task | null> {
-    this.ensure();
-    const rows = this.all("get_by_key", { key });
-    return rows.length ? rowToTask(rows[0]) : null;
+  /** Serialize an operation against every other operation on this store. */
+  private withLock<T>(fn: () => T | Promise<T>): Promise<T> {
+    const run = this.mutex.then(fn, fn) as Promise<T>;
+    this.mutex = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
-  async list(input: ListInput = {}): Promise<Task[]> {
+  protected async fetch(name: string, params: Params): Promise<any[]> {
     this.ensure();
-    const rows = this.all("list", {
-      status: input.status ?? null,
-      queue: input.queue ?? null,
-      name: input.name ?? null,
-      root_id: input.rootId ?? null,
-      correlation_id: input.correlationId ?? null,
-      limit: input.limit ?? 100,
-      offset: input.offset ?? 0,
-    });
-    return rows.map(rowToTask);
+    return this.withLock(() => this.runNow(name, params));
   }
 
-  async cancel(taskId: string): Promise<Task | null> {
-    this.ensure();
-    const rows = this.all("cancel", { id: taskId, now_ms: nowMs() });
-    return rows.length ? rowToTask(rows[0]) : null;
-  }
-
-  async cancelByKey(key: string): Promise<Task | null> {
-    this.ensure();
-    const txn = this.db!.transaction(() => {
-      const existing = this.all("get_key", { key }) as { task_id: string }[];
-      if (!existing.length) return null;
-      const rows = this.all("cancel", { id: existing[0].task_id, now_ms: nowMs() });
-      return rows.length ? rows[0] : null;
-    });
-    const row = txn.immediate();
-    return row ? rowToTask(row) : null;
-  }
-
-  async retry(taskId: string, opts: { resetAttempt?: boolean } = {}): Promise<Task | null> {
-    this.ensure();
-    const rows = this.all("retry", {
-      id: taskId,
-      now_ms: nowMs(),
-      reset_attempt: opts.resetAttempt ? 1 : 0,
-    });
-    return rows.length ? rowToTask(rows[0]) : null;
-  }
-
-  async retryByKey(key: string, opts: { resetAttempt?: boolean } = {}): Promise<Task | null> {
-    this.ensure();
-    const txn = this.db!.transaction(() => {
-      const existing = this.all("get_key", { key }) as { task_id: string }[];
-      if (!existing.length) return null;
-      const rows = this.all("retry", {
-        id: existing[0].task_id,
-        now_ms: nowMs(),
-        reset_attempt: opts.resetAttempt ? 1 : 0,
-      });
-      return rows.length ? rows[0] : null;
-    });
-    const row = txn.immediate();
-    return row ? rowToTask(row) : null;
-  }
-
-  // ------------------------------------------------------------- worker side
-  async claim(input: {
-    queues: string[];
-    workerId: string;
-    leaseMs?: number;
-    limit?: number;
-  }): Promise<Task[]> {
-    this.ensure();
-    const now = nowMs();
-    const queues = JSON.stringify(input.queues);
-    const leaseMs = input.leaseMs ?? 30_000;
-    const limit = input.limit ?? 1;
-    // Read-only probe first: skip the write lock entirely when idle.
-    const probe = this.all("claimable_probe", { queues, now_ms: now })[0] as { has_work: number };
-    if (!probe || !probe.has_work) return [];
-    const txn = this.db!.transaction(() => {
-      this.all("recover_leases", {
-        now_ms: now,
-        lease_expired_error: LEASE_EXPIRED_ERROR_JSON,
-      });
-      return this.all("claim", {
-        queues,
-        now_ms: now,
-        worker_id: input.workerId,
-        lease_until_ms: now + leaseMs,
-        limit,
-      });
-    });
-    return (txn.immediate() as any[]).map(rowToTask);
-  }
-
-  async heartbeat(input: {
-    taskId: string;
-    workerId: string;
-    leaseMs?: number;
-  }): Promise<Task> {
-    this.ensure();
-    const now = nowMs();
-    return this.ownedWrite("heartbeat", input.taskId, {
-      id: input.taskId,
-      worker_id: input.workerId,
-      now_ms: now,
-      lease_until_ms: now + (input.leaseMs ?? 30_000),
+  protected async tx<T>(fn: (fetch: Fetch) => Promise<T>): Promise<T> {
+    const db = this.ensure();
+    // BEGIN IMMEDIATE by hand rather than db.transaction(): the callback is async
+    // (the seam is shared with Postgres), and better-sqlite3's wrapper only takes
+    // a synchronous one. The lock above makes the manual version safe.
+    return this.withLock(async () => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const out = await fn(async (name, params) => this.runNow(name, params));
+        db.exec("COMMIT");
+        return out;
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Already rolled back by SQLite (e.g. a constraint abort).
+        }
+        throw err;
+      }
     });
   }
 
-  async progress(input: {
-    taskId: string;
-    workerId: string;
-    progress: number | null;
-    message: string | null;
-  }): Promise<Task> {
-    this.ensure();
-    return this.ownedWrite("progress", input.taskId, {
-      id: input.taskId,
-      worker_id: input.workerId,
-      now_ms: nowMs(),
-      progress: input.progress,
-      message: input.message,
-    });
-  }
-
-  async succeed(input: { taskId: string; workerId: string; result: unknown }): Promise<Task> {
-    this.ensure();
-    return this.ownedWrite("succeed", input.taskId, {
-      id: input.taskId,
-      worker_id: input.workerId,
-      now_ms: nowMs(),
-      result: input.result == null ? null : JSON.stringify(input.result),
-      message: null,
-    });
-  }
-
-  async complete(input: { taskId: string; workerId: string; result: unknown }): Promise<Task> {
-    this.ensure();
-    return this.ownedWrite("complete", input.taskId, {
-      id: input.taskId,
-      worker_id: input.workerId,
-      now_ms: nowMs(),
-      result: input.result == null ? null : JSON.stringify(input.result),
-    });
-  }
-
-  async fail(input: {
-    taskId: string;
-    workerId: string;
-    error: unknown;
-    retryable?: boolean;
-    delayMs?: number;
-  }): Promise<Task> {
-    this.ensure();
-    return this.ownedWrite("fail", input.taskId, {
-      id: input.taskId,
-      worker_id: input.workerId,
-      now_ms: nowMs(),
-      error: JSON.stringify(input.error ?? {}),
-      retryable: input.retryable === false ? 0 : 1,
-      delay_ms: input.delayMs ?? 0,
-    });
+  protected async hasClaimableWork(params: Params): Promise<boolean> {
+    // Read-only probe first: an idle worker never takes SQLite's single write
+    // lock, so idle workers don't serialize against each other.
+    const rows = await this.fetch("claimable_probe", params);
+    return Boolean(rows[0]?.has_work);
   }
 }
