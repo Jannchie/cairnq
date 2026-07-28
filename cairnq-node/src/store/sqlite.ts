@@ -13,6 +13,44 @@ type Stmt = Database.Statement;
 
 const SUPPORTED_PROTOCOL_MAJOR = 1;
 
+const WAL_RETRY_DELAY_MS = 50;
+const WAL_RETRY_BUDGET_MS = 5_000;
+
+/** Sleep without yielding — the whole open path is synchronous already. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Put the database in WAL mode, waiting out a concurrent cold start.
+ *
+ * journal_mode is a persistent property of the file, so only the first connection
+ * to a new database actually switches it — and that switch needs an exclusive
+ * lock. `busy_timeout` does not cover it: SQLite returns SQLITE_BUSY for a
+ * journal_mode change rather than invoking the busy handler, so several processes
+ * opening the same new database at once would otherwise get an instant "database
+ * is locked". Retry briefly instead; the window is only as long as one other
+ * opener's switch.
+ */
+function enableWal(db: DB): void {
+  const deadline = Date.now() + WAL_RETRY_BUDGET_MS;
+  for (;;) {
+    try {
+      const rows = db.pragma("journal_mode = WAL") as { journal_mode?: string }[];
+      if (rows[0]?.journal_mode?.toLowerCase() === "wal") return;
+    } catch (err) {
+      const message = String((err as Error).message ?? err);
+      if (!/locked|busy/i.test(message)) throw err;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        "could not switch the database to WAL mode: it stayed locked by another connection",
+      );
+    }
+    sleepSync(WAL_RETRY_DELAY_MS);
+  }
+}
+
 /**
  * SQLiteStore — the SQLite dialect of the shared cairnq-protocol SQL.
  *
@@ -59,9 +97,11 @@ export class SQLiteStore extends TaskStore {
     if (this.db) return this.db;
     if (this.path !== ":memory:") mkdirSync(dirname(this.path), { recursive: true });
     const db = new Database(this.path);
-    db.pragma("journal_mode = WAL");
-    db.pragma("foreign_keys = ON");
+    // busy_timeout first, so every later statement waits out contention instead
+    // of failing instantly.
     db.pragma(`busy_timeout = ${this.opts.busyTimeoutMs ?? 5000}`);
+    enableWal(db);
+    db.pragma("foreign_keys = ON");
     this.applyMigrations(db);
     for (const [name, sql] of Object.entries(this.statements)) {
       this.stmts[name] = db.prepare(sql);
@@ -76,22 +116,20 @@ export class SQLiteStore extends TaskStore {
       "create table if not exists cairnq_migrations " +
         "(name text primary key, applied_at_ms integer not null)",
     );
-    const applied = new Set(
-      (db.prepare("select name from cairnq_migrations").all() as { name: string }[]).map(
-        (r) => r.name,
-      ),
-    );
-    // `or ignore`: another process may apply the same migration concurrently on a
-    // fresh shared db (mode B cold start). Migrations are idempotent.
+    const isApplied = db.prepare("select 1 from cairnq_migrations where name = ?");
     const insert = db.prepare(
-      "insert or ignore into cairnq_migrations (name, applied_at_ms) values (?, ?)",
+      "insert into cairnq_migrations (name, applied_at_ms) values (?, ?)",
     );
     for (const { name, sql } of loadMigrations("sqlite")) {
-      if (applied.has(name)) continue;
+      // Check and apply under one write lock. Two processes cold-starting on a
+      // shared database would otherwise both see a migration as unapplied and
+      // both run it — harmless for the idempotent ones, not for a future ALTER.
+      // `immediate` takes the write lock up front; the loser sees it applied.
       db.transaction(() => {
+        if (isApplied.get(name)) return;
         db.exec(sql);
         insert.run(name, nowMs());
-      })();
+      }).immediate();
     }
   }
 

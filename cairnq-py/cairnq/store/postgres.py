@@ -85,17 +85,22 @@ class PostgresStore(TaskStore):
             "create table if not exists cairnq_migrations "
             "(name text primary key, applied_at_ms bigint not null)"
         )
-        applied = {r["name"] for r in await conn.fetch("select name from cairnq_migrations")}
         for name, sql in load_migrations("postgres"):
-            if name in applied:
-                continue
+            # Check and apply inside one transaction, with the row lock taken up
+            # front: two processes cold-starting together would otherwise both see
+            # a migration as unapplied and both run it.
             async with conn.transaction():
-                await conn.execute(sql)  # multi-statement DDL
-                await conn.execute(
-                    "insert into cairnq_migrations (name, applied_at_ms) values "
-                    "($1, (extract(epoch from now()) * 1000)::bigint) on conflict (name) do nothing",
-                    name,
+                await conn.execute("lock table cairnq_migrations in exclusive mode")
+                already = await conn.fetchval(
+                    "select 1 from cairnq_migrations where name = $1", name
                 )
+                if already is None:
+                    await conn.execute(sql)  # multi-statement DDL
+                    await conn.execute(
+                        "insert into cairnq_migrations (name, applied_at_ms) values "
+                        "($1, (extract(epoch from now()) * 1000)::bigint)",
+                        name,
+                    )
 
     async def close(self) -> None:
         if self._pool is not None:

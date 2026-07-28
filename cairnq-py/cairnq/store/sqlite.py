@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,60 @@ from ..errors import ProtocolVersionMismatch
 from .base import Fetch, TaskStore, statement_params
 
 SUPPORTED_PROTOCOL_MAJOR = 1
+
+
+def _split_script(script: str) -> list[str]:
+    """Split a migration into single statements.
+
+    `executescript` would be the obvious tool, but it COMMITs before it runs —
+    which would silently end the transaction the migration is supposed to be
+    applied in. `sqlite3.complete_statement` gives the same split without the
+    hidden commit, and understands strings and comments so a `;` inside either
+    doesn't cut a statement in half."""
+    statements: list[str] = []
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statements.append(buffer.strip())
+            buffer = ""
+    if buffer.strip():
+        statements.append(buffer.strip())
+    return statements
+
+
+_WAL_RETRY_DELAY_S = 0.05
+_WAL_RETRY_BUDGET_S = 5.0
+
+
+async def _enable_wal(conn: aiosqlite.Connection) -> None:
+    """Put the database in WAL mode, waiting out a concurrent cold start.
+
+    journal_mode is a persistent property of the file, so only the first
+    connection to a new database actually switches it — and that switch needs an
+    exclusive lock. `busy_timeout` does not cover it: SQLite returns SQLITE_BUSY
+    for a journal_mode change rather than invoking the busy handler, so several
+    processes opening the same new database at once would otherwise get an
+    instant "database is locked". Retry briefly instead; the window is only as
+    long as one other opener's switch.
+    """
+    deadline = asyncio.get_running_loop().time() + _WAL_RETRY_BUDGET_S
+    while True:
+        try:
+            cur = await conn.execute("pragma journal_mode = WAL")
+            row = await cur.fetchone()
+            await cur.close()
+            if row is not None and str(row[0]).lower() == "wal":
+                return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+        if asyncio.get_running_loop().time() >= deadline:
+            raise sqlite3.OperationalError(
+                "could not switch the database to WAL mode: it stayed locked by "
+                "another connection"
+            )
+        await asyncio.sleep(_WAL_RETRY_DELAY_S)
 
 
 class SQLiteStore(TaskStore):
@@ -49,9 +104,11 @@ class SQLiteStore(TaskStore):
                 Path(self._path).parent.mkdir(parents=True, exist_ok=True)
             conn = await aiosqlite.connect(self._path, isolation_level=None)
             conn.row_factory = aiosqlite.Row
-            await conn.execute("pragma journal_mode = WAL")
-            await conn.execute("pragma foreign_keys = ON")
+            # busy_timeout first, so every later statement waits out contention
+            # instead of failing instantly.
             await conn.execute(f"pragma busy_timeout = {self._busy_timeout_ms}")
+            await _enable_wal(conn)
+            await conn.execute("pragma foreign_keys = ON")
             await self._apply_migrations(conn)
             self._conn = conn
             await self._check_version()
@@ -61,19 +118,31 @@ class SQLiteStore(TaskStore):
             "create table if not exists cairnq_migrations "
             "(name text primary key, applied_at_ms integer not null)"
         )
-        cur = await conn.execute("select name from cairnq_migrations")
-        applied = {row["name"] for row in await cur.fetchall()}
-        await cur.close()
         for name, sql in load_migrations("sqlite"):
-            if name in applied:
-                continue
-            await conn.executescript(sql)
-            # `or ignore`: another process may apply the same migration concurrently
-            # on a fresh shared db (mode B cold start). Migrations are idempotent.
-            await conn.execute(
-                "insert or ignore into cairnq_migrations (name, applied_at_ms) values (?, ?)",
-                (name, now_ms()),
-            )
+            # Check and apply under one write lock. Two processes cold-starting on
+            # a shared database would otherwise both see a migration as unapplied
+            # and both run it — harmless for the idempotent ones, not for a future
+            # ALTER. BEGIN IMMEDIATE serializes them; the loser sees it applied.
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute(
+                    "select 1 from cairnq_migrations where name = ?", (name,)
+                )
+                already = await cur.fetchone()
+                await cur.close()
+                if already is None:
+                    for statement in _split_script(sql):
+                        await conn.execute(statement)
+                    await conn.execute(
+                        "insert into cairnq_migrations (name, applied_at_ms) values (?, ?)",
+                        (name, now_ms()),
+                    )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await conn.execute("ROLLBACK")
+                raise
+            else:
+                await conn.execute("COMMIT")
 
     async def close(self) -> None:
         if self._conn is not None:

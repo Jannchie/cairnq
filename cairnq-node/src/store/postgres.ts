@@ -124,21 +124,24 @@ export class PostgresStore extends TaskStore {
       "create table if not exists cairnq_migrations " +
         "(name text primary key, applied_at_ms bigint not null)",
     );
-    const applied = new Set(
-      (await client.query("select name from cairnq_migrations")).rows.map(
-        (r: { name: string }) => r.name,
-      ),
-    );
     for (const { name, sql } of loadMigrations("postgres")) {
-      if (applied.has(name)) continue;
+      // Check and apply inside one transaction, with the table lock taken up
+      // front: two processes cold-starting together would otherwise both see a
+      // migration as unapplied and both run it.
       try {
         await client.query("begin");
-        await client.query(sql); // multi-statement DDL (simple-query, no params)
-        await client.query(
-          "insert into cairnq_migrations (name, applied_at_ms) values " +
-            "($1, (extract(epoch from now()) * 1000)::bigint) on conflict (name) do nothing",
-          [name],
-        );
+        await client.query("lock table cairnq_migrations in exclusive mode");
+        const applied = await client.query("select 1 from cairnq_migrations where name = $1", [
+          name,
+        ]);
+        if (applied.rowCount === 0) {
+          await client.query(sql); // multi-statement DDL (simple-query, no params)
+          await client.query(
+            "insert into cairnq_migrations (name, applied_at_ms) values " +
+              "($1, (extract(epoch from now()) * 1000)::bigint)",
+            [name],
+          );
+        }
         await client.query("commit");
       } catch (e) {
         await client.query("rollback");
