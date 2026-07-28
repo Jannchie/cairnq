@@ -21,6 +21,9 @@ importers:
       '@types/pg':
         specifier: ^8.11.10
         version: 8.20.0
+      pg:
+        specifier: ^8.13.0
+        version: 8.21.0
       tsx:
         specifier: ^4.19.0
         version: 4.22.4
@@ -30,10 +33,6 @@ importers:
       vitest:
         specifier: ^2.1.0
         version: 2.1.9(@types/node@22.19.19)
-    optionalDependencies:
-      pg:
-        specifier: ^8.13.0
-        version: 8.21.0
 
 packages:
 
@@ -1335,15 +1334,13 @@ snapshots:
   pg-cloudflare@1.4.0:
     optional: true
 
-  pg-connection-string@2.13.0:
-    optional: true
+  pg-connection-string@2.13.0: {}
 
   pg-int8@1.0.1: {}
 
   pg-pool@3.14.0(pg@8.21.0):
     dependencies:
       pg: 8.21.0
-    optional: true
 
   pg-protocol@1.14.0: {}
 
@@ -1364,12 +1361,10 @@ snapshots:
       pgpass: 1.0.5
     optionalDependencies:
       pg-cloudflare: 1.4.0
-    optional: true
 
   pgpass@1.0.5:
     dependencies:
       split2: 4.2.0
-    optional: true
 
   picocolors@1.1.1: {}
 
@@ -1469,8 +1464,7 @@ snapshots:
 
   source-map-js@1.2.1: {}
 
-  split2@4.2.0:
-    optional: true
+  split2@4.2.0: {}
 
   stackback@0.0.2: {}
 
