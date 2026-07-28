@@ -219,10 +219,22 @@ class TaskStore(ABC):
 
     # ------------------------------------------------------------- worker side
     async def claim(
-        self, *, queues: list[str], worker_id: str, lease_ms: int = 30_000, limit: int = 1
+        self,
+        *,
+        queues: list[str],
+        worker_id: str,
+        lease_ms: int = 30_000,
+        limit: int = 1,
+        names: list[str] | tuple[str, ...] | None = None,
     ) -> list[Task]:
+        """Take up to `limit` claimable tasks. `names` restricts the claim to task
+        names this caller can actually run — a worker passes its registered
+        handlers. Queues alone do not partition work, so without it a worker
+        claims a task it cannot run and fails it permanently. None means no
+        filter; an empty list claims nothing."""
         params = {
             "queues": list(queues),
+            "names": None if names is None else list(names),
             "worker_id": worker_id,
             "lease_ms": lease_ms,
             "limit": limit,

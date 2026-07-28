@@ -112,6 +112,8 @@ class Runner:
             return await s.claim(
                 queues=a["queues"], worker_id=a["worker_id"],
                 lease_ms=a.get("lease_ms", 30_000), limit=a.get("limit", 1),
+                # Absent (not []) means "no name filter" — the two are different claims.
+                names=a.get("names"),
             )
         if op == "heartbeat":
             return await s.heartbeat(

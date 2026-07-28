@@ -1,7 +1,14 @@
 -- Atomic claim. :queues is a JSON array of queue names. :lease_until_ms is
 -- precomputed by the SDK (= now_ms + lease_ms). Single UPDATE ... RETURNING
 -- under BEGIN IMMEDIATE is the SQLite equivalent of FOR UPDATE SKIP LOCKED.
--- params: queues (JSON array text), now_ms, worker_id, lease_until_ms, limit
+--
+-- :names is a JSON array of the task names the caller can actually run, or NULL
+-- for no filter. A worker passes its registered handler names: queues alone do
+-- not partition work, so without this a worker claims a task it has no handler
+-- for and fails it permanently — two workers with different handler sets on one
+-- queue would destroy each other's tasks. An empty array claims nothing.
+-- params: queues (JSON array text), names (JSON array text or null), now_ms,
+--         worker_id, lease_until_ms, limit
 update cairnq_tasks
 set
     status = 'running',
@@ -13,6 +20,7 @@ where id in (
     select id from cairnq_tasks
     where status = 'queued'
       and queue in (select value from json_each(:queues))
+      and (:names is null or name in (select value from json_each(:names)))
       and run_at_ms <= :now_ms
     order by priority desc, created_at_ms asc
     limit :limit

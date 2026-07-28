@@ -168,6 +168,11 @@ export class Worker {
       try {
         claimed = await this.store.claim({
           queues: this.queues,
+          // Only what this worker can run. Queues do not partition work by task
+          // name, so another worker's tasks would otherwise be claimed here and
+          // failed for want of a handler. Read each poll: handlers may be
+          // registered after run() started.
+          names: [...this.handlers.keys()],
           workerId: this.workerId,
           leaseMs,
           limit: Math.min(batch, free),

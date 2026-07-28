@@ -240,6 +240,12 @@ class Worker:
                 try:
                     claimed = await self._store.claim(
                         queues=self._queues,
+                        # Only what this worker can run. Queues do not partition
+                        # work by task name, so another worker's tasks would
+                        # otherwise be claimed here and failed for want of a
+                        # handler. Read each poll: handlers may be registered
+                        # after run() started.
+                        names=list(self._handlers),
                         worker_id=self._worker_id,
                         lease_ms=self._lease_ms,
                         limit=min(batch, free),

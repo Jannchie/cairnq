@@ -6,7 +6,13 @@
 -- recover_leases MUST run first in the SAME transaction. READ COMMITTED suffices:
 -- each UPDATE re-checks its WHERE against the latest committed row, so racing
 -- claims/recovers can neither double-dispatch a task nor double-recover a lease.
--- params: queues (text[]), worker_id, lease_ms, limit
+--
+-- :names is the set of task names the caller can actually run, or NULL for no
+-- filter. A worker passes its registered handler names: queues alone do not
+-- partition work, so without this a worker claims a task it has no handler for
+-- and fails it permanently — two workers with different handler sets on one queue
+-- would destroy each other's tasks. An empty array claims nothing.
+-- params: queues (text[]), names (text[] or null), worker_id, lease_ms, limit
 update cairnq_tasks t
 set
     status = 'running',
@@ -18,6 +24,7 @@ from (
     select id from cairnq_tasks
     where status = 'queued'
       and queue = any(:queues::text[])
+      and (:names::text[] is null or name = any(:names::text[]))
       and run_at_ms <= (extract(epoch from now()) * 1000)::bigint
     order by priority desc, created_at_ms asc
     limit :limit

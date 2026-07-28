@@ -220,6 +220,11 @@ export class SQLiteStore extends TaskStore {
         case "queues":
           bound[name] = JSON.stringify(params.queues);
           break;
+        case "names":
+          // json_each needs a JSON array; null stays null so the SQL's
+          // `:names is null` arm means "no filter".
+          bound[name] = params.names == null ? null : JSON.stringify(params.names);
+          break;
         case "retryable":
         case "reset_attempt":
           bound[name] = params[name] ? 1 : 0;

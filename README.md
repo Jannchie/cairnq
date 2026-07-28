@@ -102,7 +102,9 @@ and a JSON protocol.
 - **`submit / get / wait / call / cancel / retry`**, by `task_id` or business `key`.
 - **Key conflict strategies**: `reuse` (idempotent submit), `reject`, `replace`.
 - **Lease-based claim** with heartbeat and automatic recovery — a crashed worker's
-  task is redelivered after its lease expires.
+  task is redelivered after its lease expires. A worker only claims tasks it has a
+  handler for, so workers with different handler sets share a queue safely — which
+  is what makes a Python API and a TypeScript worker on one `default` queue work.
 - **At-least-once execution** (honestly — see below). Retries with exponential
   backoff (1s doubling to 30s by default), `attempt` / `max_attempts`, queues,
   priority, progress, task chains (`parent_id` / `root_id` / `correlation_id`).

@@ -93,6 +93,13 @@ A worker **leases** a task rather than popping it:
   and `attempt += 1`. It is atomic: a single `UPDATE … WHERE id IN (SELECT … LIMIT)
   RETURNING *` run inside `BEGIN IMMEDIATE` — the SQLite equivalent of
   `FOR UPDATE SKIP LOCKED`. `busy_timeout` absorbs `SQLITE_BUSY`.
+- **`claim` filters by task name, not only by queue.** `:names` carries the names
+  the caller can actually run; a worker passes its registered handlers (`NULL`
+  means no filter, an empty set claims nothing). Queues do not partition work by
+  name, so without this a worker claims a task it has no handler for and fails it
+  permanently — two workers with different handler sets on one queue destroy each
+  other's tasks, which is exactly the cross-language deployment this protocol
+  exists for.
 - `heartbeat` extends `lease_until_ms`. All worker writes
   (`heartbeat/progress/succeed/complete/fail`) are **ownership-checked**:
   `status='running' AND worker_id=:worker_id AND lease_until_ms > :now_ms`.

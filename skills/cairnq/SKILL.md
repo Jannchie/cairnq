@@ -127,6 +127,10 @@ if (got && isSucceeded(got)) use(got.result);   // also isFailed/isCanceled/isRu
   fails **permanently** (default `retryable=False`, so deterministic errors fail
   fast). `TaskError(msg, retryable=True)` → retried with backoff up to
   `max_attempts`. **Any other** exception → treated as retryable.
+- **A worker only claims what it has a handler for.** Queues do not have to
+  partition work by task name: two workers with different handler sets (say a
+  Python one and a TypeScript one) can share `default` and each takes only its
+  own. A worker with no handlers registered claims nothing.
 - **Cooperative cancel.** Cancelling a *queued* task is immediate. Cancelling a
   *running* one only sets a flag — the handler must `if await ctx.canceled(): return`.
   On return the task finalizes as `canceled` and **the result is discarded** (cancel

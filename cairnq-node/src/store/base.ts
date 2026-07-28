@@ -228,14 +228,23 @@ export abstract class TaskStore {
   }
 
   // ------------------------------------------------------------- worker side
+  /**
+   * Take up to `limit` claimable tasks. `names` restricts the claim to task names
+   * this caller can actually run — a worker passes its registered handlers.
+   * Queues alone do not partition work, so without it a worker claims a task it
+   * cannot run and fails it permanently. Undefined means no filter; an empty
+   * array claims nothing.
+   */
   async claim(input: {
     queues: string[];
     workerId: string;
     leaseMs?: number;
     limit?: number;
+    names?: string[];
   }): Promise<Task[]> {
     const params: Params = {
       queues: input.queues,
+      names: input.names ?? null,
       worker_id: input.workerId,
       lease_ms: input.leaseMs ?? 30_000,
       limit: input.limit ?? 1,

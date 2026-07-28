@@ -119,7 +119,14 @@ export class Runner {
       case "retry_by_key":
         return c.retryByKey(a.key, { resetAttempt: a.reset_attempt });
       case "claim":
-        return s.claim({ queues: a.queues, workerId: a.worker_id, leaseMs: a.lease_ms, limit: a.limit });
+        return s.claim({
+          queues: a.queues,
+          workerId: a.worker_id,
+          leaseMs: a.lease_ms,
+          limit: a.limit,
+          // Absent (not []) means "no name filter" — the two are different claims.
+          names: "names" in a ? a.names : undefined,
+        });
       case "heartbeat":
         return s.heartbeat({ taskId: a.id, workerId: a.worker_id, leaseMs: a.lease_ms });
       case "progress":
