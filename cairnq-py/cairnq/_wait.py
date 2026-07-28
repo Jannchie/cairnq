@@ -7,13 +7,34 @@ from .errors import TaskTimeout
 from .models import Task
 from .store.base import TaskStore
 
+DEFAULT_POLL_MS = 100
+MAX_POLL_MS = 500
+_GROWTH = 1.5
+
+
+def next_poll_ms(current: int, max_ms: int) -> int:
+    """Grow the polling interval towards the ceiling.
+
+    wait() has no idea whether the task takes 50ms or an hour. Starting tight
+    keeps short tasks snappy; growing keeps a long wait from costing a read every
+    100ms for its whole duration."""
+    return min(max_ms, int(current * _GROWTH))
+
 
 async def poll_wait(
-    store: TaskStore, task_id: str, *, timeout_ms: int, poll_ms: int = 150
+    store: TaskStore,
+    task_id: str,
+    *,
+    timeout_ms: int,
+    poll_ms: int = DEFAULT_POLL_MS,
+    max_poll_ms: int = MAX_POLL_MS,
 ) -> Task:
     """Poll get() until the task is terminal or the timeout elapses. Returns the
-    terminal Task (any status). Raises TaskTimeout, leaving the task running."""
+    terminal Task (any status). Raises TaskTimeout, leaving the task running.
+
+    `poll_ms` is the *first* interval; it backs off towards `max_poll_ms`."""
     deadline = now_ms() + timeout_ms
+    interval = poll_ms
     while True:
         task = await store.get(task_id)
         if task is not None and task.is_terminal:
@@ -21,4 +42,5 @@ async def poll_wait(
         remaining = deadline - now_ms()
         if remaining <= 0:
             raise TaskTimeout(task_id)
-        await asyncio.sleep(min(poll_ms, remaining) / 1000)
+        await asyncio.sleep(min(interval, remaining) / 1000)
+        interval = next_poll_ms(interval, max_poll_ms)

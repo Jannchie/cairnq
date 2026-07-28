@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ._wait import poll_wait
+from ._wait import DEFAULT_POLL_MS, poll_wait
 from .errors import LostLease
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
@@ -132,5 +132,5 @@ class TaskContext:
             **kwargs,
         )
 
-    async def wait(self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = 150) -> Task:
+    async def wait(self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS) -> Task:
         return await poll_wait(self._store, task_id, timeout_ms=timeout_ms, poll_ms=poll_ms)

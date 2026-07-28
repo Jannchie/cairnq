@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._wait import poll_wait
+from ._wait import DEFAULT_POLL_MS, poll_wait
 from .errors import TaskCanceled, TaskFailed
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
@@ -93,7 +93,7 @@ class CairnQ:
         the write short; loop until it returns fewer than `limit`."""
         return await self._store.purge(older_than_ms=older_than_ms, limit=limit)
 
-    async def wait(self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = 150) -> Task:
+    async def wait(self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS) -> Task:
         return await poll_wait(self._store, task_id, timeout_ms=timeout_ms, poll_ms=poll_ms)
 
     async def call(
@@ -102,7 +102,7 @@ class CairnQ:
         payload: dict[str, Any] | None = None,
         *,
         wait_timeout_ms: int = 30_000,
-        poll_ms: int = 150,
+        poll_ms: int = DEFAULT_POLL_MS,
         **submit_kwargs: Any,
     ) -> Any:
         """submit + wait. Returns the result on success; raises TaskFailed /
