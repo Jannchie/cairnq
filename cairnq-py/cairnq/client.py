@@ -115,7 +115,9 @@ class CairnQ:
         the write short; loop until it returns fewer than `limit`."""
         return await self._store.purge(older_than_ms=older_than_ms, limit=limit)
 
-    async def wait(self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS) -> Task:
+    async def wait(
+        self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS
+    ) -> Task:
         return await poll_wait(self._store, task_id, timeout_ms=timeout_ms, poll_ms=poll_ms)
 
     async def call(

@@ -93,7 +93,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      # node: `pg` is an optionalDependency, installed by default.
+      # node: `pg` is an optional peer dependency; it is a devDependency here, so
+      # a normal install brings it in for these tests.
       - run: pnpm install --frozen-lockfile
         working-directory: cairnq-node
       # The live smoke plus the full conformance suite, which runs every scenario
