@@ -209,6 +209,14 @@ class TaskStore(ABC):
             rows = await fetch(name, {"id": existing[0]["task_id"], **params})
             return self._one(rows)
 
+    async def purge(self, *, older_than_ms: int = 0, limit: int = 1_000) -> list[str]:
+        """Delete terminal tasks that completed more than `older_than_ms` ago and
+        return their ids. Nothing else removes rows, so a long-lived database
+        needs this called periodically. Bounded by `limit` to keep each sweep a
+        short write; call it in a loop until it returns fewer than `limit`."""
+        rows = await self._fetch("purge", {"older_than_ms": older_than_ms, "limit": limit})
+        return [r["id"] for r in rows]
+
     # ------------------------------------------------------------- worker side
     async def claim(
         self, *, queues: list[str], worker_id: str, lease_ms: int = 30_000, limit: int = 1

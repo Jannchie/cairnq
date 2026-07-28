@@ -131,6 +131,10 @@ class Runner:
                 task_id=a["id"], worker_id=a["worker_id"], error=a["error"],
                 retryable=a.get("retryable", True), delay_ms=a.get("delay_ms", 0),
             )
+        if op == "purge":
+            return await c.purge(
+                older_than_ms=a.get("older_than_ms", 0), limit=a.get("limit", 1000)
+            )
         if op == "sleep":
             await asyncio.sleep(a["ms"] / 1000)
             return None

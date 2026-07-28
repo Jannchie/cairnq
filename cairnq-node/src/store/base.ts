@@ -29,6 +29,11 @@ export interface ListInput {
   offset?: number;
 }
 
+export interface PurgeInput {
+  olderThanMs?: number;
+  limit?: number;
+}
+
 export type Params = Record<string, unknown>;
 /** Runs one named protocol statement and returns its rows. */
 export type Fetch = (name: string, params: Params) => Promise<any[]>;
@@ -206,6 +211,20 @@ export abstract class TaskStore {
       if (!existing.length) return null;
       return TaskStore.one(await fetch(name, { id: existing[0].task_id, ...params }));
     });
+  }
+
+  /**
+   * Delete terminal tasks that completed more than `olderThanMs` ago and return
+   * their ids. Nothing else removes rows, so a long-lived database needs this
+   * called periodically. Bounded by `limit` to keep each sweep a short write;
+   * call it in a loop until it returns fewer than `limit`.
+   */
+  async purge(input: PurgeInput = {}): Promise<string[]> {
+    const rows = await this.fetch("purge", {
+      older_than_ms: input.olderThanMs ?? 0,
+      limit: input.limit ?? 1_000,
+    });
+    return rows.map((r) => r.id as string);
   }
 
   // ------------------------------------------------------------- worker side

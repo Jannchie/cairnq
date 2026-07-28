@@ -2,7 +2,7 @@ import { TaskCanceled, TaskFailed } from "./errors.js";
 import { isFailed, isSucceeded, type Task } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
-import type { ListInput, SubmitInput, TaskStore } from "./store/base.js";
+import type { ListInput, PurgeInput, SubmitInput, TaskStore } from "./store/base.js";
 import { type TaskDef, taskName } from "./task.js";
 import { pollWait } from "./wait.js";
 
@@ -70,6 +70,14 @@ export class CairnQ {
 
   retryByKey(key: string, opts?: { resetAttempt?: boolean }): Promise<Task | null> {
     return this._store.retryByKey(key, opts);
+  }
+
+  /** Delete terminal tasks that finished more than `olderThanMs` ago and return
+   * their ids. Nothing else in CairnQ removes rows, so a long-lived database
+   * needs this on a schedule. Each call is bounded by `limit` to keep the write
+   * short; loop until it returns fewer than `limit`. */
+  purge(input?: PurgeInput): Promise<string[]> {
+    return this._store.purge(input);
   }
 
   wait(

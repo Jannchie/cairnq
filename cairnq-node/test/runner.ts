@@ -141,6 +141,8 @@ export class Runner {
           retryable: a.retryable,
           delayMs: a.delay_ms,
         });
+      case "purge":
+        return c.purge({ olderThanMs: a.older_than_ms, limit: a.limit });
       case "sleep":
         await sleep(a.ms);
         return null;

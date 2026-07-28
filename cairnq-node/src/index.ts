@@ -8,7 +8,7 @@ export type { TaskDef } from "./task.js";
 export { SQLiteStore } from "./store/sqlite.js";
 export { PostgresStore } from "./store/postgres.js";
 export { TaskStore } from "./store/base.js";
-export type { ListInput, SubmitInput, Conflict } from "./store/base.js";
+export type { ListInput, PurgeInput, SubmitInput, Conflict } from "./store/base.js";
 export type { Task, TaskStatus } from "./models.js";
 export {
   STATUSES,

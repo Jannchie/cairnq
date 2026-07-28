@@ -86,6 +86,13 @@ class CairnQ:
     async def retry_by_key(self, key: str, *, reset_attempt: bool = False) -> Task | None:
         return await self._store.retry_by_key(key, reset_attempt=reset_attempt)
 
+    async def purge(self, *, older_than_ms: int = 0, limit: int = 1_000) -> list[str]:
+        """Delete terminal tasks that finished more than `older_than_ms` ago and
+        return their ids. Nothing else in CairnQ removes rows, so a long-lived
+        database needs this on a schedule. Each call is bounded by `limit` to keep
+        the write short; loop until it returns fewer than `limit`."""
+        return await self._store.purge(older_than_ms=older_than_ms, limit=limit)
+
     async def wait(self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = 150) -> Task:
         return await poll_wait(self._store, task_id, timeout_ms=timeout_ms, poll_ms=poll_ms)
 

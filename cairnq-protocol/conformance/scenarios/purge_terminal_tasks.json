@@ -1,0 +1,20 @@
+{
+  "name": "purge_terminal_tasks",
+  "description": "purge deletes terminal tasks completed before a cutoff and leaves live ones alone; the key pointer of a purged task goes with it",
+  "steps": [
+    { "op": "submit", "args": { "name": "old", "payload": {}, "key": "k-old" }, "save": "old" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "succeed", "args": { "id": "$old.id", "worker_id": "w1", "result": { "v": 1 } }, "expect": { "equals": { "status": "succeeded" } } },
+
+    { "op": "submit", "args": { "name": "live", "payload": {} }, "save": "live" },
+
+    { "op": "sleep", "args": { "ms": 50 } },
+    { "op": "purge", "args": { "older_than_ms": 0, "limit": 100 }, "save": "p", "expect": { "length": 1 } },
+
+    { "op": "get", "args": { "id": "$old.id" }, "expect": { "isNull": ["id"] } },
+    { "op": "get_by_key", "args": { "key": "k-old" }, "expect": { "isNull": ["id"] } },
+    { "op": "get", "args": { "id": "$live.id" }, "expect": { "equals": { "status": "queued" } } },
+
+    { "op": "purge", "args": { "older_than_ms": 3600000, "limit": 100 }, "expect": { "length": 0 } }
+  ]
+}
