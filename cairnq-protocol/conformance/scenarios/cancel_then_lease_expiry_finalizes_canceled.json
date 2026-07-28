@@ -1,0 +1,14 @@
+{
+  "name": "cancel_then_lease_expiry_finalizes_canceled",
+  "description": "A cancel-requested task whose worker dies finalizes as 'canceled' on lease recovery instead of being redelivered — the crash path must honour cancel just like the fail path",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "max_attempts": 3 }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 150 }, "save": "c", "expect": { "length": 1 } },
+    { "op": "cancel", "args": { "id": "$t.id" }, "expect": { "equals": { "status": "running" } } },
+    { "op": "sleep", "args": { "ms": 300 } },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w2", "lease_ms": 5000 }, "expect": { "length": 0 } },
+    { "op": "get", "args": { "id": "$t.id" }, "save": "g", "expect": { "equals": { "status": "canceled", "attempt": 1 } } },
+    { "op": "expect", "target": "$g", "notNull": ["completed_at_ms"] },
+    { "op": "expect", "target": "$g", "isNull": ["error"] }
+  ]
+}

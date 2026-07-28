@@ -1,0 +1,18 @@
+{
+  "name": "cancel_then_fail_finalizes_canceled",
+  "description": "A cancel-requested task that then fails retryably finalizes as 'canceled', not requeued — cancel must survive the retry path or the handler runs again after the user cancelled",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "max_attempts": 3 }, "save": "t" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "save": "c", "expect": { "length": 1 } },
+    { "op": "cancel", "args": { "id": "$t.id" }, "expect": { "equals": { "status": "running" } } },
+    {
+      "op": "fail",
+      "args": { "id": "$t.id", "worker_id": "w1", "error": { "type": "Boom", "code": "boom", "message": "transient", "retryable": true, "details": {} }, "retryable": true },
+      "save": "f",
+      "expect": { "equals": { "status": "canceled" } }
+    },
+    { "op": "expect", "target": "$f", "notNull": ["completed_at_ms", "error"] },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w2", "lease_ms": 5000 }, "expect": { "length": 0 } },
+    { "op": "get", "args": { "id": "$t.id" }, "expect": { "equals": { "status": "canceled", "attempt": 1 } } }
+  ]
+}
