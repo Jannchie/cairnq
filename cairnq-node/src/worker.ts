@@ -154,7 +154,6 @@ export class Worker {
     const pollMs = this.opts.pollIntervalMs ?? 500;
     const batch = this.opts.claimBatch ?? concurrency;
     await this.store.connect();
-    this.installSignals();
     const running = new Set<Promise<void>>();
     while (!this.stopped) {
       const free = concurrency - running.size;
@@ -200,9 +199,15 @@ export class Worker {
    * SIGINT/SIGTERM, then close the store. Use this at a script's top level;
    * use run() / background() when you manage the event loop yourself. */
   async serve(opts: { concurrency?: number } = {}): Promise<void> {
+    // Signals are installed here rather than in run(): serve() is the entry point
+    // that owns the process. run()/background() embed the worker in someone
+    // else's process, where a leftover listener suppresses Node's default Ctrl-C
+    // handling for the host long after the worker is done.
+    const removeSignalHandlers = this.installSignals();
     try {
       await this.run(opts);
     } finally {
+      removeSignalHandlers();
       await this.closeIfOwned();
     }
   }
@@ -354,9 +359,21 @@ export class Worker {
     });
   }
 
-  private installSignals(): void {
-    const handler = () => this.stop();
-    process.once("SIGINT", handler);
-    process.once("SIGTERM", handler);
+  /** Take SIGINT/SIGTERM for the duration of serve(). Returns the undo. */
+  private installSignals(): () => void {
+    const remove = () => {
+      process.off("SIGINT", handler);
+      process.off("SIGTERM", handler);
+    };
+    const handler = () => {
+      // Stand down after the first signal, so a second Ctrl-C reaches Node's
+      // default and kills a worker that will not drain. `once` would only drop
+      // whichever signal fired and leave the other suppressing the default.
+      remove();
+      this.stop();
+    };
+    process.on("SIGINT", handler);
+    process.on("SIGTERM", handler);
+    return remove;
   }
 }

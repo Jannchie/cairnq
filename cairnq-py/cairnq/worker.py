@@ -207,9 +207,15 @@ class Worker:
         when you already have a running event loop."""
 
         async def _main() -> None:
+            # Signals are installed here rather than in run(): serve() is the entry
+            # point that owns the process. run()/background() embed the worker in
+            # someone else's process, where taking SIGINT/SIGTERM replaces the
+            # host's own shutdown handler for good.
+            remove_signal_handlers = self._install_signal_handlers()
             try:
                 await self.run(concurrency=concurrency)
             finally:
+                remove_signal_handlers()
                 await self._close_if_owned()
 
         asyncio.run(_main())
@@ -227,7 +233,6 @@ class Worker:
             self._concurrency = concurrency
         batch = self._batch or self._concurrency
         await self._store.connect()
-        self._install_signal_handlers()
         running: set[asyncio.Task] = set()
         try:
             while not self._stop.is_set():
@@ -350,13 +355,30 @@ class Worker:
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
 
-    def _install_signal_handlers(self) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, self._stop.set)
-        except (NotImplementedError, RuntimeError, ValueError):
-            pass  # not the main thread / unsupported platform
+    def _install_signal_handlers(self) -> Callable[[], None]:
+        """Take SIGINT/SIGTERM for the duration of serve(). Returns the undo."""
+        loop = asyncio.get_running_loop()
+        installed: list[signal.Signals] = []
+
+        def remove() -> None:
+            for sig in installed:
+                with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                    loop.remove_signal_handler(sig)
+            installed.clear()
+
+        def handle() -> None:
+            # Stand down after the first signal, so a second Ctrl-C reaches
+            # Python's default and interrupts a worker that will not drain.
+            remove()
+            self._stop.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, handle)
+                installed.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass  # not the main thread / unsupported platform
+        return remove
 
     @contextlib.asynccontextmanager
     async def background(self, *, concurrency: int | None = None):
