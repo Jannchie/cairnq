@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import Database from "better-sqlite3";
 
@@ -20,6 +20,25 @@ const WAL_RETRY_BUDGET_MS = 5_000;
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
+
+/**
+ * Serializes every SQLiteStore on one database file, process-wide.
+ *
+ * better-sqlite3 is synchronous, and a transaction holds SQLite's write lock
+ * across `await`s (the callback seam is shared with Postgres, so it is async). A
+ * second connection in this process then blocks the only thread waiting for that
+ * lock, and the holder can never reach COMMIT — reaching it needs the thread the
+ * waiter is sitting on. busy_timeout cannot break that inversion, being one
+ * thread; the wait just burns the timeout and throws "database is locked". So the
+ * two must not overlap at all.
+ *
+ * Keyed by database, not by store: what the lock protects is the file. Across
+ * processes there is no inversion (the holder keeps its own thread) and
+ * busy_timeout still applies. An in-memory database is private to one connection
+ * and gets a key of its own.
+ */
+const fileLocks = new Map<string, Promise<unknown>>();
+let memoryDbSeq = 0;
 
 /**
  * Put the database in WAL mode, waiting out a concurrent cold start.
@@ -68,10 +87,8 @@ export class SQLiteStore extends TaskStore {
   private db: DB | null = null;
   private stmts: Record<string, Stmt> = {};
   private readonly statements: Record<string, string>;
-  // Serializes operations within this process. The driver is synchronous, but a
-  // transaction here spans several awaits, and without this a second operation
-  // would resume in the gap and land its statements inside the open transaction.
-  private mutex: Promise<unknown> = Promise.resolve();
+  /** This store's entry in `fileLocks` — see there for why it is per-database. */
+  private readonly lockKey: string;
 
   constructor(
     private readonly path: string,
@@ -79,6 +96,9 @@ export class SQLiteStore extends TaskStore {
   ) {
     super();
     this.statements = loadStatements("sqlite");
+    // Two `:memory:` handles share a path but not a database, so they must not
+    // share a lock either.
+    this.lockKey = path === ":memory:" ? `memory#${memoryDbSeq++}` : resolve(path);
   }
 
   async connect(): Promise<void> {
@@ -211,12 +231,16 @@ export class SQLiteStore extends TaskStore {
     return stmt.all(bound) as any[];
   }
 
-  /** Serialize an operation against every other operation on this store. */
+  /** Serialize an operation against every other operation on this database. */
   private withLock<T>(fn: () => T | Promise<T>): Promise<T> {
-    const run = this.mutex.then(fn, fn) as Promise<T>;
-    this.mutex = run.then(
-      () => undefined,
-      () => undefined,
+    const previous = fileLocks.get(this.lockKey) ?? Promise.resolve();
+    const run = previous.then(fn, fn) as Promise<T>;
+    fileLocks.set(
+      this.lockKey,
+      run.then(
+        () => undefined,
+        () => undefined,
+      ),
     );
     return run;
   }
