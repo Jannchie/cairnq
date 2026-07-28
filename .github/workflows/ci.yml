@@ -96,10 +96,13 @@ jobs:
       # node: `pg` is an optionalDependency, installed by default.
       - run: pnpm install --frozen-lockfile
         working-directory: cairnq-node
-      - run: pnpm exec vitest run test/postgres.live.test.ts
+      # The live smoke plus the full conformance suite, which runs every scenario
+      # against Postgres too when a DSN is present — that is what holds the two
+      # dialects to the same behavior.
+      - run: pnpm exec vitest run test/postgres.live.test.ts test/conformance.test.ts
         working-directory: cairnq-node
       # python: asyncpg comes from the `postgres` extra.
       - run: uv sync --extra dev --extra postgres
         working-directory: cairnq-py
-      - run: uv run pytest tests/test_postgres_live.py -q
+      - run: uv run pytest tests/test_postgres_live.py tests/test_conformance.py -q
         working-directory: cairnq-py

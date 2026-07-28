@@ -1,7 +1,8 @@
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import pg from "pg";
 
 import { CairnQ, STATUSES } from "../src/index.js";
 import { TERMINAL } from "../src/models.js";
@@ -43,6 +44,39 @@ describe("conformance", () => {
       } finally {
         await client.close();
       }
+    });
+  }
+});
+
+// The scenarios are dialect-neutral by design, so the Postgres backend must pass
+// the same suite — that is what keeps sql/postgres/*.sql from drifting from
+// sql/sqlite/*.sql in behavior, not just in wording. Skipped without a DSN; CI's
+// `postgres` job provides one.
+const PG_DSN = process.env.CAIRNQ_TEST_PG_DSN;
+const pgDescribe = PG_DSN ? describe : describe.skip;
+
+pgDescribe("conformance (postgres)", () => {
+  let client: CairnQ;
+  let admin: pg.Pool;
+
+  beforeAll(async () => {
+    client = CairnQ.postgres(PG_DSN!);
+    await client.connect(); // applies migrations
+    admin = new pg.Pool({ connectionString: PG_DSN });
+  });
+
+  afterAll(async () => {
+    await admin.end();
+    await client.close();
+  });
+
+  // Scenarios assume an empty store; a real database is shared across them.
+  beforeEach(() => admin.query("truncate cairnq_tasks, cairnq_task_keys").then(() => undefined));
+
+  for (const file of files) {
+    it(file.replace(".json", ""), async () => {
+      const data = JSON.parse(readFileSync(join(scenarioDir, file), "utf-8"));
+      await new Runner(client).run(data.steps);
     });
   }
 });

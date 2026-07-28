@@ -1,4 +1,5 @@
 import json
+import os
 import re
 
 import pytest
@@ -11,6 +12,7 @@ from ._runner import Runner
 
 SCENARIO_DIR = find_protocol_root() / "conformance" / "scenarios"
 SCENARIOS = sorted(SCENARIO_DIR.glob("*.json"))
+PG_DSN = os.environ.get("CAIRNQ_TEST_PG_DSN")
 
 
 @pytest.mark.parametrize("scenario_path", SCENARIOS, ids=lambda p: p.stem)
@@ -19,6 +21,29 @@ async def test_conformance(scenario_path, tmp_path):
     client = CairnQ.sqlite(str(tmp_path / "t.db"))
     await client.connect()
     try:
+        await Runner(client).run(data["steps"])
+    finally:
+        await client.close()
+
+
+@pytest.mark.skipif(not PG_DSN, reason="set CAIRNQ_TEST_PG_DSN to run the PG conformance suite")
+@pytest.mark.parametrize("scenario_path", SCENARIOS, ids=lambda p: p.stem)
+async def test_conformance_postgres(scenario_path):
+    """The scenarios are dialect-neutral by design, so the Postgres backend must
+    pass the same suite — that is what keeps sql/postgres/*.sql from drifting from
+    sql/sqlite/*.sql in behavior, not just in wording."""
+    import asyncpg
+
+    data = json.loads(scenario_path.read_text(encoding="utf-8"))
+    client = CairnQ.postgres(PG_DSN)
+    await client.connect()
+    try:
+        # Scenarios assume an empty store; a real database is shared across them.
+        admin = await asyncpg.connect(PG_DSN)
+        try:
+            await admin.execute("truncate cairnq_tasks, cairnq_task_keys")
+        finally:
+            await admin.close()
         await Runner(client).run(data["steps"])
     finally:
         await client.close()
