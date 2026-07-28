@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 
 from cairnq._sql import load_statements
-from cairnq.store.postgres import to_positional
+from cairnq.store.postgres import positional_statement, to_positional
 
 
 def test_collapses_repeated_name_to_one_slot():
@@ -37,3 +37,20 @@ def test_every_postgres_statement_has_no_leftover_named_params():
     for name, sql in load_statements("postgres").items():
         text, _ = to_positional(sql, defaultdict(lambda: None))
         assert not leftover.search(text), f"{name} has a leftover :named param"
+
+
+def test_translation_is_memoized_on_the_statement():
+    """Statement text is loaded once and never varies, so the rewrite is done
+    once. Without this every Postgres query re-scans its SQL with two regexes —
+    on the worker's poll loop, for a result that cannot have changed."""
+    sql = load_statements("postgres")["claim"]
+    assert positional_statement(sql) is positional_statement(sql)
+
+
+def test_memoized_translation_still_binds_per_call_values():
+    """The cache holds the rewrite, not the values — two calls with different
+    params must not share a value list."""
+    sql = "select * from t where id = :id"
+    _, first = to_positional(sql, {"id": "a"})
+    _, second = to_positional(sql, {"id": "b"})
+    assert first == ["a"] and second == ["b"]

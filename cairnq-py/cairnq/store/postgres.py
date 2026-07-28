@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
 from collections.abc import AsyncIterator
+from functools import lru_cache
 from typing import Any
 
 from .._sql import load_migrations, load_statements
@@ -24,17 +24,31 @@ from .base import COMMENT, NAMED, Fetch, TaskStore, statement_params
 
 SUPPORTED_PROTOCOL_MAJOR = 1
 
-def to_positional(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
-    """Translate the protocol's named-parameter SQL (`:name`) into asyncpg
+
+@lru_cache(maxsize=None)
+def positional_statement(sql: str) -> tuple[str, tuple[str, ...]]:
+    """The rewritten SQL and the order its `$n` slots must be filled in.
+
+    Translates the protocol's named-parameter SQL (`:name`) into asyncpg
     positional placeholders (`$1`), collapsing each DISTINCT name to ONE slot —
     statements reuse a name across CASE branches / IS NULL guards (e.g. list.sql).
     Which names count as parameters is `statement_params`' decision, shared with
     the SQLite binding path so the two can't disagree about, say, a `::type` cast.
-    Names the statement does not use are simply not bound, so callers may pass a
-    superset."""
+
+    Memoized on the statement text, which is loaded once and never varies: this
+    runs on every query, including the worker's poll loop, for a result that
+    cannot have changed.
+    """
     order = statement_params(sql)
     slot = {name: i + 1 for i, name in enumerate(order)}  # 1-based $n
-    text = NAMED.sub(lambda m: f"${slot[m.group(1)]}", COMMENT.sub("", sql))
+    return NAMED.sub(lambda m: f"${slot[m.group(1)]}", COMMENT.sub("", sql)), order
+
+
+def to_positional(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
+    """The statement's rewritten text plus this call's values, in slot order.
+    Names the statement does not use are simply not bound, so callers may pass a
+    superset."""
+    text, order = positional_statement(sql)
     return text, [params[n] for n in order]
 
 

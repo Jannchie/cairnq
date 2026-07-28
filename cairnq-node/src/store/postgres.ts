@@ -27,22 +27,44 @@ async function loadPg(): Promise<typeof import("pg")> {
   return pg;
 }
 
+const translated = new Map<string, { text: string; order: readonly string[] }>();
+
 /**
- * Translate the protocol's named-parameter SQL (`:name`) into Postgres positional
+ * The rewritten SQL and the order its `$n` slots must be filled in.
+ *
+ * Translates the protocol's named-parameter SQL (`:name`) into Postgres positional
  * placeholders (`$1`), collapsing each DISTINCT name to ONE slot — statements reuse
  * a name across CASE branches / IS NULL guards (e.g. list.sql). Which names count
  * as parameters is `statementParams`' decision, shared with the SQLite binding path
- * so the two can't disagree about, say, a `::type` cast. Names the statement does
- * not use are simply not bound, so callers may pass a superset. Exported for unit
- * testing.
+ * so the two can't disagree about, say, a `::type` cast.
+ *
+ * Memoized on the statement text, which is loaded once and never varies: this runs
+ * on every query, including the worker's poll loop, for a result that cannot have
+ * changed. Exported for unit testing.
+ */
+export function positionalStatement(sql: string): { text: string; order: readonly string[] } {
+  let entry = translated.get(sql);
+  if (!entry) {
+    const order = statementParams(sql);
+    const slot = new Map(order.map((name, i) => [name, i + 1])); // 1-based $n
+    const text = sql
+      .replace(COMMENT, "")
+      .replace(NAMED, (_m, name: string) => `$${slot.get(name)}`);
+    entry = { text, order };
+    translated.set(sql, entry);
+  }
+  return entry;
+}
+
+/**
+ * The statement's rewritten text plus this call's values, in slot order. Names the
+ * statement does not use are simply not bound, so callers may pass a superset.
  */
 export function toPositional(
   sql: string,
   params: Params,
 ): { text: string; values: unknown[] } {
-  const order = statementParams(sql);
-  const slot = new Map(order.map((name, i) => [name, i + 1])); // 1-based $n
-  const text = sql.replace(COMMENT, "").replace(NAMED, (_m, name: string) => `$${slot.get(name)}`);
+  const { text, order } = positionalStatement(sql);
   return { text, values: order.map((n) => params[n]) };
 }
 

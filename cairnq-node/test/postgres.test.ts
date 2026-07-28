@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { loadStatements } from "../src/sql.js";
-import { toPositional } from "../src/store/postgres.js";
+import { positionalStatement, toPositional } from "../src/store/postgres.js";
 
 // PostgresStore behavior (claim races, lock semantics) is exercised by the
 // conformance suite against a real PG instance. These are pure-function tests for
@@ -35,5 +35,19 @@ describe("toPositional", () => {
       const { text } = toPositional(sql, {});
       expect(text, name).not.toMatch(/(?<!:):\w/);
     }
+  });
+
+  it("does the rewrite once per statement", () => {
+    // Statement text is loaded once and never varies, so the rewrite is done
+    // once. Without this every Postgres query re-scans its SQL with two regexes
+    // — on the worker's poll loop, for a result that cannot have changed.
+    const sql = loadStatements("postgres").claim;
+    expect(positionalStatement(sql)).toBe(positionalStatement(sql));
+  });
+
+  it("still binds per-call values behind the cache", () => {
+    const sql = "select * from t where id = :id";
+    expect(toPositional(sql, { id: "a" }).values).toEqual(["a"]);
+    expect(toPositional(sql, { id: "b" }).values).toEqual(["b"]);
   });
 });
