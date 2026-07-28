@@ -151,10 +151,27 @@ export class Worker {
   async run(opts: { concurrency?: number } = {}): Promise<void> {
     const concurrency = opts.concurrency ?? this.opts.concurrency ?? 1;
     const leaseMs = this.opts.leaseMs ?? 30_000;
-    const pollMs = this.opts.pollIntervalMs ?? 500;
     const batch = this.opts.claimBatch ?? concurrency;
     await this.store.connect();
     const running = new Set<Promise<void>>();
+    try {
+      await this.loop(concurrency, batch, leaseMs, running);
+    } finally {
+      // Whatever ends the loop — stop(), or something unexpected out of the body
+      // — nothing this worker started may outlive run(). serve() closes the store
+      // as soon as run() settles, and a handler still holding the connection
+      // would fault on it.
+      await Promise.all([...running]);
+    }
+  }
+
+  private async loop(
+    concurrency: number,
+    batch: number,
+    leaseMs: number,
+    running: Set<Promise<void>>,
+  ): Promise<void> {
+    const pollMs = this.opts.pollIntervalMs ?? 500;
     while (!this.stopped) {
       const free = concurrency - running.size;
       if (free <= 0) {
@@ -192,7 +209,6 @@ export class Worker {
         running.add(p);
       }
     }
-    await Promise.all([...running]);
   }
 
   /** Blocking-style entry point for a standalone worker process: run until

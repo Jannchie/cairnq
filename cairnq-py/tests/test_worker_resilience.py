@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
+import pytest
+
 from cairnq import Worker
 from cairnq.store.sqlite import SQLiteStore
 
@@ -121,3 +123,38 @@ async def test_lost_lease_is_signalled_to_the_running_handler(client, db_path):
 
     assert observed["flag"] is True
     assert observed["event"] is True
+
+
+async def test_run_drains_in_flight_tasks_however_it_exits(db_path, client):
+    """run() promises that when it returns, nothing it started is still running —
+    serve() closes the store the moment it returns, and a handler still holding
+    the connection would fault. Pinned in both SDKs so the guarantee is known to
+    hold on each rather than assumed from one."""
+    store = SQLiteStore(db_path)
+    await store.connect()
+    real_claim = store.claim
+    calls = {"n": 0}
+
+    async def broken_claim(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await real_claim(**kwargs)
+        return object()  # a store that breaks its own contract: truthy, not a list
+
+    store.claim = broken_claim
+    finished = {"flag": False}
+    # Two slots, so the loop comes back around to the broken claim while the first
+    # task is still running.
+    worker = Worker(store, ["default"], poll_interval_ms=5, concurrency=2)
+
+    @worker.task("job")
+    async def job(ctx):
+        await asyncio.sleep(0.2)
+        finished["flag"] = True
+        return {}
+
+    await client.submit("job", {})
+    with pytest.raises(TypeError):
+        await worker.run()
+    assert finished["flag"], "run() returned while a handler was still running"
+    await store.close()

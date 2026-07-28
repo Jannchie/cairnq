@@ -90,6 +90,36 @@ describe("worker resilience", () => {
     expect(pending).toBeLessThan(5);
   });
 
+  it("drains in-flight tasks however the run loop exits", async () => {
+    // run() promises that when it settles, nothing it started is still running —
+    // serve() closes the store the moment it returns, and a handler still holding
+    // the connection would fault. The normal exits honour that; an unexpected
+    // throw out of the loop body used to skip it and abandon the in-flight work.
+    const store = new SQLiteStore(dbPath);
+    await store.connect();
+    const realClaim = store.claim.bind(store);
+    let calls = 0;
+    store.claim = async (input) => {
+      calls += 1;
+      if (calls === 1) return realClaim(input);
+      return undefined as never; // a store that breaks its own contract
+    };
+    let finished = false;
+    // Two slots, so the loop comes back around to the broken claim while the
+    // first task is still running.
+    const worker = new Worker(store, ["default"], { pollIntervalMs: 5, concurrency: 2 });
+    worker.task("job", async () => {
+      await sleep(200);
+      finished = true;
+      return {};
+    });
+
+    await client.submit("job", {});
+    await expect(worker.run()).rejects.toThrow();
+    expect(finished, "run() settled while a handler was still running").toBe(true);
+    await store.close();
+  });
+
   it("signals a lost lease to the running handler", async () => {
     const worker = Worker.sqlite(dbPath, {
       queues: ["default"],
