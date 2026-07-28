@@ -169,6 +169,10 @@ Retries carry **exponential backoff**: a failed attempt is requeued at
 `now + base * 2^(attempt-1)`, capped (SDK defaults: 1s base, 30s cap, 0 disables).
 The delay is the SDK's decision — the protocol only carries `:delay_ms` on `fail`.
 
+`progress` / `message` describe the attempt in flight, so **every path back to
+`queued` clears them** — a retryable `fail`, `retry`, and `recover_leases`. A
+terminal record keeps them, as the history of how far the last attempt got.
+
 Per-statement parameters are documented in the header comment of each
 `sql/<dialect>/*.sql` file.
 

@@ -22,6 +22,12 @@ set
                  then :lease_expired_error else error end,
     completed_at_ms = case when cancel_requested_at_ms is null and attempt < max_attempts
                            then completed_at_ms else :now_ms end,
+    -- Only the requeue branch clears them: they describe the dead attempt, and a
+    -- task waiting to be redelivered must not report its progress bar.
+    progress = case when cancel_requested_at_ms is null and attempt < max_attempts
+                    then null else progress end,
+    message = case when cancel_requested_at_ms is null and attempt < max_attempts
+                   then null else message end,
     updated_at_ms = :now_ms
 where status = 'running'
   and lease_until_ms is not null

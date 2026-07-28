@@ -1,0 +1,23 @@
+{
+  "name": "requeue_resets_progress",
+  "description": "progress/message describe the attempt in flight, so every path back to 'queued' clears them: a retryable fail, a manual retry, and lease recovery. A terminal record keeps them — that is the history of what happened. Otherwise a re-queued task reports the dead attempt's progress bar until the next one overwrites it.",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "max_attempts": 5 }, "save": "t" },
+
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "progress", "args": { "id": "$t.id", "worker_id": "w1", "progress": 0.7, "message": "half" }, "expect": { "equals": { "progress": 0.7, "message": "half" } } },
+    { "op": "fail", "args": { "id": "$t.id", "worker_id": "w1", "error": { "type": "E", "code": "e", "message": "boom", "retryable": true }, "retryable": true, "delay_ms": 0 }, "expect": { "equals": { "status": "queued" }, "isNull": ["progress", "message"] } },
+
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w2", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "progress", "args": { "id": "$t.id", "worker_id": "w2", "progress": 0.4, "message": "again" } },
+    { "op": "fail", "args": { "id": "$t.id", "worker_id": "w2", "error": { "type": "E", "code": "e", "message": "boom", "retryable": false }, "retryable": false, "delay_ms": 0 }, "expect": { "equals": { "status": "failed", "progress": 0.4, "message": "again" } } },
+
+    { "op": "retry", "args": { "id": "$t.id" }, "expect": { "equals": { "status": "queued" }, "isNull": ["progress", "message"] } },
+
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w3", "lease_ms": 150 }, "expect": { "length": 1 } },
+    { "op": "progress", "args": { "id": "$t.id", "worker_id": "w3", "progress": 0.9, "message": "nearly" } },
+    { "op": "sleep", "args": { "ms": 300 } },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w4", "lease_ms": 5000 }, "save": "recovered", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$recovered.0", "equals": { "status": "running", "worker_id": "w4" }, "isNull": ["progress", "message"] }
+  ]
+}

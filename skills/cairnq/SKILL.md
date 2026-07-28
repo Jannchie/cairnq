@@ -131,6 +131,9 @@ if (got && isSucceeded(got)) use(got.result);   // also isFailed/isCanceled/isRu
   partition work by task name: two workers with different handler sets (say a
   Python one and a TypeScript one) can share `default` and each takes only its
   own. A worker with no handlers registered claims nothing.
+- **Progress belongs to the attempt.** Anything that puts a task back in `queued`
+  — a retryable failure, `retry`, a worker crash — clears `progress`/`message`. A
+  terminal task keeps them, so a failed task still shows how far it got.
 - **Cooperative cancel.** Cancelling a *queued* task is immediate. Cancelling a
   *running* one only sets a flag — the handler must `if await ctx.canceled(): return`.
   On return the task finalizes as `canceled` and **the result is discarded** (cancel

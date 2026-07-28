@@ -7,7 +7,10 @@
 --      (run_at = now + :delay_ms).
 --   3. otherwise -> terminal 'failed'.
 -- The error envelope is recorded on every branch, so a canceled-while-failing
--- task still carries why its last attempt failed.
+-- task still carries why its last attempt failed. progress/message describe the
+-- attempt in flight, so only the requeue branch clears them: a terminal record
+-- keeps how far the last attempt got, a re-queued one must not advertise a dead
+-- attempt's progress bar until the next attempt overwrites it.
 -- :retryable is a native boolean. :error is bound as jsonb. Time from the DB clock.
 -- params: id, worker_id, error (jsonb), retryable (boolean), delay_ms
 update cairnq_tasks
@@ -26,6 +29,10 @@ set
                      then (extract(epoch from now()) * 1000)::bigint + :delay_ms else run_at_ms end,
     completed_at_ms = case when cancel_requested_at_ms is null and :retryable and attempt < max_attempts
                            then null else (extract(epoch from now()) * 1000)::bigint end,
+    progress = case when cancel_requested_at_ms is null and :retryable and attempt < max_attempts
+                    then null else progress end,
+    message = case when cancel_requested_at_ms is null and :retryable and attempt < max_attempts
+                   then null else message end,
     updated_at_ms = (extract(epoch from now()) * 1000)::bigint
 where id = :id
   and status = 'running'
