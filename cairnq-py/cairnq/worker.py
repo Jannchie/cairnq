@@ -120,10 +120,15 @@ class Worker:
         queues: list[str] | tuple[str, ...] = ("default",),
         concurrency: int = 1,
         lease_ms: int = 30_000,
+        busy_timeout_ms: int = 5_000,
         **kwargs: Any,
     ) -> "Worker":
         worker = cls(
-            SQLiteStore(path), queues, concurrency=concurrency, lease_ms=lease_ms, **kwargs
+            SQLiteStore(path, busy_timeout_ms=busy_timeout_ms),
+            queues,
+            concurrency=concurrency,
+            lease_ms=lease_ms,
+            **kwargs,
         )
         worker._owns_store = True
         return worker
@@ -136,6 +141,8 @@ class Worker:
         queues: list[str] | tuple[str, ...] = ("default",),
         concurrency: int = 1,
         lease_ms: int = 30_000,
+        min_size: int = 1,
+        max_size: int = 10,
         **kwargs: Any,
     ) -> "Worker":
         """Multi-host backend. `dsn` is a libpq connection string; requires the
@@ -143,7 +150,11 @@ class Worker:
         from .store.postgres import PostgresStore
 
         worker = cls(
-            PostgresStore(dsn), queues, concurrency=concurrency, lease_ms=lease_ms, **kwargs
+            PostgresStore(dsn, min_size=min_size, max_size=max_size),
+            queues,
+            concurrency=concurrency,
+            lease_ms=lease_ms,
+            **kwargs,
         )
         worker._owns_store = True
         return worker

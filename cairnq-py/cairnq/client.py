@@ -49,6 +49,8 @@ class CairnQ:
         max_attempts: int = 3,
         priority: int = 0,
         metadata: dict[str, Any] | None = None,
+        parent_id: str | None = None,
+        root_id: str | None = None,
         correlation_id: str | None = None,
         run_at_delay_ms: int = 0,
     ) -> Task:
@@ -61,6 +63,8 @@ class CairnQ:
             max_attempts=max_attempts,
             priority=priority,
             metadata=metadata,
+            parent_id=parent_id,
+            root_id=root_id,
             correlation_id=correlation_id,
             run_at_delay_ms=run_at_delay_ms,
         )
@@ -71,8 +75,26 @@ class CairnQ:
     async def get_by_key(self, key: str) -> Task | None:
         return await self._store.get_by_key(key)
 
-    async def list(self, **filters: Any) -> list[Task]:
-        return await self._store.list(**filters)
+    async def list(
+        self,
+        *,
+        status: str | None = None,
+        queue: str | None = None,
+        name: str | None = None,
+        root_id: str | None = None,
+        correlation_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Task]:
+        return await self._store.list(
+            status=status,
+            queue=queue,
+            name=name,
+            root_id=root_id,
+            correlation_id=correlation_id,
+            limit=limit,
+            offset=offset,
+        )
 
     async def cancel(self, task_id: str) -> Task | None:
         return await self._store.cancel(task_id)
