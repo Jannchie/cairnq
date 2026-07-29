@@ -6,6 +6,9 @@
 -- recover_leases MUST run first in the SAME transaction. READ COMMITTED suffices:
 -- each UPDATE re-checks its WHERE against the latest committed row, so racing
 -- claims/recovers can neither double-dispatch a task nor double-recover a lease.
+-- Time is clock_timestamp(), not now(): now() freezes at BEGIN, and this runs
+-- after recover_leases in a transaction that may have waited on row locks — a
+-- lease stamped from the transaction start would already be short by that wait.
 --
 -- :names is the set of task names the caller can actually run, or NULL for no
 -- filter. A worker passes its registered handler names: queues alone do not
@@ -17,15 +20,15 @@ update cairnq_tasks t
 set
     status = 'running',
     worker_id = :worker_id,
-    lease_until_ms = (extract(epoch from now()) * 1000)::bigint + :lease_ms,
+    lease_until_ms = (extract(epoch from clock_timestamp()) * 1000)::bigint + :lease_ms,
     attempt = attempt + 1,
-    updated_at_ms = (extract(epoch from now()) * 1000)::bigint
+    updated_at_ms = (extract(epoch from clock_timestamp()) * 1000)::bigint
 from (
     select id from cairnq_tasks
     where status = 'queued'
       and queue = any(:queues::text[])
       and (:names::text[] is null or name = any(:names::text[]))
-      and run_at_ms <= (extract(epoch from now()) * 1000)::bigint
+      and run_at_ms <= (extract(epoch from clock_timestamp()) * 1000)::bigint
     order by priority desc, created_at_ms asc
     limit :limit
     for update skip locked
