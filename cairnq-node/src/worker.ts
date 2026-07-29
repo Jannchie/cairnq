@@ -25,6 +25,15 @@ export interface WorkerOptions {
   /** Ceiling for the doubling. */
   retryBackoffMaxMs?: number;
   /**
+   * Wall-clock ceiling for one attempt. The heartbeat renews the lease for as
+   * long as a handler runs, so a hung handler would otherwise hold its task
+   * `running` (and its concurrency slot) forever — cancel can't help,
+   * cooperative checks need a live handler. On expiry the worker abandons the
+   * attempt (ctx.signal aborts, further ctx writes throw LostLease) and records
+   * a retryable `handler_timeout` failure. Unset disables the ceiling.
+   */
+  maxRunMs?: number;
+  /**
    * Called for errors the worker survived — a claim that threw, a store write
    * that failed while finalizing a task. Without it these are silent: the run
    * loop carries on either way, so this is the only place an operator learns a
@@ -55,6 +64,24 @@ function exceptionEnvelope(err: unknown): Record<string, unknown> {
   });
 }
 
+/** Internal: an attempt outran maxRunMs and was abandoned. */
+class AttemptTimeout extends Error {
+  constructor(readonly maxRunMs: number) {
+    super(`attempt exceeded ${maxRunMs}ms`);
+  }
+}
+
+function timeoutEnvelope(name: string, maxRunMs: number): Record<string, unknown> {
+  return errorEnvelope({
+    type: "HandlerTimeout",
+    code: "handler_timeout",
+    message: `handler for ${name} exceeded maxRunMs=${maxRunMs}ms; the attempt was abandoned`,
+    retryable: true,
+  });
+}
+
+const TIMED_OUT = Symbol("cairnq.timedOut");
+
 export class Worker {
   private readonly handlers = new Map<string, Handler>();
   private readonly workerId = newId("worker");
@@ -71,7 +98,11 @@ export class Worker {
     private readonly store: TaskStore,
     private readonly queues: string[],
     private readonly opts: WorkerOptions = {},
-  ) {}
+  ) {
+    if (opts.maxRunMs != null && opts.maxRunMs <= 0) {
+      throw new Error(`maxRunMs must be > 0, got ${opts.maxRunMs}`);
+    }
+  }
 
   static sqlite(
     path: string,
@@ -270,9 +301,15 @@ export class Worker {
       }
       let result: unknown;
       try {
-        result = await handler(ctx, task.payload);
+        result = await this.attempt(handler, ctx, task);
       } catch (err) {
         if (err instanceof LostLease) return;
+        if (err instanceof AttemptTimeout) {
+          // Recorded as a retryable failure, so backoff / maxAttempts /
+          // cancel-wins all apply exactly as for a thrown error.
+          await this.safeFail(task, timeoutEnvelope(task.name, err.maxRunMs), true);
+          return;
+        }
         if (err instanceof TaskError) {
           await this.safeFail(task, err.envelope(), err.retryable);
         } else {
@@ -315,6 +352,33 @@ export class Worker {
       hb.cancel();
       await hb.done;
     }
+  }
+
+  /**
+   * Run one attempt, bounded by maxRunMs when set. On timeout the attempt is
+   * abandoned: the context is flagged lease-lost first (ctx.signal aborts, and
+   * a handler that keeps running can never write again — see
+   * TaskContext.owned), then the still-pending promise is left to settle on
+   * its own, its outcome discarded. The caller records the handler_timeout
+   * failure; lease recovery is NOT involved, so redelivery is immediate.
+   */
+  private async attempt(handler: Handler, ctx: TaskContext, task: Task): Promise<unknown> {
+    const maxRunMs = this.opts.maxRunMs;
+    if (maxRunMs == null) return handler(ctx, task.payload);
+    // As a real promise: the race needs one (a handler may return a plain
+    // value), and the timeout path .catch()es it.
+    const run = (async () => handler(ctx, task.payload))();
+    let timer!: NodeJS.Timeout;
+    const winner = await Promise.race([
+      run,
+      new Promise<typeof TIMED_OUT>((r) => (timer = setTimeout(() => r(TIMED_OUT), maxRunMs))),
+    ]).finally(() => clearTimeout(timer));
+    if (winner !== TIMED_OUT) return winner;
+    ctx.markLeaseLost();
+    // The zombie may still reject later; that must not become an unhandled
+    // rejection — its outcome was already decided to be handler_timeout.
+    run.catch(() => {});
+    throw new AttemptTimeout(maxRunMs);
   }
 
   private startHeartbeat(

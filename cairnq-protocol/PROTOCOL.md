@@ -120,7 +120,20 @@ A worker **leases** a task rather than popping it:
   worker discards the outcome) and exposes the loss on the context —
   `ctx.lostLease` / `ctx.signal` (TS), `ctx.lost_lease` / `ctx.lease_lost`
   (Python). A handler doing real side effects should check it, because the same
-  task is now running elsewhere.
+  task is now running elsewhere. Once flagged, the SDK also short-circuits
+  further owned writes locally, without touching the store — necessary, not an
+  optimization: after an abandoned attempt the same worker may re-claim the task
+  under the same `worker_id`, and a leftover handler's write would otherwise
+  pass the ownership check against the *new* attempt.
+- **A hung handler is bounded by an SDK-side ceiling, not by the protocol.** The
+  heartbeat renews the lease for as long as the handler runs, so a handler that
+  never returns would hold its task `running` forever. Each SDK offers a worker
+  option (`max_run_ms` / `maxRunMs`) that abandons the attempt at a wall-clock
+  ceiling: the context is flagged lease-lost (Python additionally cancels the
+  handler task; TS aborts `ctx.signal`), and the worker records a retryable
+  `handler_timeout` failure through the ordinary `fail` statement — backoff,
+  `max_attempts` and cancel-wins apply unchanged. Protocol-invisible: only
+  `fail` crosses the wire.
 - `recover_leases` (run just before `claim`, same transaction) reclaims expired
   running tasks: cancel requested → `canceled`; else `attempt < max_attempts` →
   back to `queued`; else → `failed` with a lease-expired error envelope.

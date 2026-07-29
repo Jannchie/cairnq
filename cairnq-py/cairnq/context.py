@@ -86,6 +86,13 @@ class TaskContext:
         return task
 
     async def _owned(self, write: Callable[[], Awaitable[Task]]) -> Task:
+        # Short-circuit once the lease is known lost: nothing this context
+        # writes may be recorded any more. Locally, not just via the store's
+        # ownership check — after an abandoned (timed-out) attempt the same
+        # worker may re-claim this task under the same worker_id, and a zombie
+        # handler's write would then pass ownership against the NEW attempt.
+        if self._lease_lost.is_set():
+            raise LostLease(self._task.id)
         try:
             return self._observe(await write())
         except LostLease:

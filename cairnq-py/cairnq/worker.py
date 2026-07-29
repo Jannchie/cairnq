@@ -38,6 +38,28 @@ def _exception_envelope(exc: BaseException) -> dict[str, Any]:
     )
 
 
+class _AttemptTimeout(Exception):
+    """Internal: an attempt outran max_run_ms and was abandoned."""
+
+
+def _timeout_envelope(name: str, max_run_ms: int) -> dict[str, Any]:
+    return error_envelope(
+        type="HandlerTimeout",
+        code="handler_timeout",
+        message=f"handler for {name!r} exceeded max_run_ms={max_run_ms}ms; "
+        "the attempt was abandoned",
+        retryable=True,
+    )
+
+
+def _consume_result(task: asyncio.Task) -> None:
+    """Retrieve an abandoned attempt's outcome so asyncio never logs it as an
+    unretrieved exception. The outcome itself is discarded — the task was
+    already failed as handler_timeout."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _wants_payload(handler: Handler) -> bool:
     """Whether a handler declares a parameter to receive the payload — a second
     positional arg, or *args. Decided once from the static signature at
@@ -88,8 +110,11 @@ class Worker:
         claim_batch: int | None = None,
         retry_backoff_ms: int = DEFAULT_RETRY_BACKOFF_MS,
         retry_backoff_max_ms: int = DEFAULT_RETRY_BACKOFF_MAX_MS,
+        max_run_ms: int | None = None,
         on_error: OnError | None = None,
     ):
+        if max_run_ms is not None and max_run_ms <= 0:
+            raise ValueError(f"max_run_ms must be > 0, got {max_run_ms}")
         self._store = store
         self._queues = list(queues)
         self._concurrency = concurrency
@@ -100,6 +125,11 @@ class Worker:
         self._batch = claim_batch
         self._retry_backoff_ms = retry_backoff_ms
         self._retry_backoff_max_ms = retry_backoff_max_ms
+        # Wall-clock ceiling for one attempt. The heartbeat renews the lease for
+        # as long as a handler runs, so a hung handler would otherwise hold its
+        # task `running` (and its concurrency slot) forever — cancel can't help,
+        # cooperative checks need a live handler. None disables the ceiling.
+        self._max_run_ms = max_run_ms
         # Called for errors the worker survived — a claim that threw, a store
         # write that failed while finalizing a task. Without it these are silent:
         # the run loop carries on either way, so this is the only place an
@@ -296,8 +326,15 @@ class Worker:
                 return
             handler, wants_payload = entry
             try:
-                result = await _invoke(handler, wants_payload, ctx, task.payload)
+                result = await self._attempt(handler, wants_payload, ctx, task)
             except LostLease:
+                return
+            except _AttemptTimeout:
+                # Recorded as a retryable failure, so backoff / max_attempts /
+                # cancel-wins all apply exactly as for a raised exception.
+                await self._safe_fail(
+                    task, _timeout_envelope(task.name, self._max_run_ms), retryable=True
+                )
                 return
             except TaskError as exc:  # handler chose how to fail
                 await self._safe_fail(task, exc.envelope(), retryable=exc.retryable)
@@ -336,6 +373,28 @@ class Worker:
             hb.cancel()
             with contextlib.suppress(BaseException):
                 await hb
+
+    async def _attempt(
+        self, handler: Handler, wants_payload: bool, ctx: TaskContext, task: Task
+    ) -> Any:
+        """Run one attempt, bounded by max_run_ms when set. On timeout the
+        attempt is abandoned: the context is flagged lease-lost first (so a
+        handler that survives cancellation can never write again — see
+        TaskContext._owned), then the handler task is cancelled and left to
+        die at its next await. The caller records the handler_timeout failure;
+        lease recovery is NOT involved, so redelivery is immediate."""
+        if self._max_run_ms is None:
+            return await _invoke(handler, wants_payload, ctx, task.payload)
+        runner = asyncio.create_task(_invoke(handler, wants_payload, ctx, task.payload))
+        done, _ = await asyncio.wait({runner}, timeout=self._max_run_ms / 1000)
+        if done:
+            return runner.result()  # or re-raises what the handler raised
+        ctx._mark_lease_lost()
+        runner.cancel()
+        # Not awaited: a handler that shields itself from cancellation would
+        # otherwise hold this slot for exactly the hang the ceiling exists for.
+        runner.add_done_callback(_consume_result)
+        raise _AttemptTimeout
 
     async def _heartbeat_loop(self, ctx: TaskContext) -> None:
         try:

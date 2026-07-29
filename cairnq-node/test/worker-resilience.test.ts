@@ -9,7 +9,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 
-import { CairnQ, Worker } from "../src/index.js";
+import { CairnQ, LostLease, Worker } from "../src/index.js";
+import type { TaskContext } from "../src/context.js";
 import { SQLiteStore } from "../src/store/sqlite.js";
 import { freshDbPath, sleep, waitFor } from "./helpers.js";
 
@@ -152,5 +153,74 @@ describe("worker resilience", () => {
 
     expect(observed).toBe(true);
     expect(aborted).toBe(true);
+  });
+
+  // ------------------------------------------------------------- maxRunMs
+  // Why the ceiling exists: see WorkerOptions.maxRunMs.
+
+  it("abandons a hung handler at maxRunMs and fails the task", async () => {
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, maxRunMs: 100 });
+    worker.task("hang", () => new Promise(() => {})); // never settles
+
+    let final;
+    await worker.background(async () => {
+      const t = await client.submit("hang", {}, { maxAttempts: 1 });
+      final = await client.wait(t.id, { timeoutMs: 3_000, pollMs: 20 });
+    });
+    expect(final!.status).toBe("failed");
+    expect(final!.error?.code).toBe("handler_timeout");
+  });
+
+  it("retries a timed-out attempt", async () => {
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, maxRunMs: 100, retryBackoffMs: 1 });
+    const attempts: number[] = [];
+    worker.task("flaky", async (ctx) => {
+      attempts.push(ctx.attempt);
+      if (ctx.attempt === 1) await new Promise(() => {}); // hang only once
+      return { attempt: ctx.attempt };
+    });
+
+    let final;
+    await worker.background(async () => {
+      const t = await client.submit("flaky", {});
+      final = await client.wait(t.id, { timeoutMs: 3_000, pollMs: 20 });
+    });
+    expect(final!.status).toBe("succeeded");
+    expect(final!.result).toEqual({ attempt: 2 });
+    expect(attempts).toEqual([1, 2]);
+  });
+
+  it("frees the concurrency slot after a timeout", async () => {
+    // concurrency=1: the hung task occupies the only slot until the ceiling
+    // abandons it; the queued task must then run rather than wait for a lease.
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, maxRunMs: 100, leaseMs: 60_000 });
+    worker.task("hang", () => new Promise(() => {}));
+    worker.task("quick", async () => ({ ok: true }));
+
+    await client.submit("hang", {}, { maxAttempts: 1 });
+    await worker.background(async () => {
+      await expect(client.call("quick", {}, { waitTimeoutMs: 3_000, pollMs: 20 })).resolves.toEqual(
+        { ok: true },
+      );
+    });
+  });
+
+  it("cuts a zombie handler off from the store after a timeout", async () => {
+    // The promise can't be cancelled, so the abandoned handler keeps running —
+    // its ctx must abort and refuse every further write (why: TaskContext.owned).
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, maxRunMs: 100 });
+    let zombieCtx: TaskContext | undefined;
+    worker.task("hang", (ctx) => {
+      zombieCtx = ctx;
+      return new Promise(() => {});
+    });
+
+    await worker.background(async () => {
+      const t = await client.submit("hang", {}, { maxAttempts: 1 });
+      await client.wait(t.id, { timeoutMs: 3_000, pollMs: 20 });
+    });
+    expect(zombieCtx!.lostLease).toBe(true);
+    expect(zombieCtx!.signal.aborted).toBe(true);
+    await expect(zombieCtx!.progress(0.9)).rejects.toThrow(LostLease);
   });
 });

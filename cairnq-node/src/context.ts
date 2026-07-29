@@ -75,6 +75,12 @@ export class TaskContext {
   }
 
   private async owned(write: () => Promise<Task>): Promise<Task> {
+    // Short-circuit once the lease is known lost: nothing this context writes
+    // may be recorded any more. Locally, not just via the store's ownership
+    // check — after an abandoned (timed-out) attempt the same worker may
+    // re-claim this task under the same workerId, and a zombie handler's write
+    // would then pass ownership against the NEW attempt.
+    if (this.leaseLost) throw new LostLease(this.task.id);
     try {
       return this.observe(await write());
     } catch (err) {

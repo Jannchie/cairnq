@@ -14,6 +14,7 @@ import sqlite3
 import pytest
 
 from cairnq import Worker
+from cairnq.errors import LostLease
 from cairnq.store.sqlite import SQLiteStore
 
 from .helpers import wait_for
@@ -158,3 +159,87 @@ async def test_run_drains_in_flight_tasks_however_it_exits(db_path, client):
         await worker.run()
     assert finished["flag"], "run() returned while a handler was still running"
     await store.close()
+
+
+# --------------------------------------------------------------- max_run_ms
+# Why the ceiling exists: see the max_run_ms comment in Worker.__init__.
+
+
+async def test_hung_handler_is_abandoned_at_max_run_ms(client, db_path):
+    worker = Worker.sqlite(db_path, poll_interval_ms=20, max_run_ms=100)
+    cancelled = asyncio.Event()
+
+    @worker.task("hang")
+    async def hang(ctx):
+        try:
+            await asyncio.Event().wait()  # never set: hung for good
+        finally:
+            cancelled.set()
+
+    task = await client.submit("hang", {}, max_attempts=1)
+    async with worker.background():
+        final = await client.wait(task.id, timeout_ms=3_000, poll_ms=20)
+        # The handler task is genuinely cancelled, not left running.
+        await asyncio.wait_for(cancelled.wait(), 2)
+
+    assert final.failed
+    assert final.error["code"] == "handler_timeout"
+
+
+async def test_timed_out_attempt_is_retried_with_backoff(client, db_path):
+    worker = Worker.sqlite(db_path, poll_interval_ms=20, max_run_ms=100, retry_backoff_ms=1)
+    attempts: list[int] = []
+
+    @worker.task("flaky")
+    async def flaky(ctx):
+        attempts.append(ctx.attempt)
+        if ctx.attempt == 1:
+            await asyncio.Event().wait()  # hang only on the first attempt
+        return {"attempt": ctx.attempt}
+
+    task = await client.submit("flaky", {})
+    async with worker.background():
+        final = await client.wait(task.id, timeout_ms=3_000, poll_ms=20)
+
+    assert final.succeeded
+    assert final.result == {"attempt": 2}
+    assert attempts == [1, 2]
+
+
+async def test_timeout_frees_the_concurrency_slot(client, db_path):
+    # concurrency=1: the hung task occupies the only slot until the ceiling
+    # abandons it; the queued task must then run rather than wait for a lease.
+    worker = Worker.sqlite(db_path, poll_interval_ms=20, max_run_ms=100, lease_ms=60_000)
+
+    @worker.task("hang")
+    async def hang(ctx):
+        await asyncio.Event().wait()
+
+    @worker.task("quick")
+    async def quick(ctx):
+        return {"ok": True}
+
+    await client.submit("hang", {}, max_attempts=1)
+    async with worker.background():
+        result = await client.call("quick", {}, wait_timeout_ms=3_000, poll_ms=20)
+
+    assert result == {"ok": True}
+
+
+async def test_ctx_writes_short_circuit_once_the_lease_is_lost():
+    """Why writes must short-circuit locally, not just at the store's
+    ownership check: see TaskContext._owned."""
+    from cairnq.context import TaskContext
+    from cairnq.models import Task
+
+    class ExplodingStore:
+        def __getattr__(self, name):
+            raise AssertionError("a lease-lost context must not touch the store")
+
+    task = Task(id="t1", name="job", queue="default", status="running", payload={}, metadata={})
+    ctx = TaskContext(ExplodingStore(), task, "w1", 1_000)
+    ctx._mark_lease_lost()
+    with pytest.raises(LostLease):
+        await ctx.progress(0.5)
+    with pytest.raises(LostLease):
+        await ctx.heartbeat()
