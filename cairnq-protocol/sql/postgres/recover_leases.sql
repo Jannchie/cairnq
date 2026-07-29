@@ -39,7 +39,6 @@ where id in (
     where status = 'running'
       and lease_until_ms is not null
       and lease_until_ms <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-    order by id
     for update skip locked
 )
 returning *;
