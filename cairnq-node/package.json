@@ -33,6 +33,7 @@
   "files": ["dist", "src"],
   "engines": { "node": ">=20" },
   "scripts": {
+    "bench": "tsx bench/run.mjs",
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
