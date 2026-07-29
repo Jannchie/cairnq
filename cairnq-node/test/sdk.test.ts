@@ -35,9 +35,15 @@ afterEach(async () => {
 
 describe("client/worker", () => {
   it("call times out and leaves the task running", async () => {
-    await expect(
-      client.call("unhandled", {}, { waitTimeoutMs: 300, pollMs: 50 }),
-    ).rejects.toBeInstanceOf(TaskTimeout);
+    const err = await client
+      .call("unhandled", {}, { waitTimeoutMs: 300, pollMs: 50 })
+      .catch((e: unknown) => e as TaskTimeout);
+    expect(err).toBeInstanceOf(TaskTimeout);
+    // The message diagnoses the classic first-run failure, and the last observed
+    // snapshot rides on the error for programmatic follow-up.
+    expect(err.message).toContain("never claimed by a worker");
+    expect(err.message).toContain("'unhandled'");
+    expect(err.task?.status).toBe("queued");
     const tasks = await client.list({ name: "unhandled" });
     expect(tasks[0]?.status).toBe("queued");
   });

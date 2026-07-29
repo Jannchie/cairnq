@@ -6,6 +6,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._ids import now_ms
+from .models import Task
+
 
 def error_envelope(
     *,
@@ -39,13 +42,43 @@ class AlreadyExists(CairnQError):
         super().__init__(f"task with key {key!r} already exists")
 
 
+def _timeout_detail(task: Task | None) -> str:
+    """One line of "why hasn't this finished" from the last snapshot wait()
+    observed. No worker running, no handler for the name, wrong queue, and two
+    processes on different database files all look identical from the API side —
+    queued, never claimed — so that case names the likely causes."""
+    if task is None:
+        return "task not found — wrong database file, or already purged?"
+    if task.queued:
+        delay_ms = task.run_at_ms - now_ms()
+        if task.attempt == 0 and delay_ms <= 0:
+            return (
+                "never claimed by a worker — is a worker running with a handler for "
+                f"'{task.name}' on queue '{task.queue}', against this same database?"
+            )
+        next_run = f", next run in ~{delay_ms}ms" if delay_ms > 0 else ""
+        return f"still queued (attempt {task.attempt}/{task.max_attempts}){next_run}"
+    if task.cancel_requested:
+        return "cancel requested, waiting for the handler to observe it"
+    return f"still running (attempt {task.attempt}/{task.max_attempts})"
+
+
 class TaskTimeout(CairnQError):
     """wait/call did not reach a terminal status within the timeout. The task
-    keeps running; `task_id` lets the caller follow up."""
+    keeps running; `task_id` lets the caller follow up. `task` is the last
+    snapshot wait() observed (None if get() found nothing), and the message says
+    what state it was stuck in — a queued-never-claimed task is the classic
+    first-run failure (no worker, no handler, wrong queue or file)."""
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, *, timeout_ms: int | None = None, task: Task | None = None):
         self.task_id = task_id
-        super().__init__(f"task {task_id} did not finish in time")
+        self.task = task
+        message = (
+            f"task {task_id} did not finish in time"
+            if timeout_ms is None
+            else f"task {task_id} did not finish within {timeout_ms}ms: {_timeout_detail(task)}"
+        )
+        super().__init__(message)
 
 
 class TaskFailed(CairnQError):

@@ -41,7 +41,7 @@ async def poll_wait(
             return task
         remaining = deadline - now_ms()
         if remaining <= 0:
-            raise TaskTimeout(task_id)
+            raise TaskTimeout(task_id, timeout_ms=timeout_ms, task=task)
         # A store with a push channel (Postgres) cuts the sleep short when the
         # task goes terminal; the re-get above stays the source of truth.
         await store.task_done_wake(task_id, min(interval, remaining))

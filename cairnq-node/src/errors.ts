@@ -1,3 +1,6 @@
+import { nowMs } from "./ids.js";
+import { cancelRequested, isQueued, type Task } from "./models.js";
+
 /** The single shape of the JSON error envelope (see PROTOCOL.md). Everything that
  * records an error — a handler exception, a missing handler, lease expiry, a thrown
  * TaskError — builds it here, so the contract's fields live in one place. */
@@ -34,11 +37,44 @@ export class AlreadyExists extends CairnQError {
   }
 }
 
-/** wait/call did not reach a terminal status in time. The task keeps running. */
+/** One line of "why hasn't this finished" from the last snapshot wait()
+ * observed. No worker running, no handler for the name, wrong queue, and two
+ * processes on different database files all look identical from the API side —
+ * queued, never claimed — so that case names the likely causes. */
+function timeoutDetail(task: Task | null): string {
+  if (!task) return "task not found — wrong database file, or already purged?";
+  if (isQueued(task)) {
+    const delayMs = task.run_at_ms - nowMs();
+    if (task.attempt === 0 && delayMs <= 0) {
+      return (
+        `never claimed by a worker — is a worker running with a handler for ` +
+        `'${task.name}' on queue '${task.queue}', against this same database?`
+      );
+    }
+    const next = delayMs > 0 ? `, next run in ~${delayMs}ms` : "";
+    return `still queued (attempt ${task.attempt}/${task.max_attempts})${next}`;
+  }
+  if (cancelRequested(task)) return "cancel requested, waiting for the handler to observe it";
+  return `still running (attempt ${task.attempt}/${task.max_attempts})`;
+}
+
+/** wait/call did not reach a terminal status in time. The task keeps running.
+ * `task` is the last snapshot wait() observed (null if get() found nothing), and
+ * the message says what state it was stuck in — a queued-never-claimed task is
+ * the classic first-run failure (no worker, no handler, wrong queue or file). */
 export class TaskTimeout extends CairnQError {
-  constructor(public taskId: string) {
-    super(`task ${taskId} did not finish in time`);
+  readonly task: Task | null;
+  constructor(
+    public taskId: string,
+    opts: { timeoutMs?: number; task?: Task | null } = {},
+  ) {
+    super(
+      opts.timeoutMs == null
+        ? `task ${taskId} did not finish in time`
+        : `task ${taskId} did not finish within ${opts.timeoutMs}ms: ${timeoutDetail(opts.task ?? null)}`,
+    );
     this.name = "TaskTimeout";
+    this.task = opts.task ?? null;
   }
 }
 

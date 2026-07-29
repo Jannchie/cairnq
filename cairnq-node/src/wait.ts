@@ -36,7 +36,7 @@ export async function pollWait(
     const task = await store.get(taskId);
     if (task && isTerminal(task)) return task;
     const remaining = deadline - nowMs();
-    if (remaining <= 0) throw new TaskTimeout(taskId);
+    if (remaining <= 0) throw new TaskTimeout(taskId, { timeoutMs, task });
     // A store with a push channel (Postgres) cuts the sleep short when the task
     // goes terminal; the re-get above stays the source of truth either way.
     await store.taskDoneWake(taskId, Math.min(interval, remaining));

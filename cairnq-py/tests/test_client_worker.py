@@ -14,6 +14,11 @@ async def test_call_timeout_keeps_task_running(client, db_path):
     assert task_id
     task = await client.get(task_id)
     assert task.status == "queued"
+    # The message diagnoses the classic first-run failure, and the last observed
+    # snapshot rides on the exception for programmatic follow-up.
+    assert "never claimed by a worker" in str(excinfo.value)
+    assert "'unhandled'" in str(excinfo.value)
+    assert excinfo.value.task.status == "queued"
 
 
 async def test_worker_end_to_end_with_call(client, db_path):
