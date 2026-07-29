@@ -25,6 +25,11 @@ from .base import COMMENT, NAMED, Fetch, TaskStore, check_protocol_version, stat
 QUEUED_CHANNEL = "cairnq_queued"
 DONE_CHANNEL = "cairnq_done"
 
+# Backoff between attempts to (re)connect the LISTEN connection after a
+# transient failure. Doubles per failure up to the cap; polling covers the gap.
+LISTENER_RETRY_MS = 1_000
+LISTENER_RETRY_MAX_MS = 30_000
+
 
 @lru_cache(maxsize=None)
 def positional_statement(sql: str) -> tuple[str, tuple[str, ...]]:
@@ -74,9 +79,15 @@ class PostgresStore(TaskStore):
         # store to the base class's plain polling.
         self._listener: Any = None
         self._listener_connecting: asyncio.Task | None = None
-        # LISTEN is off for good: the store was closed, or the channel could
-        # not be established here (e.g. a transaction-mode pooler).
+        # LISTEN is off for good: the store was closed, or the server accepted
+        # a connection but refused LISTEN (e.g. a transaction-mode pooler) —
+        # deterministic, so retrying would fail the same way every time.
         self._listener_unavailable = False
+        # A failure to even connect is transient (network blip, server
+        # restarting): retry, but not before this loop-clock time, backing off
+        # so a down server is not hammered from the poll loop.
+        self._listener_retry_at = 0.0
+        self._listener_backoff_ms = LISTENER_RETRY_MS
         # Queues notified while nobody was waiting; consumed by the next
         # claim_wake so a wake that lands between polls is not lost. The event
         # broadcasts "some queue was notified"; waiters filter for themselves.
@@ -183,11 +194,16 @@ class PostgresStore(TaskStore):
 
     def _listener_ready(self) -> bool:
         """True once the LISTEN connection is up; starts connecting it
-        otherwise. Callers fall back to plain polling until it is ready (or
-        forever, if it can't be established) — correctness never depends on it."""
+        otherwise (respecting the transient-failure backoff). Callers fall back
+        to plain polling until it is ready (or forever, if it can't be
+        established) — correctness never depends on it."""
         if self._listener is not None:
             return True
-        if not self._listener_unavailable and self._listener_connecting is None:
+        if (
+            not self._listener_unavailable
+            and self._listener_connecting is None
+            and asyncio.get_running_loop().time() >= self._listener_retry_at
+        ):
             self._listener_connecting = asyncio.get_running_loop().create_task(
                 self._start_listener()
             )
@@ -195,19 +211,38 @@ class PostgresStore(TaskStore):
 
     async def _start_listener(self) -> None:
         try:
-            # Built from the raw DSN: if pool options ever grow connection-level
-            # settings (ssl, application_name), the listener must get them too.
-            conn = await self._asyncpg.connect(self._dsn)
-            await conn.add_listener(QUEUED_CHANNEL, self._on_notification)
-            await conn.add_listener(DONE_CHANNEL, self._on_notification)
-            conn.add_termination_listener(self._on_listener_lost)
+            try:
+                # Built from the raw DSN: if pool options ever grow connection-
+                # level settings (ssl, application_name), the listener must get
+                # them too.
+                conn = await self._asyncpg.connect(self._dsn)
+            except Exception:
+                # Could not even connect — transient. Schedule a backed-off
+                # retry; polling covers the gap.
+                self._listener_retry_at = (
+                    asyncio.get_running_loop().time() + self._listener_backoff_ms / 1000
+                )
+                self._listener_backoff_ms = min(
+                    LISTENER_RETRY_MAX_MS, self._listener_backoff_ms * 2
+                )
+                return
+            try:
+                await conn.add_listener(QUEUED_CHANNEL, self._on_notification)
+                await conn.add_listener(DONE_CHANNEL, self._on_notification)
+                conn.add_termination_listener(self._on_listener_lost)
+            except Exception:
+                # Connected, but LISTEN was refused (e.g. a transaction-mode
+                # pooler) — deterministic, so off for good. Polling covers it.
+                self._listener_unavailable = True
+                with contextlib.suppress(Exception):
+                    await conn.close()
+                return
             if self._listener_unavailable:
-                await conn.close()  # closed while we were connecting
+                with contextlib.suppress(Exception):
+                    await conn.close()  # closed while we were connecting
                 return
             self._listener = conn
-        except Exception:
-            # Can't LISTEN here (e.g. a transaction-mode pooler). Polling covers it.
-            self._listener_unavailable = True
+            self._listener_backoff_ms = LISTENER_RETRY_MS
         finally:
             self._listener_connecting = None
 

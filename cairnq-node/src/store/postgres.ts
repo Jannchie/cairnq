@@ -50,6 +50,11 @@ async function rollbackQuietly(client: PG.PoolClient): Promise<void> {
 const QUEUED_CHANNEL = "cairnq_queued";
 const DONE_CHANNEL = "cairnq_done";
 
+// Backoff between attempts to (re)connect the LISTEN connection after a
+// transient failure. Doubles per failure up to the cap; polling covers the gap.
+const LISTENER_RETRY_MS = 1_000;
+const LISTENER_RETRY_MAX_MS = 30_000;
+
 const translated = new Map<string, { text: string; order: readonly string[] }>();
 
 /**
@@ -113,9 +118,15 @@ export class PostgresStore extends TaskStore {
   // keep it silently degrades the store to the base class's plain polling.
   private listener: PG.Client | null = null;
   private listenerConnecting: Promise<void> | null = null;
-  /** LISTEN is off for good: the store was closed, or the channel could not be
-   * established here (e.g. a transaction-mode pooler). */
+  /** LISTEN is off for good: the store was closed, or the server accepted a
+   * connection but refused LISTEN (e.g. a transaction-mode pooler) —
+   * deterministic, so retrying would fail the same way every time. */
   private listenerUnavailable = false;
+  /** A failure to even connect is transient (network blip, server restarting):
+   * retry, but not before this time, backing off so a down server is not
+   * hammered from the poll loop. */
+  private listenerRetryAt = 0;
+  private listenerBackoffMs = LISTENER_RETRY_MS;
   /** Queues notified while nobody was waiting; consumed by the next claimWake
    * so a wake that lands between polls is not lost. */
   private readonly pendingQueues = new Set<string>();
@@ -269,12 +280,13 @@ export class PostgresStore extends TaskStore {
     });
   }
 
-  /** True once the LISTEN connection is up; starts connecting it otherwise.
-   * Callers fall back to plain polling until it is ready (or forever, if it
-   * can't be established) — correctness never depends on it. */
+  /** True once the LISTEN connection is up; starts connecting it otherwise
+   * (respecting the transient-failure backoff). Callers fall back to plain
+   * polling until it is ready (or forever, if it can't be established) —
+   * correctness never depends on it. */
   private listenerReady(): boolean {
     if (this.listener) return true;
-    if (!this.listenerUnavailable && !this.listenerConnecting) {
+    if (!this.listenerUnavailable && !this.listenerConnecting && Date.now() >= this.listenerRetryAt) {
       this.listenerConnecting = this.startListener();
     }
     return false;
@@ -286,18 +298,36 @@ export class PostgresStore extends TaskStore {
       // Built from the raw DSN: if `opts` ever grows connection-level settings
       // (ssl, application_name), the listener must receive them too.
       const client = new pg.Client({ connectionString: this.dsn });
-      await client.connect();
+      try {
+        await client.connect();
+      } catch {
+        // Could not even connect — transient. Schedule a backed-off retry;
+        // polling covers the gap.
+        this.listenerRetryAt = Date.now() + this.listenerBackoffMs;
+        this.listenerBackoffMs = Math.min(LISTENER_RETRY_MAX_MS, this.listenerBackoffMs * 2);
+        return;
+      }
       client.on("notification", (msg) => this.onNotification(msg.channel, msg.payload));
       // A dropped listener degrades to polling; the next wake call reconnects.
       client.on("error", () => this.dropListener());
-      await client.query(`listen ${QUEUED_CHANNEL}; listen ${DONE_CHANNEL}`);
+      try {
+        await client.query(`listen ${QUEUED_CHANNEL}; listen ${DONE_CHANNEL}`);
+      } catch {
+        // Connected, but LISTEN was refused (e.g. a transaction-mode pooler) —
+        // deterministic, so off for good. Polling covers it.
+        this.listenerUnavailable = true;
+        void client.end().catch(() => {});
+        return;
+      }
       if (this.listenerUnavailable) {
-        await client.end(); // closed while we were connecting
+        void client.end().catch(() => {}); // closed while we were connecting
         return;
       }
       this.listener = client;
+      this.listenerBackoffMs = LISTENER_RETRY_MS;
     } catch {
-      // Can't LISTEN here (e.g. a transaction-mode pooler). Polling covers it.
+      // Anything unexpected (e.g. `pg` failed to load): off for good rather
+      // than a retry loop that cannot succeed.
       this.listenerUnavailable = true;
     } finally {
       this.listenerConnecting = null;
