@@ -108,9 +108,14 @@ export class SQLiteStore extends TaskStore {
   ) {
     super();
     this.statements = loadStatements("sqlite");
-    // Two `:memory:` handles share a path but not a database, so they must not
-    // share a lock either.
-    this.lockKey = isMemory(path) ? `memory#${memoryDbSeq++}` : resolve(path);
+    // Only a bare ":memory:" is guaranteed private to its connection, so only
+    // it gets a lock of its own. A "mode=memory" URI stays path-keyed: with
+    // cache=shared it names ONE shared database, and on a build without URI
+    // filenames it is a literal file — in both cases two stores on that string
+    // must share a lock. Over-serializing a private URI-memory database is
+    // harmless; skipping the lock on a shared one is the deadlock this map
+    // exists to prevent.
+    this.lockKey = path === ":memory:" ? `memory#${memoryDbSeq++}` : resolve(path);
   }
 
   async connect(): Promise<void> {
@@ -175,7 +180,9 @@ export class SQLiteStore extends TaskStore {
 
   async protocolVersion(): Promise<number> {
     this.ensure();
-    return this.readProtocolVersion();
+    // Under the store lock: this public read must not slip a statement into
+    // another operation's open transaction on the shared connection.
+    return this.withLock(() => this.readProtocolVersion());
   }
 
   // ------------------------------------------------------------ dialect seam
