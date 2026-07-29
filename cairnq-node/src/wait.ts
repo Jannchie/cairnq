@@ -7,8 +7,6 @@ export const DEFAULT_POLL_MS = 100;
 export const MAX_POLL_MS = 500;
 const GROWTH = 1.5;
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
 /**
  * Grow the polling interval towards the ceiling.
  *
@@ -41,8 +39,7 @@ export async function pollWait(
     if (remaining <= 0) throw new TaskTimeout(taskId);
     // A store with a push channel (Postgres) cuts the sleep short when the task
     // goes terminal; the re-get above stays the source of truth either way.
-    const ms = Math.min(interval, remaining);
-    await (store.taskDoneWake(taskId, ms) ?? sleep(ms));
+    await store.taskDoneWake(taskId, Math.min(interval, remaining));
     interval = nextPollMs(interval, maxPollMs);
   }
 }

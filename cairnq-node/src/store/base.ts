@@ -18,7 +18,7 @@ export function checkProtocolVersion(version: number): void {
 // CONFLICTS is the canonical declaration; the type derives from it so the
 // runtime guard in submit() and the type can't drift apart (same pattern as
 // STATUSES/TaskStatus in models.ts).
-export const CONFLICTS = ["reuse", "reject", "replace"] as const;
+const CONFLICTS = ["reuse", "reject", "replace"] as const;
 export type Conflict = (typeof CONFLICTS)[number];
 
 export interface SubmitInput {
@@ -126,21 +126,22 @@ export abstract class TaskStore {
   }
 
   // ------------------------------------------------------------ wake channel
-  // Push wakeups are an accelerator, never a correctness mechanism: callers
-  // keep their polling loop and merely cut a sleep short when a hint arrives.
-  // The default (null) means "no push channel — polling is the wake mechanism",
-  // which is SQLite's answer: a shared file has no reliable cross-process
-  // notification primitive. PostgresStore overrides both via LISTEN/NOTIFY.
+  // Wake-or-timeout contract (PROTOCOL.md "Push wakeups"): resolve when the
+  // watched event may have happened, or after timeoutMs at the latest. The
+  // default is a plain sleep — polling IS the wake mechanism; a dialect with a
+  // push channel (PostgresStore, LISTEN/NOTIFY) resolves earlier.
 
-  /** A promise that resolves when a task may have become claimable, or after
-   * `timeoutMs` at the latest — or null when this dialect cannot push. */
-  claimWake(_timeoutMs: number): Promise<void> | null {
-    return null;
+  /** Resolves when a task may have become claimable on one of `queues`. The
+   * timer is unref'd: the worker races this against its own stop-aware, ref'd
+   * sleep, so it must neither hold the process open nor need clearing. */
+  claimWake(_queues: string[], timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, timeoutMs).unref?.());
   }
 
-  /** Same contract for one task reaching a terminal status (wait/call). */
-  taskDoneWake(_taskId: string, _timeoutMs: number): Promise<void> | null {
-    return null;
+  /** Resolves when `taskId` may have gone terminal. Plain ref'd sleep —
+   * pollWait awaits it directly, so it is what keeps the process alive. */
+  taskDoneWake(_taskId: string, timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, timeoutMs));
   }
 
   // --------------------------------------------------------------- internals

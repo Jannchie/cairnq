@@ -354,27 +354,19 @@ class Worker:
 
     async def _idle(self, poll_ms: int) -> None:
         """The empty-poll sleep. A store with a push channel (Postgres
-        LISTEN/NOTIFY) cuts it short when a task becomes claimable; stop()
-        interrupts it either way, and the timeout bounds it at the poll
-        interval so the poll fallback — which also drives lease recovery —
-        never stretches."""
-        wake = self._store.claim_wake(poll_ms)
-        if wake is None:
-            await self._sleep_or_stop(poll_ms / 1000)
-            return
-        wake_task = asyncio.ensure_future(wake)
-        stop_task = asyncio.create_task(self._stop.wait())
-        try:
-            await asyncio.wait(
-                {wake_task, stop_task},
-                timeout=poll_ms / 1000,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            for t in (wake_task, stop_task):
-                t.cancel()
-                with contextlib.suppress(BaseException):
-                    await t
+        LISTEN/NOTIFY) cuts it short when a task on this worker's queues
+        becomes claimable; stop() interrupts it either way. Both sides bound
+        themselves at the poll interval, so the poll fallback — which also
+        drives lease recovery — never stretches."""
+        racers = {
+            asyncio.create_task(self._store.claim_wake(self._queues, poll_ms)),
+            asyncio.create_task(self._sleep_or_stop(poll_ms / 1000)),
+        }
+        _, pending = await asyncio.wait(racers, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            with contextlib.suppress(BaseException):
+                await t
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         with contextlib.suppress(asyncio.TimeoutError):

@@ -44,10 +44,5 @@ async def poll_wait(
             raise TaskTimeout(task_id)
         # A store with a push channel (Postgres) cuts the sleep short when the
         # task goes terminal; the re-get above stays the source of truth.
-        ms = min(interval, remaining)
-        wake = store.task_done_wake(task_id, ms)
-        if wake is None:
-            await asyncio.sleep(ms / 1000)
-        else:
-            await wake
+        await store.task_done_wake(task_id, min(interval, remaining))
         interval = next_poll_ms(interval, max_poll_ms)

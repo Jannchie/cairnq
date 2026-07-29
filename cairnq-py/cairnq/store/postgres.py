@@ -14,12 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any
 
 from .._sql import load_migrations, load_statements
 from .base import COMMENT, NAMED, Fetch, TaskStore, check_protocol_version, statement_params
+
+# Notification channels, emitted by the 0003_notify trigger.
+QUEUED_CHANNEL = "cairnq_queued"
+DONE_CHANNEL = "cairnq_done"
 
 
 @lru_cache(maxsize=None)
@@ -65,17 +69,20 @@ class PostgresStore(TaskStore):
         self._init_lock = asyncio.Lock()
         self._sql = load_statements("postgres")
         # LISTEN/NOTIFY state. One dedicated connection listens on both channels
-        # (see 0003_notify.sql). Notifications are an accelerator: every wake
-        # path keeps its poll fallback, so when this connection can't be
-        # established (e.g. a pooler without LISTEN support) or drops, the store
-        # silently degrades to plain polling. The queued event stays set when a
-        # notification arrives with nobody waiting, so a wake between polls is
-        # not lost.
+        # (see 0003_notify.sql and the claim_wake/task_done_wake contract on
+        # TaskStore). Failure to establish or keep it silently degrades the
+        # store to the base class's plain polling.
         self._listener: Any = None
-        self._listener_state = "none"  # none | connecting | ready | closed
-        self._listener_task: asyncio.Task | None = None
+        self._listener_connecting: asyncio.Task | None = None
+        # LISTEN is off for good: the store was closed, or the channel could
+        # not be established here (e.g. a transaction-mode pooler).
+        self._listener_unavailable = False
+        # Queues notified while nobody was waiting; consumed by the next
+        # claim_wake so a wake that lands between polls is not lost. The event
+        # broadcasts "some queue was notified"; waiters filter for themselves.
+        self._pending_queues: set[str] = set()
         self._queued_event = asyncio.Event()
-        self._done_events: dict[str, asyncio.Event] = {}
+        self._done_waiters: dict[str, set[asyncio.Event]] = {}
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
@@ -124,104 +131,111 @@ class PostgresStore(TaskStore):
                     )
 
     async def close(self) -> None:
-        self._listener_state = "closed"  # no revival after close
-        await self._drop_listener()
+        self._listener_unavailable = True  # no revival after close
+        conn, self._listener = self._listener, None
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                await conn.close()
+        if self._listener_connecting is not None:
+            self._listener_connecting.cancel()
+            with contextlib.suppress(BaseException):
+                await self._listener_connecting
+        self._release_waiters()
         if self._pool is not None:
             pool, self._pool = self._pool, None
             await pool.close()
 
     # ----------------------------------------------------------- wake channel
-    def claim_wake(self, timeout_ms: int) -> Awaitable[None] | None:
+    async def claim_wake(self, queues: list[str], timeout_ms: int) -> None:
         if not self._listener_ready():
-            return None
-        return self._claim_wake(timeout_ms)
-
-    async def _claim_wake(self, timeout_ms: int) -> None:
-        if self._queued_event.is_set():
-            self._queued_event.clear()
+            await super().claim_wake(queues, timeout_ms)
             return
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._queued_event.wait(), timeout_ms / 1000)
-        self._queued_event.clear()
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        while True:
+            # Consume every pending notification for our queues; any hit wakes.
+            hit = self._pending_queues.intersection(queues)
+            if hit:
+                self._pending_queues.difference_update(queues)
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            # Broadcast wake: another queue's notification loops us back to
+            # waiting with the remaining budget instead of waking the worker.
+            self._queued_event.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._queued_event.wait(), remaining)
 
-    def task_done_wake(self, task_id: str, timeout_ms: int) -> Awaitable[None] | None:
+    async def task_done_wake(self, task_id: str, timeout_ms: int) -> None:
         if not self._listener_ready():
-            return None
-        return self._task_done_wake(task_id, timeout_ms)
-
-    async def _task_done_wake(self, task_id: str, timeout_ms: int) -> None:
-        event = self._done_events.setdefault(task_id, asyncio.Event())
+            await super().task_done_wake(task_id, timeout_ms)
+            return
+        event = asyncio.Event()
+        waiters = self._done_waiters.setdefault(task_id, set())
+        waiters.add(event)
         try:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(event.wait(), timeout_ms / 1000)
         finally:
-            self._done_events.pop(task_id, None)
+            waiters.discard(event)
+            if not waiters:
+                self._done_waiters.pop(task_id, None)
 
     def _listener_ready(self) -> bool:
-        """True once the LISTEN connection is up; kicks off connecting it
+        """True once the LISTEN connection is up; starts connecting it
         otherwise. Callers fall back to plain polling until it is ready (or
         forever, if it can't be established) — correctness never depends on it."""
-        if self._listener_state == "ready":
+        if self._listener is not None:
             return True
-        if self._listener_state == "none":
-            self._listener_state = "connecting"
-            self._listener_task = asyncio.get_running_loop().create_task(self._start_listener())
+        if not self._listener_unavailable and self._listener_connecting is None:
+            self._listener_connecting = asyncio.get_running_loop().create_task(
+                self._start_listener()
+            )
         return False
 
     async def _start_listener(self) -> None:
         try:
+            # Built from the raw DSN: if pool options ever grow connection-level
+            # settings (ssl, application_name), the listener must get them too.
             conn = await self._asyncpg.connect(self._dsn)
-            await conn.add_listener("cairnq_queued", self._on_notification)
-            await conn.add_listener("cairnq_done", self._on_notification)
+            await conn.add_listener(QUEUED_CHANNEL, self._on_notification)
+            await conn.add_listener(DONE_CHANNEL, self._on_notification)
             conn.add_termination_listener(self._on_listener_lost)
-            if self._listener_state == "closed":
-                await conn.close()
+            if self._listener_unavailable:
+                await conn.close()  # closed while we were connecting
                 return
             self._listener = conn
-            self._listener_state = "ready"
         except Exception:
             # Can't LISTEN here (e.g. a transaction-mode pooler). Polling covers it.
-            if self._listener_state != "closed":
-                self._listener_state = "closed"
+            self._listener_unavailable = True
+        finally:
+            self._listener_connecting = None
 
     def _on_notification(self, _conn: Any, _pid: int, channel: str, payload: str) -> None:
-        if channel == "cairnq_queued":
+        if channel == QUEUED_CHANNEL:
+            self._pending_queues.add(payload)
             self._queued_event.set()
-        elif channel == "cairnq_done":
-            event = self._done_events.get(payload)
-            if event is not None:
+        elif channel == DONE_CHANNEL:
+            for event in self._done_waiters.get(payload, ()):
                 event.set()
 
     def _on_listener_lost(self, _conn: Any) -> None:
         # A dropped listener degrades to polling; the next wake call reconnects.
-        if self._listener_state != "closed":
-            self._listener_state = "none"
         self._listener = None
-        self._release_waiters()
-
-    async def _drop_listener(self) -> None:
-        conn, self._listener = self._listener, None
-        if conn is not None:
-            with contextlib.suppress(Exception):
-                await conn.close()
-        if self._listener_task is not None:
-            self._listener_task.cancel()
-            with contextlib.suppress(BaseException):
-                await self._listener_task
-            self._listener_task = None
         self._release_waiters()
 
     def _release_waiters(self) -> None:
         # Release everyone promptly; their fallback poll takes over.
         self._queued_event.set()
-        for event in self._done_events.values():
-            event.set()
+        for waiters in list(self._done_waiters.values()):
+            for event in waiters:
+                event.set()
 
     async def _read_protocol_version(self, conn: Any) -> int:
         # Takes an explicit conn: during connect the pool is not published yet,
-        # so this cannot go through _fetch.
-        text, _ = positional_statement(self._sql["protocol_version"])
-        row = await conn.fetchrow(text)
+        # so this cannot go through _fetch. The statement binds nothing, so it
+        # runs as-is.
+        row = await conn.fetchrow(self._sql["protocol_version"])
         return int(row["value"]) if row else 0
 
     async def protocol_version(self) -> int:

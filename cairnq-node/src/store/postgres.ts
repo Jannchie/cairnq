@@ -46,6 +46,10 @@ async function rollbackQuietly(client: PG.PoolClient): Promise<void> {
   }
 }
 
+// Notification channels, emitted by the 0003_notify trigger.
+const QUEUED_CHANNEL = "cairnq_queued";
+const DONE_CHANNEL = "cairnq_done";
+
 const translated = new Map<string, { text: string; order: readonly string[] }>();
 
 /**
@@ -104,17 +108,19 @@ export class PostgresStore extends TaskStore {
   private readonly statements: Record<string, string>;
 
   // ------------------------------------------------------- LISTEN/NOTIFY state
-  // One dedicated connection LISTENs on both channels (see 0003_notify.sql).
-  // Notifications are an accelerator: every wake path keeps its poll fallback,
-  // so when this connection can't be established (e.g. a pooler without LISTEN
-  // support) or drops, the store silently degrades to plain polling.
+  // One dedicated connection LISTENs on both channels (see 0003_notify.sql and
+  // the claimWake/taskDoneWake contract on TaskStore). Failure to establish or
+  // keep it silently degrades the store to the base class's plain polling.
   private listener: PG.Client | null = null;
-  private listenerState: "none" | "connecting" | "ready" | "closed" = "none";
-  /** A cairnq_queued notification that arrived with nobody waiting; consumed by
-   * the next claimWake so a wake between polls is not lost. */
-  private wakePending = false;
-  private readonly queuedWaiters = new Set<() => void>();
-  private readonly doneWaiters = new Map<string, Set<() => void>>();
+  private listenerConnecting: Promise<void> | null = null;
+  /** LISTEN is off for good: the store was closed, or the channel could not be
+   * established here (e.g. a transaction-mode pooler). */
+  private listenerUnavailable = false;
+  /** Queues notified while nobody was waiting; consumed by the next claimWake
+   * so a wake that lands between polls is not lost. */
+  private readonly pendingQueues = new Set<string>();
+  /** Wake callbacks by key: "queued" (broadcast) or "done:<task id>". */
+  private readonly waiters = new Map<string, Set<() => void>>();
 
   constructor(
     private readonly dsn: string,
@@ -129,7 +135,7 @@ export class PostgresStore extends TaskStore {
   }
 
   async close(): Promise<void> {
-    this.listenerState = "closed"; // no revival after close
+    this.listenerUnavailable = true; // no revival after close
     this.dropListener();
     if (this.pool) {
       const p = this.pool;
@@ -205,10 +211,9 @@ export class PostgresStore extends TaskStore {
   }
 
   // Takes an explicit client: during doConnect the pool is not published yet, so
-  // this cannot go through fetch().
+  // this cannot go through fetch(). The statement binds nothing, so it runs as-is.
   private async readProtocolVersion(client: PG.PoolClient): Promise<number> {
-    const { text } = toPositional(this.statements.protocol_version, {});
-    const res = await client.query(text);
+    const res = await client.query(this.statements.protocol_version);
     return res.rows.length ? Number(res.rows[0].value) : 0;
   }
 
@@ -223,46 +228,54 @@ export class PostgresStore extends TaskStore {
   }
 
   // ------------------------------------------------------------ wake channel
-  claimWake(timeoutMs: number): Promise<void> | null {
-    if (!this.listenerReady()) return null;
-    if (this.wakePending) {
-      this.wakePending = false;
-      return Promise.resolve();
+  async claimWake(queues: string[], timeoutMs: number): Promise<void> {
+    if (!this.listenerReady()) return super.claimWake(queues, timeoutMs);
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      // Consume every pending notification for our queues; any hit wakes us.
+      let hit = false;
+      for (const q of queues) if (this.pendingQueues.delete(q)) hit = true;
+      if (hit) return;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return;
+      // Broadcast wake: another queue's notification loops us back to waiting
+      // with the remaining budget instead of waking the worker for nothing.
+      await this.wakeOn("queued", remaining);
     }
-    return this.waiterWithTimeout(this.queuedWaiters, timeoutMs);
   }
 
-  taskDoneWake(taskId: string, timeoutMs: number): Promise<void> | null {
-    if (!this.listenerReady()) return null;
-    let set = this.doneWaiters.get(taskId);
-    if (!set) this.doneWaiters.set(taskId, (set = new Set()));
-    const perTask = set;
-    return this.waiterWithTimeout(perTask, timeoutMs).finally(() => {
-      if (perTask.size === 0) this.doneWaiters.delete(taskId);
-    });
+  taskDoneWake(taskId: string, timeoutMs: number): Promise<void> {
+    if (!this.listenerReady()) return super.taskDoneWake(taskId, timeoutMs);
+    return this.wakeOn(`done:${taskId}`, timeoutMs);
   }
 
-  /** A promise resolving on notification-or-timeout, deregistering either way. */
-  private waiterWithTimeout(set: Set<() => void>, timeoutMs: number): Promise<void> {
+  /** A promise resolving on notification-or-timeout, deregistering either way.
+   * The timer is unref'd: while a listener exists its socket keeps the process
+   * alive, and dropListener wakes every waiter the moment it goes away. */
+  private wakeOn(key: string, timeoutMs: number): Promise<void> {
     return new Promise((resolve) => {
+      let set = this.waiters.get(key);
+      if (!set) this.waiters.set(key, (set = new Set()));
+      const peers = set;
       const waiter = () => {
         clearTimeout(timer);
-        set.delete(waiter);
+        peers.delete(waiter);
+        if (peers.size === 0) this.waiters.delete(key);
         resolve();
       };
       const timer = setTimeout(waiter, timeoutMs);
-      set.add(waiter);
+      timer.unref?.();
+      peers.add(waiter);
     });
   }
 
-  /** True once the LISTEN connection is up; kicks off connecting it otherwise.
+  /** True once the LISTEN connection is up; starts connecting it otherwise.
    * Callers fall back to plain polling until it is ready (or forever, if it
    * can't be established) — correctness never depends on it. */
   private listenerReady(): boolean {
-    if (this.listenerState === "ready") return true;
-    if (this.listenerState === "none") {
-      this.listenerState = "connecting";
-      void this.startListener();
+    if (this.listener) return true;
+    if (!this.listenerUnavailable && !this.listenerConnecting) {
+      this.listenerConnecting = this.startListener();
     }
     return false;
   }
@@ -270,34 +283,40 @@ export class PostgresStore extends TaskStore {
   private async startListener(): Promise<void> {
     try {
       const pg = await loadPg();
+      // Built from the raw DSN: if `opts` ever grows connection-level settings
+      // (ssl, application_name), the listener must receive them too.
       const client = new pg.Client({ connectionString: this.dsn });
       await client.connect();
       client.on("notification", (msg) => this.onNotification(msg.channel, msg.payload));
       // A dropped listener degrades to polling; the next wake call reconnects.
-      client.on("error", () => {
-        if (this.listenerState !== "closed") this.listenerState = "none";
-        this.dropListener();
-      });
-      await client.query("listen cairnq_queued; listen cairnq_done");
-      if ((this.listenerState as string) === "closed") {
-        await client.end();
+      client.on("error", () => this.dropListener());
+      await client.query(`listen ${QUEUED_CHANNEL}; listen ${DONE_CHANNEL}`);
+      if (this.listenerUnavailable) {
+        await client.end(); // closed while we were connecting
         return;
       }
       this.listener = client;
-      this.listenerState = "ready";
     } catch {
       // Can't LISTEN here (e.g. a transaction-mode pooler). Polling covers it.
-      if (this.listenerState !== "closed") this.listenerState = "closed";
+      this.listenerUnavailable = true;
+    } finally {
+      this.listenerConnecting = null;
     }
   }
 
   private onNotification(channel: string, payload: string | undefined): void {
-    if (channel === "cairnq_queued") {
-      if (this.queuedWaiters.size === 0) this.wakePending = true;
-      for (const w of [...this.queuedWaiters]) w();
-    } else if (channel === "cairnq_done" && payload) {
-      for (const w of [...(this.doneWaiters.get(payload) ?? [])]) w();
+    let key: string;
+    if (channel === QUEUED_CHANNEL && payload) {
+      this.pendingQueues.add(payload);
+      key = "queued";
+    } else if (channel === DONE_CHANNEL && payload) {
+      key = `done:${payload}`;
+    } else {
+      return;
     }
+    const set = this.waiters.get(key);
+    // A waiter only deletes itself, which Set iteration tolerates — no copy.
+    if (set) for (const w of set) w();
   }
 
   private dropListener(): void {
@@ -305,8 +324,7 @@ export class PostgresStore extends TaskStore {
     this.listener = null;
     if (client) void client.end().catch(() => {});
     // Release everyone promptly; their fallback poll takes over.
-    for (const w of [...this.queuedWaiters]) w();
-    for (const set of [...this.doneWaiters.values()]) for (const w of [...set]) w();
+    for (const set of [...this.waiters.values()]) for (const w of [...set]) w();
   }
 
   // ------------------------------------------------------------ dialect seam

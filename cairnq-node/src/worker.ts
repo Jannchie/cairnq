@@ -59,7 +59,10 @@ export class Worker {
   private readonly handlers = new Map<string, Handler>();
   private readonly workerId = newId("worker");
   private stopped = false;
-  private stopResolvers = new Set<() => void>();
+  private stopWake!: () => void;
+  // Resolved once by stop(); every sleep races against it. A stopped worker
+  // never restarts, so one promise serves the instance's lifetime.
+  private readonly stopped$ = new Promise<void>((r) => (this.stopWake = r));
   // True only when this worker created its own store (via Worker.sqlite); an
   // injected store may be shared, so serve()/background() must not close it.
   private ownsStore = false;
@@ -123,9 +126,7 @@ export class Worker {
 
   stop(): void {
     this.stopped = true;
-    const resolvers = [...this.stopResolvers];
-    this.stopResolvers.clear();
-    for (const r of resolvers) r();
+    this.stopWake();
   }
 
   /** Close the underlying store connection. Call after run() returns. */
@@ -361,31 +362,21 @@ export class Worker {
 
   /**
    * The empty-poll sleep. A store with a push channel (Postgres LISTEN/NOTIFY)
-   * cuts it short when a task becomes claimable; stop() interrupts it either
-   * way, and sleepOrStop bounds it at `ms` so the poll fallback — which also
-   * drives lease recovery — never stretches.
+   * cuts it short when a task on this worker's queues becomes claimable;
+   * stop() interrupts it either way, and sleepOrStop bounds it at `ms` so the
+   * poll fallback — which also drives lease recovery — never stretches.
    */
   private idle(ms: number): Promise<void> {
-    const wake = this.store.claimWake(ms);
-    return wake ? Promise.race([this.sleepOrStop(ms), wake]) : this.sleepOrStop(ms);
+    return Promise.race([this.sleepOrStop(ms), this.store.claimWake(this.queues, ms)]);
   }
 
   private sleepOrStop(ms: number): Promise<void> {
     if (this.stopped) return Promise.resolve();
-    return new Promise<void>((resolve) => {
-      let done = false;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        // Drop the registration; otherwise every idle poll leaks one closure
-        // until stop() is finally called.
-        this.stopResolvers.delete(finish);
-        resolve();
-      };
-      const timer = setTimeout(finish, ms);
-      this.stopResolvers.add(finish);
-    });
+    let timer!: NodeJS.Timeout;
+    const nap = new Promise<void>((r) => (timer = setTimeout(r, ms)));
+    // Clear the timer whichever side wins, so a stop is never followed by a
+    // leftover poll timer holding the process open.
+    return Promise.race([nap, this.stopped$]).finally(() => clearTimeout(timer));
   }
 
   /** Take SIGINT/SIGTERM for the duration of serve(). Returns the undo. */

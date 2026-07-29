@@ -13,6 +13,7 @@ Users never touch a TaskStore directly — they use CairnQ / Worker / TaskContex
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
@@ -108,22 +109,18 @@ class TaskStore(ABC):
         return True
 
     # ---------------------------------------------------------- wake channel
-    # Push wakeups are an accelerator, never a correctness mechanism: callers
-    # keep their polling loop and merely cut a sleep short when a hint arrives.
-    # The default (None) means "no push channel — polling is the wake
-    # mechanism", which is SQLite's answer: a shared file has no reliable
-    # cross-process notification primitive. PostgresStore overrides both via
-    # LISTEN/NOTIFY.
+    # Wake-or-timeout contract (PROTOCOL.md "Push wakeups"): return when the
+    # watched event may have happened, or after timeout_ms at the latest. The
+    # default is a plain sleep — polling IS the wake mechanism; a dialect with
+    # a push channel (PostgresStore, LISTEN/NOTIFY) returns earlier.
 
-    def claim_wake(self, timeout_ms: int) -> Awaitable[None] | None:
-        """An awaitable resolving when a task may have become claimable, or
-        after `timeout_ms` at the latest — or None when this dialect cannot
-        push."""
-        return None
+    async def claim_wake(self, queues: list[str], timeout_ms: int) -> None:
+        """Returns when a task may have become claimable on one of `queues`."""
+        await asyncio.sleep(timeout_ms / 1000)
 
-    def task_done_wake(self, task_id: str, timeout_ms: int) -> Awaitable[None] | None:
-        """Same contract for one task reaching a terminal status (wait/call)."""
-        return None
+    async def task_done_wake(self, task_id: str, timeout_ms: int) -> None:
+        """Returns when `task_id` may have gone terminal (wait/call)."""
+        await asyncio.sleep(timeout_ms / 1000)
 
     # --------------------------------------------------------------- internals
     async def _owned_write(self, name: str, task_id: str, params: dict[str, Any]) -> Task:

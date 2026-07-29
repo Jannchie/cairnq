@@ -76,18 +76,20 @@ describe("worker resilience", () => {
     expect(errors.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("does not accumulate wakeup callbacks while idle", async () => {
-    const worker = Worker.sqlite(dbPath, { queues: ["default"], pollIntervalMs: 5 });
+  it("stop() cuts an idle sleep short instead of waiting out the poll", async () => {
+    // The poll interval is far above the assertion: run() can only settle in
+    // time if stop() resolves the sleep the worker is parked in. (The per-poll
+    // wakeup registry this test used to inspect is gone — every sleep now
+    // races one lifetime stopped-promise, so there is nothing to accumulate.)
+    const worker = Worker.sqlite(dbPath, { queues: ["default"], pollIntervalMs: 5_000 });
     const runner = worker.run();
-    await sleep(250); // ~50 idle polls
-    // White-box: the run loop's registry of pending wakeups must not grow with
-    // the number of polls, only with the number of sleepers (here, one).
-    const pending = (worker as unknown as { stopResolvers: Set<unknown> }).stopResolvers.size;
+    await sleep(100); // let it park in its idle sleep
+    const t0 = Date.now();
     worker.stop();
     await runner;
     await worker.close();
 
-    expect(pending).toBeLessThan(5);
+    expect(Date.now() - t0).toBeLessThan(1_000);
   });
 
   it("drains in-flight tasks however the run loop exits", async () => {
