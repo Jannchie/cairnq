@@ -17,8 +17,9 @@ def next_poll_ms(current: int, max_ms: int) -> int:
 
     wait() has no idea whether the task takes 50ms or an hour. Starting tight
     keeps short tasks snappy; growing keeps a long wait from costing a read every
-    100ms for its whole duration."""
-    return min(max_ms, int(current * _GROWTH))
+    100ms for its whole duration. The +1 keeps truncation from pinning tiny
+    intervals: int(1 * 1.5) == 1 would otherwise never grow past 1."""
+    return min(max_ms, max(current + 1, int(current * _GROWTH)))
 
 
 async def poll_wait(

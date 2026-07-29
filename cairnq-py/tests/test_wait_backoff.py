@@ -14,6 +14,10 @@ def test_poll_interval_backs_off_to_the_ceiling():
     assert next_poll_ms(150, 500) == 225
     assert next_poll_ms(400, 500) == 500
     assert next_poll_ms(500, 500) == 500
+    # int truncation must not pin tiny intervals: int(1 * 1.5) == 1 would
+    # otherwise re-read the task as fast as possible for the whole timeout.
+    assert next_poll_ms(1, 500) > 1
+    assert next_poll_ms(0, 500) > 0
 
 
 async def test_waiting_on_a_slow_task_backs_off(client):

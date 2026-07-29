@@ -12,10 +12,11 @@ const GROWTH = 1.5;
  *
  * wait() has no idea whether the task takes 50ms or an hour. Starting tight keeps
  * short tasks snappy; growing keeps a long wait from costing a read every 100ms
- * for its whole duration.
+ * for its whole duration. The +1 keeps truncation from pinning tiny intervals:
+ * Math.floor(1 * 1.5) === 1 would otherwise never grow past 1.
  */
 export function nextPollMs(current: number, maxMs: number): number {
-  return Math.min(maxMs, Math.floor(current * GROWTH));
+  return Math.min(maxMs, Math.max(current + 1, Math.floor(current * GROWTH)));
 }
 
 /** Poll get() until terminal or timeout. Returns the terminal Task (any status).

@@ -24,6 +24,10 @@ describe("wait backoff", () => {
     expect(nextPollMs(150, 500)).toBe(225);
     expect(nextPollMs(400, 500)).toBe(500);
     expect(nextPollMs(500, 500)).toBe(500);
+    // Truncation must not pin tiny intervals: Math.floor(1 * 1.5) === 1 would
+    // otherwise re-read the task as fast as possible for the whole timeout.
+    expect(nextPollMs(1, 500)).toBeGreaterThan(1);
+    expect(nextPollMs(0, 500)).toBeGreaterThan(0);
   });
 
   it("does not re-read every 150ms while waiting on a slow task", async () => {
