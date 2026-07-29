@@ -6,16 +6,21 @@ lease recovery, and the *_by_key transactions."""
 
 import asyncio
 import os
+from time import perf_counter
 
 import pytest
 
-from cairnq import CairnQ, Worker
+from cairnq import CairnQ, PostgresStore, Worker
 from cairnq.errors import LostLease
 
 DSN = os.environ.get("CAIRNQ_TEST_PG_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="set CAIRNQ_TEST_PG_DSN to run live PG tests")
 
 
+# Unlike the node twin (which isolates itself in its own database), this suite
+# shares the DSN database: pytest runs tests sequentially, so nothing races the
+# fixture's truncate. Adopting a parallel runner (pytest-xdist) would need the
+# same per-suite isolation the node file has.
 @pytest.fixture
 async def pg_client():
     import asyncpg
@@ -115,10 +120,6 @@ async def test_notify_wakes_worker_and_waiter_beating_the_poll_floor(pg_client):
     # Poll intervals are set far above the assertion, so finishing in time is
     # only possible if LISTEN/NOTIFY cut both sleeps short: the worker's idle
     # (claim poll 5s) and call's wait poll (4s).
-    from time import perf_counter
-
-    from cairnq.store.postgres import PostgresStore
-
     store = PostgresStore(DSN)
     await store.connect()
     await asyncio.sleep(0.5)  # let the LISTEN connections warm up
