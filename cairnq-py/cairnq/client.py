@@ -4,7 +4,7 @@ from typing import Any
 
 from ._wait import DEFAULT_POLL_MS, poll_wait
 from .errors import TaskCanceled, TaskFailed
-from .models import Task, TaskDef, task_name
+from .models import Task, TaskDef, TaskStatus, task_name
 from .store.base import Conflict, TaskStore
 from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
@@ -77,7 +77,7 @@ class CairnQ:
     async def list(
         self,
         *,
-        status: str | None = None,
+        status: TaskStatus | None = None,
         queue: str | None = None,
         name: str | None = None,
         root_id: str | None = None,

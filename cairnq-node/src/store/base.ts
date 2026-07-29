@@ -73,7 +73,7 @@ export interface SubmitInput {
 }
 
 export interface ListInput {
-  status?: string | null;
+  status?: TaskStatus | null;
   queue?: string | null;
   name?: string | null;
   rootId?: string | null;
@@ -256,6 +256,11 @@ export abstract class TaskStore {
   }
 
   async list(input: ListInput = {}): Promise<Task[]> {
+    // Validate up front, like submit's conflict guard: a typo'd status otherwise
+    // matches nothing and returns [] indistinguishably from "no such tasks".
+    if (input.status != null && !STATUSES.includes(input.status)) {
+      throw new Error(`unknown status filter: ${input.status}`);
+    }
     const rows = await this.fetch("list", {
       status: input.status ?? null,
       queue: input.queue ?? null,

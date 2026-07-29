@@ -231,7 +231,7 @@ class TaskStore(ABC):
     async def list(
         self,
         *,
-        status: str | None = None,
+        status: TaskStatus | None = None,
         queue: str | None = None,
         name: str | None = None,
         root_id: str | None = None,
@@ -239,6 +239,11 @@ class TaskStore(ABC):
         limit: int = 100,
         offset: int = 0,
     ) -> list[Task]:
+        # Validate up front, like submit's conflict guard: a typo'd status
+        # otherwise matches nothing and returns [] indistinguishably from
+        # "no such tasks".
+        if status is not None and status not in STATUSES:
+            raise ValueError(f"unknown status filter: {status!r}")
         rows = await self._fetch(
             "list",
             {
