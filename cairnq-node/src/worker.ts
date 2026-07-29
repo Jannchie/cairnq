@@ -107,8 +107,10 @@ export class Worker {
     let fn: Handler;
     if (typeof arg === "function") {
       // Bare form: worker.task(fn) — registered under the function's name.
+      // Strip the "bound " prefix .bind() stamps on it: otherwise a bound
+      // method registers under "bound process", a name no submit ever uses.
       fn = arg;
-      name = fn.name;
+      name = fn.name.replace(/^(bound )+/, "");
       if (!name) {
         throw new Error(
           "worker.task(fn): the handler is anonymous; pass a name explicitly, " +
