@@ -174,11 +174,17 @@ export abstract class TaskStore {
       await fetch("lock_key", { key });
       const existing = (await fetch("get_key", { key })) as { task_id: string }[];
       if (existing.length) {
-        const exId = existing[0].task_id;
-        if (conflict === "reuse") return rowToTask((await fetch("get", { id: exId }))[0]);
-        if (conflict === "reject") throw new AlreadyExists(key);
-        // "replace": cancel the recorded task, then repoint the key below.
-        await fetch("cancel", { id: exId });
+        // Read the task itself before branching: a concurrent purge (which
+        // takes no key lock) may have deleted it — cascading the key row away —
+        // between our statements' snapshots. A vanished task means the key is
+        // free after all, whatever the strategy.
+        const current = (await fetch("get", { id: existing[0].task_id }))[0];
+        if (current) {
+          if (conflict === "reuse") return rowToTask(current);
+          if (conflict === "reject") throw new AlreadyExists(key);
+          // "replace": cancel the recorded task, then repoint the key below.
+          await fetch("cancel", { id: existing[0].task_id });
+        }
       }
       const row = (await fetch("insert_task", ins))[0];
       await fetch("upsert_key", { key, task_id: id });

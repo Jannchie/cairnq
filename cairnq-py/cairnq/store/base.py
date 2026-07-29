@@ -167,13 +167,18 @@ class TaskStore(ABC):
             await fetch("lock_key", {"key": key})
             existing = await fetch("get_key", {"key": key})
             if existing:
-                ex_id = existing[0]["task_id"]
-                if conflict == "reuse":
-                    return Task.from_row((await fetch("get", {"id": ex_id}))[0])
-                if conflict == "reject":
-                    raise AlreadyExists(key)
-                # "replace": cancel the recorded task, then repoint the key below.
-                await fetch("cancel", {"id": ex_id})
+                # Read the task itself before branching: a concurrent purge
+                # (which takes no key lock) may have deleted it — cascading the
+                # key row away — between our statements' snapshots. A vanished
+                # task means the key is free after all, whatever the strategy.
+                rows = await fetch("get", {"id": existing[0]["task_id"]})
+                if rows:
+                    if conflict == "reuse":
+                        return Task.from_row(rows[0])
+                    if conflict == "reject":
+                        raise AlreadyExists(key)
+                    # "replace": cancel the recorded task, then repoint the key.
+                    await fetch("cancel", {"id": existing[0]["task_id"]})
             rows = await fetch("insert_task", ins)
             await fetch("upsert_key", {"key": key, "task_id": task_id})
             return Task.from_row(rows[0])
