@@ -321,7 +321,8 @@ export class Worker {
   ): { cancel: () => void; done: Promise<void> } {
     let active = true;
     let wake: (() => void) | null = null;
-    const interval = this.opts.heartbeatIntervalMs ?? Math.max(1_000, Math.floor(leaseMs / 3));
+    // lease/3 gives two beats of slack; the floor only matters for sub-150ms leases.
+    const interval = this.opts.heartbeatIntervalMs ?? Math.max(50, Math.floor(leaseMs / 3));
     const done = (async () => {
       while (active) {
         // Cancellable sleep: cancel() resolves this immediately and clears the

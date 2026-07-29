@@ -94,7 +94,8 @@ class Worker:
         self._queues = list(queues)
         self._concurrency = concurrency
         self._lease_ms = lease_ms
-        self._hb_interval = heartbeat_interval_ms or max(1_000, lease_ms // 3)
+        # lease/3 gives two beats of slack; the floor only matters for sub-150ms leases.
+        self._hb_interval = heartbeat_interval_ms or max(50, lease_ms // 3)
         self._poll = poll_interval_ms
         self._batch = claim_batch
         self._retry_backoff_ms = retry_backoff_ms
