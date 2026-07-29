@@ -107,6 +107,24 @@ class TaskStore(ABC):
         block writers, so it just says yes."""
         return True
 
+    # ---------------------------------------------------------- wake channel
+    # Push wakeups are an accelerator, never a correctness mechanism: callers
+    # keep their polling loop and merely cut a sleep short when a hint arrives.
+    # The default (None) means "no push channel — polling is the wake
+    # mechanism", which is SQLite's answer: a shared file has no reliable
+    # cross-process notification primitive. PostgresStore overrides both via
+    # LISTEN/NOTIFY.
+
+    def claim_wake(self, timeout_ms: int) -> Awaitable[None] | None:
+        """An awaitable resolving when a task may have become claimable, or
+        after `timeout_ms` at the latest — or None when this dialect cannot
+        push."""
+        return None
+
+    def task_done_wake(self, task_id: str, timeout_ms: int) -> Awaitable[None] | None:
+        """Same contract for one task reaching a terminal status (wait/call)."""
+        return None
+
     # --------------------------------------------------------------- internals
     async def _owned_write(self, name: str, task_id: str, params: dict[str, Any]) -> Task:
         """An ownership-checked worker write (heartbeat/progress/succeed/complete/

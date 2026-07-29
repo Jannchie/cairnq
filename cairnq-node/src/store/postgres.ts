@@ -103,6 +103,19 @@ export class PostgresStore extends TaskStore {
   private connecting: Promise<void> | null = null;
   private readonly statements: Record<string, string>;
 
+  // ------------------------------------------------------- LISTEN/NOTIFY state
+  // One dedicated connection LISTENs on both channels (see 0003_notify.sql).
+  // Notifications are an accelerator: every wake path keeps its poll fallback,
+  // so when this connection can't be established (e.g. a pooler without LISTEN
+  // support) or drops, the store silently degrades to plain polling.
+  private listener: PG.Client | null = null;
+  private listenerState: "none" | "connecting" | "ready" | "closed" = "none";
+  /** A cairnq_queued notification that arrived with nobody waiting; consumed by
+   * the next claimWake so a wake between polls is not lost. */
+  private wakePending = false;
+  private readonly queuedWaiters = new Set<() => void>();
+  private readonly doneWaiters = new Map<string, Set<() => void>>();
+
   constructor(
     private readonly dsn: string,
     private readonly opts: { max?: number } = {},
@@ -116,6 +129,8 @@ export class PostgresStore extends TaskStore {
   }
 
   async close(): Promise<void> {
+    this.listenerState = "closed"; // no revival after close
+    this.dropListener();
     if (this.pool) {
       const p = this.pool;
       this.pool = null;
@@ -153,6 +168,9 @@ export class PostgresStore extends TaskStore {
       throw e;
     }
     this.pool = pool; // publish only a fully-migrated, version-checked pool
+    // Warm the LISTEN connection in the background so the first idle sleep is
+    // already wakeable. Fire-and-forget: failure just means polling.
+    this.listenerReady();
   }
 
   private async applyMigrations(client: PG.PoolClient): Promise<void> {
@@ -202,6 +220,93 @@ export class PostgresStore extends TaskStore {
     } finally {
       client.release();
     }
+  }
+
+  // ------------------------------------------------------------ wake channel
+  claimWake(timeoutMs: number): Promise<void> | null {
+    if (!this.listenerReady()) return null;
+    if (this.wakePending) {
+      this.wakePending = false;
+      return Promise.resolve();
+    }
+    return this.waiterWithTimeout(this.queuedWaiters, timeoutMs);
+  }
+
+  taskDoneWake(taskId: string, timeoutMs: number): Promise<void> | null {
+    if (!this.listenerReady()) return null;
+    let set = this.doneWaiters.get(taskId);
+    if (!set) this.doneWaiters.set(taskId, (set = new Set()));
+    const perTask = set;
+    return this.waiterWithTimeout(perTask, timeoutMs).finally(() => {
+      if (perTask.size === 0) this.doneWaiters.delete(taskId);
+    });
+  }
+
+  /** A promise resolving on notification-or-timeout, deregistering either way. */
+  private waiterWithTimeout(set: Set<() => void>, timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const waiter = () => {
+        clearTimeout(timer);
+        set.delete(waiter);
+        resolve();
+      };
+      const timer = setTimeout(waiter, timeoutMs);
+      set.add(waiter);
+    });
+  }
+
+  /** True once the LISTEN connection is up; kicks off connecting it otherwise.
+   * Callers fall back to plain polling until it is ready (or forever, if it
+   * can't be established) — correctness never depends on it. */
+  private listenerReady(): boolean {
+    if (this.listenerState === "ready") return true;
+    if (this.listenerState === "none") {
+      this.listenerState = "connecting";
+      void this.startListener();
+    }
+    return false;
+  }
+
+  private async startListener(): Promise<void> {
+    try {
+      const pg = await loadPg();
+      const client = new pg.Client({ connectionString: this.dsn });
+      await client.connect();
+      client.on("notification", (msg) => this.onNotification(msg.channel, msg.payload));
+      // A dropped listener degrades to polling; the next wake call reconnects.
+      client.on("error", () => {
+        if (this.listenerState !== "closed") this.listenerState = "none";
+        this.dropListener();
+      });
+      await client.query("listen cairnq_queued; listen cairnq_done");
+      if ((this.listenerState as string) === "closed") {
+        await client.end();
+        return;
+      }
+      this.listener = client;
+      this.listenerState = "ready";
+    } catch {
+      // Can't LISTEN here (e.g. a transaction-mode pooler). Polling covers it.
+      if (this.listenerState !== "closed") this.listenerState = "closed";
+    }
+  }
+
+  private onNotification(channel: string, payload: string | undefined): void {
+    if (channel === "cairnq_queued") {
+      if (this.queuedWaiters.size === 0) this.wakePending = true;
+      for (const w of [...this.queuedWaiters]) w();
+    } else if (channel === "cairnq_done" && payload) {
+      for (const w of [...(this.doneWaiters.get(payload) ?? [])]) w();
+    }
+  }
+
+  private dropListener(): void {
+    const client = this.listener;
+    this.listener = null;
+    if (client) void client.end().catch(() => {});
+    // Release everyone promptly; their fallback poll takes over.
+    for (const w of [...this.queuedWaiters]) w();
+    for (const set of [...this.doneWaiters.values()]) for (const w of [...set]) w();
   }
 
   // ------------------------------------------------------------ dialect seam

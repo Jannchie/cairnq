@@ -125,6 +125,24 @@ export abstract class TaskStore {
     return true;
   }
 
+  // ------------------------------------------------------------ wake channel
+  // Push wakeups are an accelerator, never a correctness mechanism: callers
+  // keep their polling loop and merely cut a sleep short when a hint arrives.
+  // The default (null) means "no push channel — polling is the wake mechanism",
+  // which is SQLite's answer: a shared file has no reliable cross-process
+  // notification primitive. PostgresStore overrides both via LISTEN/NOTIFY.
+
+  /** A promise that resolves when a task may have become claimable, or after
+   * `timeoutMs` at the latest — or null when this dialect cannot push. */
+  claimWake(_timeoutMs: number): Promise<void> | null {
+    return null;
+  }
+
+  /** Same contract for one task reaching a terminal status (wait/call). */
+  taskDoneWake(_taskId: string, _timeoutMs: number): Promise<void> | null {
+    return null;
+  }
+
   // --------------------------------------------------------------- internals
   /**
    * An ownership-checked worker write (heartbeat/progress/succeed/complete/fail).

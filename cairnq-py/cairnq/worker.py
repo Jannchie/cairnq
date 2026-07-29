@@ -264,7 +264,7 @@ class Worker:
                     await self._sleep_or_stop(CLAIM_ERROR_BACKOFF_S)
                     continue
                 if not claimed:
-                    await self._sleep_or_stop(self._poll / 1000)
+                    await self._idle(self._poll)
                     continue
                 for task in claimed:
                     fut = asyncio.create_task(self._execute(task))
@@ -351,6 +351,30 @@ class Worker:
             )
         except LostLease:
             pass
+
+    async def _idle(self, poll_ms: int) -> None:
+        """The empty-poll sleep. A store with a push channel (Postgres
+        LISTEN/NOTIFY) cuts it short when a task becomes claimable; stop()
+        interrupts it either way, and the timeout bounds it at the poll
+        interval so the poll fallback — which also drives lease recovery —
+        never stretches."""
+        wake = self._store.claim_wake(poll_ms)
+        if wake is None:
+            await self._sleep_or_stop(poll_ms / 1000)
+            return
+        wake_task = asyncio.ensure_future(wake)
+        stop_task = asyncio.create_task(self._stop.wait())
+        try:
+            await asyncio.wait(
+                {wake_task, stop_task},
+                timeout=poll_ms / 1000,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (wake_task, stop_task):
+                t.cancel()
+                with contextlib.suppress(BaseException):
+                    await t
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         with contextlib.suppress(asyncio.TimeoutError):

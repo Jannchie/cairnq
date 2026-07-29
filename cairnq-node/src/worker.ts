@@ -203,7 +203,7 @@ export class Worker {
         continue;
       }
       if (claimed.length === 0) {
-        await this.sleepOrStop(pollMs);
+        await this.idle(pollMs);
         continue;
       }
       for (const task of claimed) {
@@ -357,6 +357,17 @@ export class Worker {
     } catch (err) {
       if (!(err instanceof LostLease)) throw err;
     }
+  }
+
+  /**
+   * The empty-poll sleep. A store with a push channel (Postgres LISTEN/NOTIFY)
+   * cuts it short when a task becomes claimable; stop() interrupts it either
+   * way, and sleepOrStop bounds it at `ms` so the poll fallback — which also
+   * drives lease recovery — never stretches.
+   */
+  private idle(ms: number): Promise<void> {
+    const wake = this.store.claimWake(ms);
+    return wake ? Promise.race([this.sleepOrStop(ms), wake]) : this.sleepOrStop(ms);
   }
 
   private sleepOrStop(ms: number): Promise<void> {

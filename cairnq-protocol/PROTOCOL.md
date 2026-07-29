@@ -161,9 +161,29 @@ purged task's `key` pointer goes with it via `ON DELETE CASCADE`.
 `wait` and `call` are **SDK-orchestrated polling** over `get`: the interval starts
 at 100ms and grows 1.5× to a 500ms ceiling, so a short task stays responsive while
 a long wait doesn't re-read every 100ms for an hour. This is the only non-SQL
-operation, read-only, leaving room to swap in a smarter wakeup later.
-`call = submit + wait`; on timeout it raises `TaskTimeout(task_id=...)` and **the
-task keeps running**.
+operation, read-only. `call = submit + wait`; on timeout it raises
+`TaskTimeout(task_id=...)` and **the task keeps running**.
+
+## Push wakeups (Postgres only)
+
+Migration `0003_notify` installs a row trigger that emits `pg_notify` on the
+status transitions that matter to a sleeper: **`cairnq_queued`** (payload: queue
+name) when a task becomes claimable-soon — inserted queued, or requeued by a
+retryable fail / retry / lease recovery — and **`cairnq_done`** (payload: task
+id) when a task reaches a terminal status. The trigger lives in the database, so
+every writer wakes listeners, whichever SDK or version wrote the row.
+
+SDKs use it strictly as an **accelerator**: the worker's idle sleep and
+`wait`/`call`'s poll sleep end early when a matching notification arrives, and
+that is the entire contract. NOTIFY reaches only currently connected listeners
+and carries no durability, so both loops keep their poll interval as the
+fallback — the poll also drives lease recovery and delayed (`run_at`) tasks,
+which no notification announces. A store that cannot LISTEN (e.g. behind a
+transaction-mode pooler) silently stays a pure poller. Correctness never
+depends on a notification being delivered; a lost one costs one poll interval
+of latency, nothing else. SQLite has no push channel — a shared file has no
+reliable cross-process notification primitive — and keeps the identical polling
+behavior it always had. Purely additive: `protocol_version` stays 1.
 
 Retries carry **exponential backoff**: a failed attempt is requeued at
 `now + base * 2^(attempt-1)`, capped (SDK defaults: 1s base, 30s cap, 0 disables).

@@ -111,6 +111,34 @@ async def test_ownership_rejects_non_owner(pg_client):
         await store.complete(task_id=t.id, worker_id="intruder", result={})
 
 
+async def test_notify_wakes_worker_and_waiter_beating_the_poll_floor(pg_client):
+    # Poll intervals are set far above the assertion, so finishing in time is
+    # only possible if LISTEN/NOTIFY cut both sleeps short: the worker's idle
+    # (claim poll 5s) and call's wait poll (4s).
+    from time import perf_counter
+
+    from cairnq.store.postgres import PostgresStore
+
+    store = PostgresStore(DSN)
+    await store.connect()
+    await asyncio.sleep(0.5)  # let the LISTEN connections warm up
+    worker = Worker(store, ["default"], poll_interval_ms=5_000)
+
+    @worker.task("ping")
+    async def ping(ctx, payload):
+        return {"pong": True}
+
+    try:
+        t0 = perf_counter()
+        async with worker.background():
+            await asyncio.sleep(0.3)  # park the worker in its idle sleep first
+            result = await pg_client.call("ping", {}, wait_timeout_ms=8_000, poll_ms=4_000)
+        assert result == {"pong": True}
+        assert perf_counter() - t0 < 3.0
+    finally:
+        await store.close()
+
+
 async def test_worker_end_to_end(pg_client):
     worker = Worker.postgres(DSN, queues=["default"], poll_interval_ms=50)
 

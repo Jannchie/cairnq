@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 
-import { CairnQ, LostLease, Worker } from "../src/index.js";
+import { CairnQ, LostLease, PostgresStore, Worker } from "../src/index.js";
+import { sleep } from "./helpers.js";
 
 // Live Postgres smoke. Skipped unless CAIRNQ_TEST_PG_DSN is set — CI provides a
 // `postgres` service; locally you can point it at any throwaway database. It runs
@@ -11,14 +12,27 @@ import { CairnQ, LostLease, Worker } from "../src/index.js";
 const DSN = process.env.CAIRNQ_TEST_PG_DSN;
 const suite = DSN ? describe : describe.skip;
 
+// This suite runs in a database of its own, created on demand: vitest runs test
+// FILES in parallel, and sharing one database with the conformance file means
+// its truncates race these tests' rows (tests within this file stay sequential,
+// so they can share it safely).
+function liveDsn(): string {
+  const url = new URL(DSN!);
+  url.pathname = "/cairnq_live_test";
+  return url.toString();
+}
+
 suite("postgres live", () => {
   let client: CairnQ;
   let admin: pg.Pool;
 
   beforeEach(async () => {
-    client = CairnQ.postgres(DSN!);
+    const maintenance = new pg.Pool({ connectionString: DSN });
+    await maintenance.query("create database cairnq_live_test").catch(() => {});
+    await maintenance.end();
+    client = CairnQ.postgres(liveDsn());
     await client.connect(); // applies migrations (idempotent)
-    admin = new pg.Pool({ connectionString: DSN });
+    admin = new pg.Pool({ connectionString: liveDsn() });
     await admin.query("truncate cairnq_tasks, cairnq_task_keys");
   });
 
@@ -105,8 +119,30 @@ suite("postgres live", () => {
     ).rejects.toBeInstanceOf(LostLease);
   });
 
+  it("wakes the worker and the waiter by NOTIFY, beating the poll floor", async () => {
+    // Poll intervals are set far above the assertion, so finishing in time is
+    // only possible if LISTEN/NOTIFY cut both sleeps short: the worker's idle
+    // (claim poll 5s) and call's wait poll (4s).
+    const store = new PostgresStore(liveDsn());
+    await store.connect();
+    await sleep(500); // let the LISTEN connections warm up
+    const worker = new Worker(store, ["default"], { pollIntervalMs: 5_000 });
+    worker.task("ping", () => ({ pong: true }));
+    try {
+      const t0 = Date.now();
+      const result = await worker.background(async () => {
+        await sleep(300); // park the worker in its idle sleep first
+        return client.call("ping", {}, { waitTimeoutMs: 8_000, pollMs: 4_000 });
+      });
+      expect(result).toEqual({ pong: true });
+      expect(Date.now() - t0).toBeLessThan(3_000);
+    } finally {
+      await store.close();
+    }
+  }, 15_000);
+
   it("runs a worker end-to-end over postgres", async () => {
-    const worker = Worker.postgres(DSN!, { queues: ["default"], pollIntervalMs: 50 });
+    const worker = Worker.postgres(liveDsn(), { queues: ["default"], pollIntervalMs: 50 });
     worker.task("sum", async (_ctx, p) => ({ sum: p.a + p.b }));
     const result = await worker.background(() =>
       client.call("sum", { a: 2, b: 3 }, { waitTimeoutMs: 10_000, pollMs: 50 }),
