@@ -22,11 +22,23 @@ from functools import lru_cache
 from typing import Any
 
 from .._ids import new_id
-from ..errors import AlreadyExists, LostLease, error_envelope
+from ..errors import AlreadyExists, LostLease, ProtocolVersionMismatch, error_envelope
 from ..models import Task
 
 # Runs one named protocol statement and returns its rows.
 Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
+
+SUPPORTED_PROTOCOL_MAJOR = 1
+
+
+def check_protocol_version(version: int) -> None:
+    """Refuse to run against a store whose protocol major this SDK does not
+    speak. The supported major is a protocol fact, not a dialect one — every
+    backend checks it here so the constant can't fork per store."""
+    if version != SUPPORTED_PROTOCOL_MAJOR:
+        raise ProtocolVersionMismatch(
+            f"storage protocol_version={version}, SDK supports {SUPPORTED_PROTOCOL_MAJOR}"
+        )
 
 LEASE_EXPIRED_ERROR_JSON = json.dumps(
     error_envelope(

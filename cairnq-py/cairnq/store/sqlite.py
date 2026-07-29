@@ -24,10 +24,7 @@ import aiosqlite
 
 from .._ids import now_ms
 from .._sql import load_migrations, load_statements
-from ..errors import ProtocolVersionMismatch
-from .base import Fetch, TaskStore, statement_params
-
-SUPPORTED_PROTOCOL_MAJOR = 1
+from .base import Fetch, TaskStore, check_protocol_version, statement_params
 
 
 def _split_script(script: str) -> list[str]:
@@ -125,7 +122,7 @@ class SQLiteStore(TaskStore):
             await conn.execute("pragma foreign_keys = ON")
             await self._apply_migrations(conn)
             self._conn = conn
-            await self._check_version()
+            check_protocol_version(await self.protocol_version())
 
     async def _apply_migrations(self, conn: aiosqlite.Connection) -> None:
         await conn.execute(
@@ -168,13 +165,6 @@ class SQLiteStore(TaskStore):
             await self.connect()
         assert self._conn is not None
         return self._conn
-
-    async def _check_version(self) -> None:
-        version = await self.protocol_version()
-        if version != SUPPORTED_PROTOCOL_MAJOR:
-            raise ProtocolVersionMismatch(
-                f"storage protocol_version={version}, SDK supports {SUPPORTED_PROTOCOL_MAJOR}"
-            )
 
     async def protocol_version(self) -> int:
         conn = await self._ensure()

@@ -19,10 +19,7 @@ from functools import lru_cache
 from typing import Any
 
 from .._sql import load_migrations, load_statements
-from ..errors import ProtocolVersionMismatch
-from .base import COMMENT, NAMED, Fetch, TaskStore, statement_params
-
-SUPPORTED_PROTOCOL_MAJOR = 1
+from .base import COMMENT, NAMED, Fetch, TaskStore, check_protocol_version, statement_params
 
 
 @lru_cache(maxsize=None)
@@ -83,12 +80,7 @@ class PostgresStore(TaskStore):
             try:
                 async with pool.acquire() as conn:
                     await self._apply_migrations(conn)
-                    version = await self._read_protocol_version(conn)
-                    if version != SUPPORTED_PROTOCOL_MAJOR:
-                        raise ProtocolVersionMismatch(
-                            f"storage protocol_version={version}, "
-                            f"SDK supports {SUPPORTED_PROTOCOL_MAJOR}"
-                        )
+                    check_protocol_version(await self._read_protocol_version(conn))
             except BaseException:
                 await pool.close()  # never leak a pool when connect fails
                 raise

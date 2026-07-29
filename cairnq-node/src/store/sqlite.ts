@@ -4,14 +4,17 @@ import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
 import { nowMs } from "../ids.js";
-import { ProtocolVersionMismatch } from "../errors.js";
 import { loadMigrations, loadStatements } from "../sql.js";
-import { type Fetch, type Params, statementParams, TaskStore } from "./base.js";
+import {
+  checkProtocolVersion,
+  type Fetch,
+  type Params,
+  statementParams,
+  TaskStore,
+} from "./base.js";
 
 type DB = Database.Database;
 type Stmt = Database.Statement;
-
-const SUPPORTED_PROTOCOL_MAJOR = 1;
 
 const WAL_RETRY_DELAY_MS = 50;
 const WAL_RETRY_BUDGET_MS = 5_000;
@@ -139,7 +142,7 @@ export class SQLiteStore extends TaskStore {
       this.stmts[name] = db.prepare(sql);
     }
     this.db = db;
-    this.checkVersion();
+    checkProtocolVersion(this.readProtocolVersion());
     return db;
   }
 
@@ -162,15 +165,6 @@ export class SQLiteStore extends TaskStore {
         db.exec(sql);
         insert.run(name, nowMs());
       }).immediate();
-    }
-  }
-
-  private checkVersion(): void {
-    const version = this.readProtocolVersion();
-    if (version !== SUPPORTED_PROTOCOL_MAJOR) {
-      throw new ProtocolVersionMismatch(
-        `storage protocol_version=${version}, SDK supports ${SUPPORTED_PROTOCOL_MAJOR}`,
-      );
     }
   }
 

@@ -1,10 +1,15 @@
 import type * as PG from "pg";
 
-import { ProtocolVersionMismatch } from "../errors.js";
 import { loadMigrations, loadStatements } from "../sql.js";
-import { COMMENT, type Fetch, NAMED, type Params, statementParams, TaskStore } from "./base.js";
-
-const SUPPORTED_PROTOCOL_MAJOR = 1;
+import {
+  checkProtocolVersion,
+  COMMENT,
+  type Fetch,
+  NAMED,
+  type Params,
+  statementParams,
+  TaskStore,
+} from "./base.js";
 
 // `pg` is an optional dependency: the SDK is SQLite-first, so it's loaded lazily
 // the first time a PostgresStore connects. Absent -> a clear install hint.
@@ -139,12 +144,7 @@ export class PostgresStore extends TaskStore {
       const client = await pool.connect();
       try {
         await this.applyMigrations(client);
-        const version = await this.readProtocolVersion(client);
-        if (version !== SUPPORTED_PROTOCOL_MAJOR) {
-          throw new ProtocolVersionMismatch(
-            `storage protocol_version=${version}, SDK supports ${SUPPORTED_PROTOCOL_MAJOR}`,
-          );
-        }
+        checkProtocolVersion(await this.readProtocolVersion(client));
       } finally {
         client.release();
       }
