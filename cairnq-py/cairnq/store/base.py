@@ -23,8 +23,14 @@ from functools import lru_cache
 from typing import Any, Literal, get_args
 
 from .._ids import new_id
-from ..errors import AlreadyExists, LostLease, ProtocolVersionMismatch, error_envelope
-from ..models import Task
+from ..errors import (
+    AlreadyExists,
+    LostLease,
+    ProtocolVersionMismatch,
+    SerializationError,
+    error_envelope,
+)
+from ..models import STATUSES, Task, TaskStatus
 
 # Runs one named protocol statement and returns its rows.
 Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
@@ -48,7 +54,25 @@ def check_protocol_version(version: int) -> None:
         )
 
 
-LEASE_EXPIRED_ERROR_JSON = json.dumps(
+# allow_nan=False: the default encoder writes NaN/Infinity as bare ``NaN`` /
+# ``Infinity`` — not JSON — which Python's lenient loads hides but JSON.parse in
+# the TypeScript SDK throws on, poisoning the row for every cross-language
+# reader. Compact separators match JSON.stringify, so the twins store the same
+# bytes for the same value. A module-level encoder skips the fresh-encoder
+# construction json.dumps pays for any non-default kwarg.
+_ENCODER = json.JSONEncoder(allow_nan=False, separators=(",", ":"))
+
+
+def dump_json(value: Any) -> str:
+    """Encode a value for a protocol JSON column, raising SerializationError on
+    anything JSON cannot represent (non-finite number, set, datetime, …)."""
+    try:
+        return _ENCODER.encode(value)
+    except (TypeError, ValueError) as exc:
+        raise SerializationError(str(exc)) from exc
+
+
+LEASE_EXPIRED_ERROR_JSON = dump_json(
     error_envelope(
         type="LeaseExpired",
         code="lease_expired",
@@ -162,8 +186,8 @@ class TaskStore(ABC):
             "id": task_id,
             "name": name,
             "queue": queue,
-            "payload": json.dumps(payload if payload is not None else {}),
-            "metadata": json.dumps(metadata or {}),
+            "payload": dump_json(payload if payload is not None else {}),
+            "metadata": dump_json(metadata or {}),
             "max_attempts": max_attempts,
             "priority": priority,
             "delay_ms": run_at_delay_ms,
@@ -317,7 +341,7 @@ class TaskStore(ABC):
             {
                 "id": task_id,
                 "worker_id": worker_id,
-                "result": None if result is None else json.dumps(result),
+                "result": None if result is None else dump_json(result),
                 "message": None,
             },
         )
@@ -329,7 +353,7 @@ class TaskStore(ABC):
             {
                 "id": task_id,
                 "worker_id": worker_id,
-                "result": None if result is None else json.dumps(result),
+                "result": None if result is None else dump_json(result),
             },
         )
 
@@ -342,13 +366,28 @@ class TaskStore(ABC):
         retryable: bool = True,
         delay_ms: int = 0,
     ) -> Task:
+        try:
+            error_text = dump_json(error)
+        except SerializationError:
+            # A failure record must never itself fail to serialize (a TaskError
+            # carrying exotic details would otherwise strand the task until
+            # lease expiry). Strip the envelope to its string fields and record
+            # that.
+            error_text = dump_json(
+                error_envelope(
+                    type=str(error.get("type", "TaskError")),
+                    code=str(error.get("code", "task_error")),
+                    message=str(error.get("message", "")),
+                    retryable=retryable,
+                )
+            )
         return await self._owned_write(
             "fail",
             task_id,
             {
                 "id": task_id,
                 "worker_id": worker_id,
-                "error": json.dumps(error),
+                "error": error_text,
                 "retryable": retryable,
                 "delay_ms": delay_ms,
             },

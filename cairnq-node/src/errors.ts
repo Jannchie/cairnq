@@ -125,6 +125,17 @@ export class ProtocolVersionMismatch extends CairnQError {
   }
 }
 
+/** A value could not be encoded for a protocol JSON column (non-finite number,
+ * BigInt, circular structure, …). Raised at the boundary — submit rejects with
+ * it, and a worker records a handler result that triggers it as a permanent
+ * `unserializable_result` failure. The Python SDK raises the same named error. */
+export class SerializationError extends CairnQError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SerializationError";
+  }
+}
+
 /** Throw inside a handler to control how the failure is recorded. Defaults to
  * non-retryable so deterministic errors fail fast instead of burning retries.
  * Any other thrown value is treated as retryable. */

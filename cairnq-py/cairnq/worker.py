@@ -8,7 +8,7 @@ from typing import Any, Callable, Literal
 
 from ._ids import new_id
 from .context import TaskContext
-from .errors import LostLease, TaskError, error_envelope
+from .errors import LostLease, SerializationError, TaskError, error_envelope
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
 from .store.postgres import PostgresStore
@@ -312,6 +312,22 @@ class Worker:
                 )
             except LostLease:
                 ctx._mark_lease_lost()
+                return
+            except SerializationError as exc:
+                # The handler succeeded but its return value can't cross the JSON
+                # protocol. Deterministic, so fail fast and permanently — the
+                # alternative is sitting `running` until lease expiry redelivers
+                # a task that fails the same way every attempt.
+                await self._safe_fail(
+                    task,
+                    error_envelope(
+                        type="SerializationError",
+                        code="unserializable_result",
+                        message=f"handler result is not JSON-serializable: {exc}",
+                        retryable=False,
+                    ),
+                    retryable=False,
+                )
                 return
         except Exception as exc:
             self._report(exc, phase="execute", task_id=task.id)

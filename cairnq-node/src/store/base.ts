@@ -1,6 +1,42 @@
 import { newId } from "../ids.js";
-import { AlreadyExists, errorEnvelope, LostLease, ProtocolVersionMismatch } from "../errors.js";
-import { rowToTask, type Task } from "../models.js";
+import {
+  AlreadyExists,
+  errorEnvelope,
+  LostLease,
+  ProtocolVersionMismatch,
+  SerializationError,
+} from "../errors.js";
+import { rowToTask, STATUSES, type Task, type TaskStatus } from "../models.js";
+
+const rejectNonFinite = (_key: string, v: unknown): unknown => {
+  if (typeof v === "number" && !Number.isFinite(v)) {
+    throw new SerializationError(`non-finite number ${v} is not JSON-serializable`);
+  }
+  return v;
+};
+
+/** Encode a value for a protocol JSON column, raising SerializationError on
+ * anything JSON cannot represent. Refuses what JSON.stringify would silently
+ * mangle: NaN/Infinity become null and a top-level function/undefined disappears
+ * entirely — either way the twin SDK reads back something other than what the
+ * caller meant (the Python SDK rejects the same values, via allow_nan=False). */
+export function dumpJson(value: unknown): string {
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(value);
+  } catch (err) {
+    // BigInt or a circular structure.
+    throw new SerializationError(err instanceof Error ? err.message : String(err));
+  }
+  if (text === undefined) {
+    throw new SerializationError(`value of type ${typeof value} is not JSON-serializable`);
+  }
+  // A non-finite number can only reach the output as the literal `null`, so a
+  // null-free result needs no strict pass — this keeps the replacer (which
+  // forfeits V8's native stringifier) off the hot path.
+  if (text.includes("null")) JSON.stringify(value, rejectNonFinite);
+  return text;
+}
 
 const SUPPORTED_PROTOCOL_MAJOR = 1;
 
@@ -55,7 +91,7 @@ export type Params = Record<string, unknown>;
 /** Runs one named protocol statement and returns its rows. */
 export type Fetch = (name: string, params: Params) => Promise<any[]>;
 
-export const LEASE_EXPIRED_ERROR_JSON = JSON.stringify(
+export const LEASE_EXPIRED_ERROR_JSON = dumpJson(
   errorEnvelope({
     type: "LeaseExpired",
     code: "lease_expired",
@@ -167,8 +203,8 @@ export abstract class TaskStore {
       id,
       name: input.name,
       queue: input.queue ?? "default",
-      payload: JSON.stringify(input.payload ?? {}),
-      metadata: JSON.stringify(input.metadata ?? {}),
+      payload: dumpJson(input.payload ?? {}),
+      metadata: dumpJson(input.metadata ?? {}),
       max_attempts: input.maxAttempts ?? 3,
       priority: input.priority ?? 0,
       delay_ms: input.runAtDelayMs ?? 0,
@@ -337,7 +373,7 @@ export abstract class TaskStore {
     return this.ownedWrite("succeed", input.taskId, {
       id: input.taskId,
       worker_id: input.workerId,
-      result: input.result == null ? null : JSON.stringify(input.result),
+      result: input.result == null ? null : dumpJson(input.result),
       message: null,
     });
   }
@@ -346,7 +382,7 @@ export abstract class TaskStore {
     return this.ownedWrite("complete", input.taskId, {
       id: input.taskId,
       worker_id: input.workerId,
-      result: input.result == null ? null : JSON.stringify(input.result),
+      result: input.result == null ? null : dumpJson(input.result),
     });
   }
 
@@ -357,10 +393,28 @@ export abstract class TaskStore {
     retryable?: boolean;
     delayMs?: number;
   }): Promise<Task> {
+    let error: string;
+    try {
+      error = dumpJson(input.error ?? {});
+    } catch (err) {
+      if (!(err instanceof SerializationError)) throw err;
+      // A failure record must never itself fail to serialize (a TaskError
+      // carrying exotic details would otherwise strand the task until lease
+      // expiry). Strip the envelope to its string fields and record that.
+      const e = (input.error ?? {}) as { type?: unknown; code?: unknown; message?: unknown };
+      error = dumpJson(
+        errorEnvelope({
+          type: String(e.type ?? "TaskError"),
+          code: String(e.code ?? "task_error"),
+          message: String(e.message ?? ""),
+          retryable: input.retryable !== false,
+        }),
+      );
+    }
     return this.ownedWrite("fail", input.taskId, {
       id: input.taskId,
       worker_id: input.workerId,
-      error: JSON.stringify(input.error ?? {}),
+      error,
       retryable: input.retryable !== false,
       delay_ms: input.delayMs ?? 0,
     });

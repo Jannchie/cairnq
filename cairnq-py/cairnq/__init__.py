@@ -12,6 +12,7 @@ from .errors import (
     CairnQError,
     LostLease,
     ProtocolVersionMismatch,
+    SerializationError,
     TaskCanceled,
     TaskError,
     TaskFailed,
@@ -48,4 +49,5 @@ __all__ = [
     "TaskError",
     "LostLease",
     "ProtocolVersionMismatch",
+    "SerializationError",
 ]

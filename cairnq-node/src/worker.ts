@@ -1,5 +1,5 @@
 import { TaskContext } from "./context.js";
-import { errorEnvelope, LostLease, TaskError } from "./errors.js";
+import { errorEnvelope, LostLease, SerializationError, TaskError } from "./errors.js";
 import { newId } from "./ids.js";
 import { type Task } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
@@ -285,6 +285,24 @@ export class Worker {
       } catch (err) {
         if (err instanceof LostLease) {
           ctx.markLeaseLost();
+          return;
+        }
+        if (err instanceof SerializationError) {
+          // The handler succeeded but its return value can't cross the JSON
+          // protocol (BigInt, non-finite number, circular). Deterministic, so
+          // fail fast and permanently — the alternative is sitting `running`
+          // until lease expiry redelivers a task that fails the same way every
+          // attempt.
+          await this.safeFail(
+            task,
+            errorEnvelope({
+              type: "SerializationError",
+              code: "unserializable_result",
+              message: `handler result is not JSON-serializable: ${err.message}`,
+              retryable: false,
+            }),
+            false,
+          );
           return;
         }
         throw err;

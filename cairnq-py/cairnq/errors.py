@@ -117,6 +117,14 @@ class ProtocolVersionMismatch(CairnQError):
     """The storage protocol major version is incompatible with this SDK."""
 
 
+class SerializationError(CairnQError):
+    """A value could not be encoded for a protocol JSON column (non-finite
+    number, set, datetime, …). Raised at the boundary — submit raises it, and a
+    worker records a handler result that triggers it as a permanent
+    `unserializable_result` failure. The TypeScript SDK raises the same named
+    error."""
+
+
 class TaskError(CairnQError):
     """Raise inside a task handler to control how the failure is recorded.
 

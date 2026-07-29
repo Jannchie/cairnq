@@ -29,4 +29,5 @@ export {
   TaskError,
   LostLease,
   ProtocolVersionMismatch,
+  SerializationError,
 } from "./errors.js";
