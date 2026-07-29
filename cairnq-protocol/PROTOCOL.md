@@ -48,7 +48,10 @@ one implementation of each operation serve both backends.
   `NaN`/`Infinity` (which `JSON.parse` throws on) and JavaScript's would silently
   turn them into `null` — both SDKs instead raise `SerializationError`, and a
   worker records a result it cannot serialize as a permanent
-  `unserializable_result` failure rather than stranding the task. One residual
+  `unserializable_result` failure rather than stranding the task. The TypeScript
+  SDK likewise rejects `undefined` / functions / symbols *inside arrays*, which
+  `JSON.stringify` would silently write as `null`; an undefined object property
+  is merely omitted — the JS idiom for "absent" — and stays allowed. One residual
   dialect gap: Postgres `jsonb` rejects `\u0000` inside strings while SQLite
   accepts it, so avoid NUL characters in values that need backend portability.
 - **Null means "leave it alone"** on `progress`: both `progress` and `message` are

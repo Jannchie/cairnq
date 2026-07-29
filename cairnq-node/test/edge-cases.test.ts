@@ -130,4 +130,14 @@ describe("edge cases", () => {
     await expect(client.purge({ olderThanMs: -1 })).rejects.toThrow("olderThanMs");
     await expect(client.purge({ limit: 0 })).rejects.toThrow("limit");
   });
+
+  it("rejects array elements JSON.stringify would mangle into null", async () => {
+    // [undefined] / [fn] stringify as [null] — the twin SDK would read back a
+    // null the caller never wrote. An undefined object property is merely
+    // omitted (the JS idiom for "absent") and stays allowed.
+    await expect(client.submit("job", { xs: [undefined] })).rejects.toThrow(SerializationError);
+    await expect(client.submit("job", { xs: [() => 1] })).rejects.toThrow(SerializationError);
+    const t = await client.submit("job", { xs: [null, 1], absent: undefined });
+    expect(t.payload).toEqual({ xs: [null, 1] });
+  });
 });

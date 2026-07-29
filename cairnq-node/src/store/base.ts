@@ -8,18 +8,25 @@ import {
 } from "../errors.js";
 import { rowToTask, STATUSES, type Task, type TaskStatus } from "../models.js";
 
-const rejectNonFinite = (_key: string, v: unknown): unknown => {
+const rejectMangled = function (this: unknown, _key: string, v: unknown): unknown {
   if (typeof v === "number" && !Number.isFinite(v)) {
     throw new SerializationError(`non-finite number ${v} is not JSON-serializable`);
+  }
+  // In an array these become the literal `null` (in an object they are merely
+  // omitted, the JS idiom for "absent") — the twin SDK would read back a null
+  // the caller never wrote.
+  if (Array.isArray(this) && (v === undefined || typeof v === "function" || typeof v === "symbol")) {
+    throw new SerializationError(`${typeof v} inside an array is not JSON-serializable`);
   }
   return v;
 };
 
 /** Encode a value for a protocol JSON column, raising SerializationError on
  * anything JSON cannot represent. Refuses what JSON.stringify would silently
- * mangle: NaN/Infinity become null and a top-level function/undefined disappears
- * entirely — either way the twin SDK reads back something other than what the
- * caller meant (the Python SDK rejects the same values, via allow_nan=False). */
+ * mangle into `null`: NaN/Infinity anywhere, undefined/function/symbol inside an
+ * array, and a top-level undefined that disappears entirely — either way the
+ * twin SDK reads back something other than what the caller meant (the Python
+ * SDK rejects the same values, via allow_nan=False). */
 export function dumpJson(value: unknown): string {
   let text: string | undefined;
   try {
@@ -31,10 +38,10 @@ export function dumpJson(value: unknown): string {
   if (text === undefined) {
     throw new SerializationError(`value of type ${typeof value} is not JSON-serializable`);
   }
-  // A non-finite number can only reach the output as the literal `null`, so a
+  // Every mangled value reaches the output as the literal `null`, so a
   // null-free result needs no strict pass — this keeps the replacer (which
   // forfeits V8's native stringifier) off the hot path.
-  if (text.includes("null")) JSON.stringify(value, rejectNonFinite);
+  if (text.includes("null")) JSON.stringify(value, rejectMangled);
   return text;
 }
 
