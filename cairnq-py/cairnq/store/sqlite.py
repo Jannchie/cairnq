@@ -167,11 +167,8 @@ class SQLiteStore(TaskStore):
         return self._conn
 
     async def protocol_version(self) -> int:
-        conn = await self._ensure()
-        cur = await conn.execute("select value from cairnq_meta where key = 'protocol_version'")
-        row = await cur.fetchone()
-        await cur.close()
-        return int(row["value"]) if row else 0
+        rows = await self._fetch("protocol_version", {})
+        return int(rows[0]["value"]) if rows else 0
 
     # ----------------------------------------------------------- dialect seam
     def _bind(self, sql: str, params: dict[str, Any]) -> dict[str, Any]:

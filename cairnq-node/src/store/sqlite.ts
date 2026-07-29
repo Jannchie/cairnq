@@ -169,10 +169,8 @@ export class SQLiteStore extends TaskStore {
   }
 
   private readProtocolVersion(): number {
-    const row = this.db!
-      .prepare("select value from cairnq_meta where key = 'protocol_version'")
-      .get() as { value: string } | undefined;
-    return row ? Number(row.value) : 0;
+    const rows = this.runNow("protocol_version", {});
+    return rows.length ? Number(rows[0].value) : 0;
   }
 
   async protocolVersion(): Promise<number> {

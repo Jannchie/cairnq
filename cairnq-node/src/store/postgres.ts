@@ -186,10 +186,11 @@ export class PostgresStore extends TaskStore {
     }
   }
 
+  // Takes an explicit client: during doConnect the pool is not published yet, so
+  // this cannot go through fetch().
   private async readProtocolVersion(client: PG.PoolClient): Promise<number> {
-    const res = await client.query(
-      "select value from cairnq_meta where key = 'protocol_version'",
-    );
+    const { text } = toPositional(this.statements.protocol_version, {});
+    const res = await client.query(text);
     return res.rows.length ? Number(res.rows[0].value) : 0;
   }
 

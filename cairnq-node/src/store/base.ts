@@ -2,7 +2,7 @@ import { newId } from "../ids.js";
 import { AlreadyExists, errorEnvelope, LostLease, ProtocolVersionMismatch } from "../errors.js";
 import { rowToTask, type Task } from "../models.js";
 
-export const SUPPORTED_PROTOCOL_MAJOR = 1;
+const SUPPORTED_PROTOCOL_MAJOR = 1;
 
 /** Refuse to run against a store whose protocol major this SDK does not speak.
  * The supported major is a protocol fact, not a dialect one — every backend

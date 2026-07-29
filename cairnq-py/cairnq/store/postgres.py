@@ -114,7 +114,10 @@ class PostgresStore(TaskStore):
             await pool.close()
 
     async def _read_protocol_version(self, conn: Any) -> int:
-        row = await conn.fetchrow("select value from cairnq_meta where key = 'protocol_version'")
+        # Takes an explicit conn: during connect the pool is not published yet,
+        # so this cannot go through _fetch.
+        text, _ = positional_statement(self._sql["protocol_version"])
+        row = await conn.fetchrow(text)
         return int(row["value"]) if row else 0
 
     async def protocol_version(self) -> int:
