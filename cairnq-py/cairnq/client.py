@@ -114,6 +114,11 @@ class CairnQ:
         the write short; loop until it returns fewer than `limit`."""
         return await self._store.purge(older_than_ms=older_than_ms, limit=limit)
 
+    async def stats(self) -> dict[str, dict[TaskStatus, int]]:
+        """Task counts per queue, keyed by status and zero-filled across all
+        statuses — `stats()["default"]["queued"]` is the backlog of a queue."""
+        return await self._store.stats()
+
     async def wait(
         self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS
     ) -> Task:

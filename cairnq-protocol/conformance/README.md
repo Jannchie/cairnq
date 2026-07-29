@@ -32,7 +32,8 @@ Any string argument of the form `$alias`, `$alias.field`, or `$alias.0.field`
 
 Client-side: `submit`, `get`, `get_by_key`, `list`, `cancel`, `cancel_by_key`,
 `retry`, `retry_by_key`, `purge` (`{ "older_than_ms": n, "limit": n }`; returns an
-array of deleted ids). Worker-side: `claim` (runs lease recovery then claim, like
+array of deleted ids), `stats` (no args; returns `{queue: {status: count}}`,
+zero-filled per queue). Worker-side: `claim` (runs lease recovery then claim, like
 the worker loop; returns an array), `heartbeat`, `progress`, `succeed`,
 `complete`, `fail`. Control: `sleep` (`{ "ms": n }`), `expect`.
 

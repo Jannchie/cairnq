@@ -165,10 +165,15 @@ statement snapshots). Pinned by `key_reuse_after_purge`.
 
 ## Operations
 
-Client-side (API role): `submit`, `get`, `get_by_key`, `list`, `cancel`,
-`cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus SDK-orchestrated
-`wait` / `call`. Worker-side: `claim`, `heartbeat`, `progress`, `complete`,
-`succeed`, `fail`.
+Client-side (API role): `submit`, `get`, `get_by_key`, `list`, `stats`,
+`cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus
+SDK-orchestrated `wait` / `call`. Worker-side: `claim`, `heartbeat`,
+`progress`, `complete`, `succeed`, `fail`.
+
+`stats` is the one aggregate read: task counts grouped by queue and status
+(`stats.sql`). SDKs zero-fill the statuses a queue has no rows in; a queue with
+no rows at all does not appear. Terminal tasks keep counting until `purge`
+removes them, so the numbers describe the database, not just the live backlog.
 
 `claim` first runs a read-only `claimable_probe` (SQLite only); only if it reports
 work does it open the `BEGIN IMMEDIATE` write transaction (recover expired leases +

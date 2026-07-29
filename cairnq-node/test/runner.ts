@@ -150,6 +150,8 @@ export class Runner {
         });
       case "purge":
         return c.purge({ olderThanMs: a.older_than_ms, limit: a.limit });
+      case "stats":
+        return c.stats();
       case "sleep":
         await sleep(a.ms);
         return null;

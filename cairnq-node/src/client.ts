@@ -1,5 +1,5 @@
 import { TaskCanceled, TaskFailed } from "./errors.js";
-import { isFailed, isSucceeded, type Task } from "./models.js";
+import { isFailed, isSucceeded, type Task, type TaskStatus } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
 import type { ListInput, PurgeInput, SubmitInput, TaskStore } from "./store/base.js";
@@ -78,6 +78,12 @@ export class CairnQ {
    * short; loop until it returns fewer than `limit`. */
   purge(input?: PurgeInput): Promise<string[]> {
     return this._store.purge(input);
+  }
+
+  /** Task counts per queue, keyed by status and zero-filled across all statuses
+   * — `(await stats()).default.queued` is the backlog of a queue. */
+  stats(): Promise<Record<string, Record<TaskStatus, number>>> {
+    return this._store.stats();
   }
 
   wait(

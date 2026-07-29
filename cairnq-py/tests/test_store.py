@@ -9,6 +9,12 @@ async def test_protocol_version(client):
     assert await client.store.protocol_version() == 1
 
 
+async def test_stats_on_an_empty_database(client):
+    # No rows, no queues — {} rather than a zero-filled "default" that would
+    # imply the store knows which queues exist before anything is submitted.
+    assert await client.stats() == {}
+
+
 async def test_protocol_version_mismatch(tmp_path):
     import sqlite3
 

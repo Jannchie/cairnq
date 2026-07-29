@@ -137,6 +137,8 @@ class Runner:
             return await c.purge(
                 older_than_ms=a.get("older_than_ms", 0), limit=a.get("limit", 1000)
             )
+        if op == "stats":
+            return await c.stats()
         if op == "sleep":
             await asyncio.sleep(a["ms"] / 1000)
             return None

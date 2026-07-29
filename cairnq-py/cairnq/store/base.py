@@ -306,6 +306,17 @@ class TaskStore(ABC):
         rows = await self._fetch("purge", {"older_than_ms": older_than_ms, "limit": limit})
         return [r["id"] for r in rows]
 
+    async def stats(self) -> dict[str, dict[TaskStatus, int]]:
+        """Task counts per queue, keyed by status and zero-filled across all
+        statuses — `stats()["default"]["queued"]` is the backlog of a queue.
+        A queue appears only while it has rows; terminal tasks keep counting
+        until `purge` removes them."""
+        out: dict[str, dict[TaskStatus, int]] = {}
+        for row in await self._fetch("stats", {}):
+            per = out.setdefault(row["queue"], dict.fromkeys(STATUSES, 0))
+            per[row["status"]] = int(row["count"])
+        return out
+
     # ------------------------------------------------------------- worker side
     async def claim(
         self,

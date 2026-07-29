@@ -346,6 +346,23 @@ export abstract class TaskStore {
     return rows.map((r) => r.id as string);
   }
 
+  /**
+   * Task counts per queue, keyed by status and zero-filled across all statuses —
+   * `(await stats()).default.queued` is the backlog of a queue. A queue appears
+   * only while it has rows; terminal tasks keep counting until `purge` removes
+   * them.
+   */
+  async stats(): Promise<Record<string, Record<TaskStatus, number>>> {
+    const out: Record<string, Record<TaskStatus, number>> = {};
+    for (const row of await this.fetch("stats", {})) {
+      const per = (out[row.queue] ??= Object.fromEntries(
+        STATUSES.map((s) => [s, 0]),
+      ) as Record<TaskStatus, number>);
+      per[row.status as TaskStatus] = Number(row.count);
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------- worker side
   /**
    * Take up to `limit` claimable tasks. `names` restricts the claim to task names
