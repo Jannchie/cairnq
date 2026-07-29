@@ -181,6 +181,13 @@ class TaskStore(ABC):
         # branch on the second submit of a key, deep inside the transaction.
         if conflict not in CONFLICTS:
             raise ValueError(f"unknown conflict strategy: {conflict!r}")
+        # max_attempts < 1 would still run once (claim increments before the
+        # check), a silently different meaning than the number says; a negative
+        # delay is always a mistake. Both fail loudly instead.
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+        if run_at_delay_ms < 0:
+            raise ValueError(f"run_at_delay_ms must be >= 0, got {run_at_delay_ms}")
         task_id = new_id("task")
         ins = {
             "id": task_id,
@@ -244,6 +251,8 @@ class TaskStore(ABC):
         # "no such tasks".
         if status is not None and status not in STATUSES:
             raise ValueError(f"unknown status filter: {status!r}")
+        if limit < 0 or offset < 0:
+            raise ValueError(f"limit/offset must be >= 0, got limit={limit} offset={offset}")
         rows = await self._fetch(
             "list",
             {
@@ -290,6 +299,10 @@ class TaskStore(ABC):
         return their ids. Nothing else removes rows, so a long-lived database
         needs this called periodically. Bounded by `limit` to keep each sweep a
         short write; call it in a loop until it returns fewer than `limit`."""
+        if older_than_ms < 0:
+            raise ValueError(f"older_than_ms must be >= 0, got {older_than_ms}")
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
         rows = await self._fetch("purge", {"older_than_ms": older_than_ms, "limit": limit})
         return [r["id"] for r in rows]
 

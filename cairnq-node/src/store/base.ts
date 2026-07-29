@@ -219,6 +219,16 @@ export abstract class TaskStore {
     if (!CONFLICTS.includes(conflict)) {
       throw new Error(`unknown conflict strategy: ${conflict}`);
     }
+    // maxAttempts < 1 would still run once (claim increments before the check),
+    // a silently different meaning than the number says; a negative delay is
+    // always a mistake. Both fail loudly instead. Only supplied values are
+    // checked — the defaults live in the params object alone.
+    if (input.maxAttempts != null && input.maxAttempts < 1) {
+      throw new Error(`maxAttempts must be >= 1, got ${input.maxAttempts}`);
+    }
+    if (input.runAtDelayMs != null && input.runAtDelayMs < 0) {
+      throw new Error(`runAtDelayMs must be >= 0, got ${input.runAtDelayMs}`);
+    }
     if (key === null) return rowToTask((await this.fetch("insert_task", ins))[0]);
 
     // A key makes submit a read-then-write, so it has to be one transaction —
@@ -260,6 +270,9 @@ export abstract class TaskStore {
     // matches nothing and returns [] indistinguishably from "no such tasks".
     if (input.status != null && !STATUSES.includes(input.status)) {
       throw new Error(`unknown status filter: ${input.status}`);
+    }
+    if ((input.limit != null && input.limit < 0) || (input.offset != null && input.offset < 0)) {
+      throw new Error(`limit/offset must be >= 0, got limit=${input.limit} offset=${input.offset}`);
     }
     const rows = await this.fetch("list", {
       status: input.status ?? null,
@@ -313,6 +326,12 @@ export abstract class TaskStore {
    * call it in a loop until it returns fewer than `limit`.
    */
   async purge(input: PurgeInput = {}): Promise<string[]> {
+    if (input.olderThanMs != null && input.olderThanMs < 0) {
+      throw new Error(`olderThanMs must be >= 0, got ${input.olderThanMs}`);
+    }
+    if (input.limit != null && input.limit < 1) {
+      throw new Error(`limit must be >= 1, got ${input.limit}`);
+    }
     const rows = await this.fetch("purge", {
       older_than_ms: input.olderThanMs ?? 0,
       limit: input.limit ?? 1_000,

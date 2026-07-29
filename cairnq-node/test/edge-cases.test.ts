@@ -118,4 +118,16 @@ describe("edge cases", () => {
       "unknown status filter",
     );
   });
+
+  it("rejects out-of-range numeric options", async () => {
+    // maxAttempts=0 would still run once (claim increments before the check) —
+    // a silently different meaning than the number says. The others silently
+    // matched nothing or purged nothing.
+    await expect(client.submit("job", {}, { maxAttempts: 0 })).rejects.toThrow("maxAttempts");
+    await expect(client.submit("job", {}, { runAtDelayMs: -1 })).rejects.toThrow("runAtDelayMs");
+    await expect(client.list({ limit: -1 })).rejects.toThrow("limit/offset");
+    await expect(client.list({ offset: -1 })).rejects.toThrow("limit/offset");
+    await expect(client.purge({ olderThanMs: -1 })).rejects.toThrow("olderThanMs");
+    await expect(client.purge({ limit: 0 })).rejects.toThrow("limit");
+  });
 });

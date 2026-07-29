@@ -92,3 +92,21 @@ async def test_list_rejects_an_unknown_status(client):
     # from "no such tasks".
     with pytest.raises(ValueError):
         await client.list(status="succeded")  # typo on purpose
+
+
+async def test_out_of_range_numeric_arguments_are_rejected(client):
+    # max_attempts=0 would still run once (claim increments before the check) —
+    # a silently different meaning than the number says. The others silently
+    # matched nothing or purged nothing.
+    with pytest.raises(ValueError):
+        await client.submit("job", {}, max_attempts=0)
+    with pytest.raises(ValueError):
+        await client.submit("job", {}, run_at_delay_ms=-1)
+    with pytest.raises(ValueError):
+        await client.list(limit=-1)
+    with pytest.raises(ValueError):
+        await client.list(offset=-1)
+    with pytest.raises(ValueError):
+        await client.purge(older_than_ms=-1)
+    with pytest.raises(ValueError):
+        await client.purge(limit=0)
