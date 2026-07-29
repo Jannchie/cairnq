@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from .._ids import new_id
 from ..errors import AlreadyExists, LostLease, ProtocolVersionMismatch, error_envelope
@@ -27,6 +27,8 @@ from ..models import Task
 
 # Runs one named protocol statement and returns its rows.
 Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
+
+Conflict = Literal["reuse", "reject", "replace"]
 
 SUPPORTED_PROTOCOL_MAJOR = 1
 
@@ -122,7 +124,7 @@ class TaskStore(ABC):
         payload: dict[str, Any] | None = None,
         queue: str = "default",
         key: str | None = None,
-        conflict: str = "reuse",
+        conflict: Conflict = "reuse",
         max_attempts: int = 3,
         priority: int = 0,
         metadata: dict[str, Any] | None = None,

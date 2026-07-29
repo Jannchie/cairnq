@@ -18,7 +18,7 @@ from .errors import (
     TaskTimeout,
 )
 from .models import STATUSES, Task, TaskDef, TaskStatus
-from .store import PostgresStore, SQLiteStore, TaskStore
+from .store import Conflict, PostgresStore, SQLiteStore, TaskStore
 from .worker import Worker
 
 # Read from the installed package metadata rather than repeated here: the version
@@ -36,6 +36,7 @@ __all__ = [
     "TaskDef",
     "TaskStatus",
     "STATUSES",
+    "Conflict",
     "TaskStore",
     "SQLiteStore",
     "PostgresStore",

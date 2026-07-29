@@ -5,7 +5,7 @@ from typing import Any
 from ._wait import DEFAULT_POLL_MS, poll_wait
 from .errors import TaskCanceled, TaskFailed
 from .models import Task, TaskDef, task_name
-from .store.base import TaskStore
+from .store.base import Conflict, TaskStore
 from .store.sqlite import SQLiteStore
 
 
@@ -45,7 +45,7 @@ class CairnQ:
         *,
         key: str | None = None,
         queue: str = "default",
-        conflict: str = "reuse",
+        conflict: Conflict = "reuse",
         max_attempts: int = 3,
         priority: int = 0,
         metadata: dict[str, Any] | None = None,
