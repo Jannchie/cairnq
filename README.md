@@ -183,6 +183,10 @@ cd cairnq-node && pnpm install && pnpm test
 
 # Cross-language: TS API -> Py worker, and Py API -> TS worker, over one tasks.db
 cd conformance && pnpm test:cross-lang
+
+# Micro-benchmarks (same workload in both SDKs; add `postgres` to hit a real PG)
+cd cairnq-node && pnpm bench
+cd cairnq-py && uv run python bench/run.py
 ```
 
 No database server to start — the runtime is the SQLite file. Set

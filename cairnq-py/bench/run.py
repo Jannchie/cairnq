@@ -3,6 +3,9 @@
     uv run python bench/run.py               # SQLite on a temp file
     uv run python bench/run.py postgres      # against CAIRNQ_TEST_PG_DSN (use a throwaway DB)
 
+Workload sizes, poll settings and row labels MUST match cairnq-node/bench/run.ts
+— the two benches exist to be compared against each other.
+
 Reports client-op throughput (submit/get/cancel/purge), worker drain throughput,
 and end-to-end call() latency — the latency rows are the ones that show the
 polling floor: with the default intervals a call can't finish faster than the
@@ -17,10 +20,7 @@ import sys
 import tempfile
 from time import perf_counter
 
-from cairnq import CairnQ, TaskDef, Worker
-from cairnq.store.base import TaskStore
-from cairnq.store.postgres import PostgresStore
-from cairnq.store.sqlite import SQLiteStore
+from cairnq import CairnQ, PostgresStore, SQLiteStore, TaskDef, TaskStore, Worker
 
 N_SUBMIT = 1000
 N_GET = 2000

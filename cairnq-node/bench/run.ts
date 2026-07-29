@@ -2,6 +2,9 @@
 //   pnpm bench                # SQLite on a temp file
 //   pnpm bench postgres       # against CAIRNQ_TEST_PG_DSN (use a throwaway DB)
 //
+// Workload sizes, poll settings and row labels MUST match cairnq-py/bench/run.py
+// — the two benches exist to be compared against each other.
+//
 // Reports client-op throughput (submit/get/cancel/purge), worker drain
 // throughput, and end-to-end call() latency — the latency rows are the ones that
 // show the polling floor: with the default intervals a call can't finish faster
@@ -11,7 +14,8 @@ import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { CairnQ, defineTask, PostgresStore, SQLiteStore, Worker } from "../src/index.js";
-import { freshDbPath, sleep } from "../test/helpers.js";
+import type { TaskStore } from "../src/index.js";
+import { freshDbPath, waitFor } from "../test/helpers.js";
 
 const N_SUBMIT = 1000;
 const N_GET = 2000;
@@ -19,23 +23,24 @@ const N_DRAIN = 500;
 const N_CALL = 40;
 
 const noop = defineTask("bench.noop");
-const rows = [];
+const rows: string[][] = [];
 
-const opsPerSec = (n, ms) => Math.round((n / ms) * 1000);
-const pct = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+const opsPerSec = (n: number, ms: number) => Math.round((n / ms) * 1000);
+const pct = (sorted: number[], q: number) =>
+  sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
 
-async function timed(label, n, fn) {
+async function timed<T>(label: string, n: number, fn: () => Promise<T>): Promise<T> {
   const t0 = performance.now();
   const out = await fn();
   rows.push([label, `${opsPerSec(n, performance.now() - t0)} ops/s`]);
   return out;
 }
 
-const pushLatency = (label, lat) =>
+const pushLatency = (label: string, lat: number[]) =>
   rows.push([label, `p50 ${pct(lat, 0.5).toFixed(0)} ms`, `p95 ${pct(lat, 0.95).toFixed(0)} ms`]);
 
-async function callLatencies(tasks, callOpts = {}) {
-  const lat = [];
+async function callLatencies(tasks: CairnQ, callOpts: { pollMs?: number } = {}) {
+  const lat: number[] = [];
   for (let i = 0; i < N_CALL; i++) {
     const t0 = performance.now();
     await tasks.call(noop, {}, { waitTimeoutMs: 15_000, ...callOpts });
@@ -45,19 +50,20 @@ async function callLatencies(tasks, callOpts = {}) {
 }
 
 /** Sweep every terminal task, honoring purge's bounded-batch contract. */
-async function purgeAll(tasks) {
+async function purgeAll(tasks: CairnQ) {
   while ((await tasks.purge({ olderThanMs: 0, limit: 1_000 })).length === 1_000);
 }
 
 /** The drain counter fires on the last handler's return; its complete write —
  * and the handful still in flight — land just after. Wait them out. */
-async function drainSettled(tasks) {
-  while ((await tasks.list({ status: "running", limit: 1 })).length) await sleep(5);
-}
+const drainSettled = (tasks: CairnQ) =>
+  waitFor(async () => (await tasks.list({ status: "running", limit: 1 })).length === 0);
 
 async function main() {
   const backend = process.argv[2] ?? "sqlite";
-  let tasks, workerStore, tmpDir;
+  let tasks: CairnQ;
+  let workerStore: TaskStore;
+  let tmpDir: string | undefined;
   if (backend === "postgres") {
     const dsn = process.env.CAIRNQ_TEST_PG_DSN;
     if (!dsn) throw new Error("set CAIRNQ_TEST_PG_DSN (point it at a throwaway database)");
@@ -74,7 +80,7 @@ async function main() {
   // ---- client ops, no worker running. "bench.unclaimed" is a name no worker
   // registers, so these rows sit queued until the cancel pass below.
   const ids = await timed("submit", N_SUBMIT, async () => {
-    const out = [];
+    const out: string[] = [];
     for (let i = 0; i < N_SUBMIT; i++) out.push((await tasks.submit("bench.unclaimed", { i })).id);
     return out;
   });
@@ -92,8 +98,8 @@ async function main() {
   // both workers share it (they never run at the same time).
   await Promise.all(Array.from({ length: N_DRAIN }, (_, i) => tasks.submit(noop, { i })));
   let done = 0;
-  let resolveAll;
-  const allDone = new Promise((r) => (resolveAll = r));
+  let resolveAll!: () => void;
+  const allDone = new Promise<void>((r) => (resolveAll = r));
   const w = new Worker(workerStore, ["default"], { concurrency: 8 });
   w.task(noop, () => {
     if (++done === N_DRAIN) resolveAll();
@@ -104,7 +110,7 @@ async function main() {
   const [drainMs, lat] = await w.background(async () => {
     await allDone;
     await drainSettled(tasks);
-    return [performance.now() - t0, await callLatencies(tasks)];
+    return [performance.now() - t0, await callLatencies(tasks)] as const;
   });
   rows.push([`drain ${N_DRAIN} (conc 8)`, `${opsPerSec(N_DRAIN, drainMs)} tasks/s`]);
   pushLatency("call e2e (default polls)", lat);
