@@ -15,7 +15,11 @@ export function checkProtocolVersion(version: number): void {
   }
 }
 
-export type Conflict = "reuse" | "reject" | "replace";
+// CONFLICTS is the canonical declaration; the type derives from it so the
+// runtime guard in submit() and the type can't drift apart (same pattern as
+// STATUSES/TaskStatus in models.ts).
+export const CONFLICTS = ["reuse", "reject", "replace"] as const;
+export type Conflict = (typeof CONFLICTS)[number];
 
 export interface SubmitInput {
   name: string;
@@ -155,6 +159,11 @@ export abstract class TaskStore {
     };
     const key = input.key ?? null;
     const conflict = input.conflict ?? "reuse";
+    // Validate up front: untyped callers otherwise only hit the strategy branch
+    // on the second submit of a key, deep inside the transaction.
+    if (!CONFLICTS.includes(conflict)) {
+      throw new Error(`unknown conflict strategy: ${conflict}`);
+    }
     if (key === null) return rowToTask((await this.fetch("insert_task", ins))[0]);
 
     // A key makes submit a read-then-write, so it has to be one transaction —
@@ -168,7 +177,7 @@ export abstract class TaskStore {
         const exId = existing[0].task_id;
         if (conflict === "reuse") return rowToTask((await fetch("get", { id: exId }))[0]);
         if (conflict === "reject") throw new AlreadyExists(key);
-        if (conflict !== "replace") throw new Error(`unknown conflict strategy: ${conflict}`);
+        // "replace": cancel the recorded task, then repoint the key below.
         await fetch("cancel", { id: exId });
       }
       const row = (await fetch("insert_task", ins))[0];

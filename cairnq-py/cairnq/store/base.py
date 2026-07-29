@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from .._ids import new_id
 from ..errors import AlreadyExists, LostLease, ProtocolVersionMismatch, error_envelope
@@ -28,7 +28,11 @@ from ..models import Task
 # Runs one named protocol statement and returns its rows.
 Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
 
+# Conflict is the canonical declaration; CONFLICTS derives from it (via
+# get_args) so the runtime guard in submit() and the type can't drift apart
+# (same pattern as TaskStatus/STATUSES in models.py).
 Conflict = Literal["reuse", "reject", "replace"]
+CONFLICTS: tuple[Conflict, ...] = get_args(Conflict)
 
 SUPPORTED_PROTOCOL_MAJOR = 1
 
@@ -134,6 +138,10 @@ class TaskStore(ABC):
         correlation_id: str | None = None,
         run_at_delay_ms: int = 0,
     ) -> Task:
+        # Validate up front: untyped callers otherwise only hit the strategy
+        # branch on the second submit of a key, deep inside the transaction.
+        if conflict not in CONFLICTS:
+            raise ValueError(f"unknown conflict strategy: {conflict!r}")
         task_id = new_id("task")
         ins = {
             "id": task_id,
@@ -164,8 +172,7 @@ class TaskStore(ABC):
                     return Task.from_row((await fetch("get", {"id": ex_id}))[0])
                 if conflict == "reject":
                     raise AlreadyExists(key)
-                if conflict != "replace":
-                    raise ValueError(f"unknown conflict strategy: {conflict!r}")
+                # "replace": cancel the recorded task, then repoint the key below.
                 await fetch("cancel", {"id": ex_id})
             rows = await fetch("insert_task", ins)
             await fetch("upsert_key", {"key": key, "task_id": task_id})
