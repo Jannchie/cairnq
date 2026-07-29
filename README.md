@@ -115,11 +115,25 @@ and a JSON protocol.
   attempt failed retryably or its worker crashed.
 - **Handler-controlled failure**: raise `TaskError(..., retryable=False)` to fail
   a task permanently; any other thrown error is retried up to `max_attempts`.
+- **Hung-handler ceiling**: optional `max_run_ms` / `maxRunMs` bounds one
+  attempt's wall clock — the heartbeat otherwise renews a hung handler's lease
+  forever. At the ceiling the worker abandons the attempt (Python cancels the
+  handler; TypeScript aborts `ctx.signal` and cuts the context off from the
+  store) and records a retryable `handler_timeout` failure, so backoff,
+  `max_attempts` and cancel-wins apply as usual.
 - **Retention**: `purge` deletes terminal tasks past a cutoff — nothing else ever
-  removes rows, so call it on a schedule.
-- **Operational visibility**: an `on_error` / `onError` hook on the worker reports
-  what the run loop survived (a failed claim, a store write that blew up while
-  finalizing). Without it those are silent.
+  removes rows, so call it on a schedule. A minimal hourly sweep:
+
+  ```python
+  while len(await tasks.purge(older_than_ms=7 * 86_400_000, limit=1_000)) == 1_000:
+      pass  # drain in bounded batches; re-run from your scheduler every hour
+  ```
+
+- **Operational visibility**: `stats()` returns task counts per queue and status
+  (zero-filled), so a dashboard or health check reads backlog without listing
+  rows; an `on_error` / `onError` hook on the worker reports what the run loop
+  survived (a failed claim, a store write that blew up while finalizing) —
+  without it those are silent.
 
 ### At-least-once, not exactly-once
 
