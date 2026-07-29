@@ -228,14 +228,15 @@ class Worker:
 
     # ----------------------------------------------------------------- run loop
     async def run(self, *, concurrency: int | None = None) -> None:
-        if concurrency:
-            self._concurrency = concurrency
-        batch = self._batch or self._concurrency
+        # A per-run override stays local, as in the TS SDK — it must not stick to
+        # the worker and silently apply to the next run().
+        concurrency = concurrency or self._concurrency
+        batch = self._batch or concurrency
         await self._store.connect()
         running: set[asyncio.Task] = set()
         try:
             while not self._stop.is_set():
-                free = self._concurrency - len(running)
+                free = concurrency - len(running)
                 if free <= 0:
                     # Wait for a slot rather than polling for one. _execute never
                     # raises, so waiting on it cannot surface an exception here.
