@@ -149,7 +149,9 @@ export class Worker {
   }
 
   async run(opts: { concurrency?: number } = {}): Promise<void> {
-    const concurrency = opts.concurrency ?? this.opts.concurrency ?? 1;
+    // Clamped: at 0 the loop would await Promise.race([]) — pending forever,
+    // beyond even stop()'s reach.
+    const concurrency = Math.max(1, opts.concurrency ?? this.opts.concurrency ?? 1);
     const leaseMs = this.opts.leaseMs ?? 30_000;
     const batch = this.opts.claimBatch ?? concurrency;
     await this.store.connect();

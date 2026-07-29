@@ -229,8 +229,9 @@ class Worker:
     # ----------------------------------------------------------------- run loop
     async def run(self, *, concurrency: int | None = None) -> None:
         # A per-run override stays local, as in the TS SDK — it must not stick to
-        # the worker and silently apply to the next run().
-        concurrency = concurrency or self._concurrency
+        # the worker and silently apply to the next run(). Clamped: at 0 the
+        # loop would await asyncio.wait(set()), which raises.
+        concurrency = max(1, concurrency or self._concurrency)
         batch = self._batch or concurrency
         await self._store.connect()
         running: set[asyncio.Task] = set()
