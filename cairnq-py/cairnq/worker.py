@@ -11,6 +11,7 @@ from .context import TaskContext
 from .errors import LostLease, TaskError, error_envelope
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
+from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
 
 Handler = Callable[..., Any]
@@ -147,8 +148,6 @@ class Worker:
     ) -> "Worker":
         """Multi-host backend. `dsn` is a libpq connection string; requires the
         optional asyncpg package (install cairnq[postgres])."""
-        from .store.postgres import PostgresStore
-
         worker = cls(
             PostgresStore(dsn, min_size=min_size, max_size=max_size),
             queues,

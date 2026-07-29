@@ -6,6 +6,7 @@ from ._wait import DEFAULT_POLL_MS, poll_wait
 from .errors import TaskCanceled, TaskFailed
 from .models import Task, TaskDef, task_name
 from .store.base import Conflict, TaskStore
+from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
 
 
@@ -24,8 +25,6 @@ class CairnQ:
     def postgres(cls, dsn: str, **kwargs: Any) -> "CairnQ":
         """Multi-host backend. `dsn` is a libpq connection string; requires the
         optional asyncpg package (install cairnq[postgres])."""
-        from .store.postgres import PostgresStore
-
         return cls(PostgresStore(dsn, **kwargs))
 
     @property
