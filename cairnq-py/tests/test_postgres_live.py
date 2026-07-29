@@ -90,6 +90,19 @@ async def test_by_key_transactions(pg_client):
     assert await pg_client.cancel_by_key("missing") is None
 
 
+async def test_concurrent_same_key_submits_stay_idempotent(pg_client):
+    # Regression: without lock_key.sql these race through READ COMMITTED (no key
+    # row to lock yet), every submit sees "no existing task", and one key ends up
+    # with several live tasks. The pool gives each submit its own connection, so
+    # they truly race.
+    results = await asyncio.gather(
+        *(pg_client.submit("job", {}, key="K", conflict="reuse") for _ in range(8))
+    )
+    assert len({t.id for t in results}) == 1
+    live = await pg_client.list(name="job", status="queued")
+    assert len(live) == 1
+
+
 async def test_ownership_rejects_non_owner(pg_client):
     store = pg_client.store
     t = await pg_client.submit("job", {})

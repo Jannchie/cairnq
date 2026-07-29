@@ -84,6 +84,19 @@ suite("postgres live", () => {
     expect(await client.cancelByKey("missing")).toBeNull();
   });
 
+  it("keeps reuse idempotent under genuinely concurrent same-key submits", async () => {
+    // Regression: without lock_key.sql these race through READ COMMITTED (no
+    // key row to lock yet), every submit sees "no existing task", and one key
+    // ends up with several live tasks. The pool gives each submit its own
+    // connection, so they truly race.
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => client.submit("job", {}, { key: "K", conflict: "reuse" })),
+    );
+    expect(new Set(results.map((t) => t.id)).size).toBe(1);
+    const live = await client.list({ name: "job", status: "queued" });
+    expect(live.length).toBe(1);
+  });
+
   it("rejects a non-owner worker write with LostLease", async () => {
     const t = await client.submit("job", {});
     await client.store.claim({ queues: ["default"], workerId: "owner", leaseMs: 5000 });

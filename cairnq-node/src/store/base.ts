@@ -157,9 +157,12 @@ export abstract class TaskStore {
     const conflict = input.conflict ?? "reuse";
     if (key === null) return rowToTask((await this.fetch("insert_task", ins))[0]);
 
-    // A key makes submit a read-then-write, so it has to be one transaction:
-    // concurrent same-key submits must not both see "no existing task".
+    // A key makes submit a read-then-write, so it has to be one transaction —
+    // opened by taking the key's lock, because on Postgres the transaction alone
+    // is not enough: concurrent same-key submits must not both see "no existing
+    // task" (see lock_key.sql; on SQLite it is a no-op).
     return this.tx(async (fetch) => {
+      await fetch("lock_key", { key });
       const existing = (await fetch("get_key", { key })) as { task_id: string }[];
       if (existing.length) {
         const exId = existing[0].task_id;
@@ -214,12 +217,14 @@ export abstract class TaskStore {
   }
 
   /**
-   * Resolve a key to the task it currently points at, then act on that task — in
-   * one transaction, so a concurrent `replace` can't repoint the key between the
-   * lookup and the write.
+   * Resolve a key to the task it currently points at, then act on that task —
+   * under the key's lock, so a concurrent `replace` can't repoint the key
+   * between the lookup and the write (the transaction alone is not enough on
+   * Postgres; see lock_key.sql).
    */
   private async byKey(name: string, key: string, params: Params): Promise<Task | null> {
     return this.tx(async (fetch) => {
+      await fetch("lock_key", { key });
       const existing = (await fetch("get_key", { key })) as { task_id: string }[];
       if (!existing.length) return null;
       return TaskStore.one(await fetch(name, { id: existing[0].task_id, ...params }));

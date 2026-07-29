@@ -42,6 +42,7 @@ def check_protocol_version(version: int) -> None:
             f"storage protocol_version={version}, SDK supports {SUPPORTED_PROTOCOL_MAJOR}"
         )
 
+
 LEASE_EXPIRED_ERROR_JSON = json.dumps(
     error_envelope(
         type="LeaseExpired",
@@ -150,9 +151,12 @@ class TaskStore(ABC):
         if key is None:
             return Task.from_row((await self._fetch("insert_task", ins))[0])
 
-        # A key makes submit a read-then-write, so it has to be one transaction:
-        # concurrent same-key submits must not both see "no existing task".
+        # A key makes submit a read-then-write, so it has to be one transaction —
+        # opened by taking the key's lock, because on Postgres the transaction
+        # alone is not enough: concurrent same-key submits must not both see "no
+        # existing task" (see lock_key.sql; on SQLite it is a no-op).
         async with self._transaction() as fetch:
+            await fetch("lock_key", {"key": key})
             existing = await fetch("get_key", {"key": key})
             if existing:
                 ex_id = existing[0]["task_id"]
@@ -214,9 +218,11 @@ class TaskStore(ABC):
 
     async def _by_key(self, name: str, key: str, params: dict[str, Any]) -> Task | None:
         """Resolve a key to the task it currently points at, then act on that task
-        — in one transaction, so a concurrent `replace` can't repoint the key
-        between the lookup and the write."""
+        — under the key's lock, so a concurrent `replace` can't repoint the key
+        between the lookup and the write (the transaction alone is not enough on
+        Postgres; see lock_key.sql)."""
         async with self._transaction() as fetch:
+            await fetch("lock_key", {"key": key})
             existing = await fetch("get_key", {"key": key})
             if not existing:
                 return None
