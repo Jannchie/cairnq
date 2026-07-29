@@ -149,8 +149,11 @@ class SQLiteStore(TaskStore):
                         (name, now_ms()),
                     )
             except BaseException:
-                with contextlib.suppress(Exception):
-                    await conn.execute("ROLLBACK")
+                # Shielded and BaseException-suppressed: a cancellation landing
+                # during the rollback must not abandon the shared connection
+                # inside an open write transaction.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(conn.execute("ROLLBACK"))
                 raise
             else:
                 await conn.execute("COMMIT")
@@ -229,8 +232,12 @@ class SQLiteStore(TaskStore):
             try:
                 yield self._run
             except BaseException:
-                with contextlib.suppress(Exception):
-                    await self._conn.execute("ROLLBACK")
+                # Shielded and BaseException-suppressed: a cancellation landing
+                # during the rollback must not abandon the shared connection
+                # inside an open write transaction — every later operation
+                # would then run inside it, holding SQLite's write lock.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(self._conn.execute("ROLLBACK"))
                 raise
             else:
                 await self._conn.execute("COMMIT")
