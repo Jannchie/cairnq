@@ -43,7 +43,14 @@ one implementation of each operation serve both backends.
   parse on read — parsing only when the driver returns text (a `jsonb` driver may
   return already-decoded objects). No language-private types cross the boundary (no
   pickle, no class instances, no Buffer). Large blobs go by reference (e.g.
-  `{"image_url": "s3://..."}`).
+  `{"image_url": "s3://..."}`). Values JSON cannot represent are **rejected at the
+  boundary**, never coerced or written leniently: Python's encoder would emit bare
+  `NaN`/`Infinity` (which `JSON.parse` throws on) and JavaScript's would silently
+  turn them into `null` — both SDKs instead raise `SerializationError`, and a
+  worker records a result it cannot serialize as a permanent
+  `unserializable_result` failure rather than stranding the task. One residual
+  dialect gap: Postgres `jsonb` rejects `\u0000` inside strings while SQLite
+  accepts it, so avoid NUL characters in values that need backend portability.
 - **Null means "leave it alone"** on `progress`: both `progress` and `message` are
   coalesced, so `progress(0.5)` keeps the prior message and `progress(null, "msg")`
   keeps the prior fraction. Neither can be cleared once set.
@@ -176,7 +183,10 @@ purged task's `key` pointer goes with it via `ON DELETE CASCADE`.
 at 100ms and grows 1.5× to a 500ms ceiling, so a short task stays responsive while
 a long wait doesn't re-read every 100ms for an hour. This is the only non-SQL
 operation, read-only. `call = submit + wait`; on timeout it raises
-`TaskTimeout(task_id=...)` and **the task keeps running**.
+`TaskTimeout(task_id=...)` and **the task keeps running**. The error carries the
+last task snapshot the poll observed, and its message says what state the task
+was stuck in (never claimed / queued / still running) — diagnostic text each SDK
+composes for itself, not part of the contract.
 
 ## Push wakeups (Postgres only)
 

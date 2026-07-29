@@ -142,7 +142,9 @@ its state*, including a terminal `failed`/`canceled` one. To force a new run use
   backends run the same conformance suite. On Postgres, LISTEN/NOTIFY additionally
   wakes idle workers and `wait`/`call` the moment a task is queued or finishes —
   millisecond pickup instead of the poll interval, with polling kept as the
-  fallback (a lost notification costs one poll, never a task).
+  fallback (a lost notification costs one poll, never a task). One payload caveat
+  when targeting both backends: Postgres `jsonb` rejects `\u0000` inside strings,
+  SQLite accepts it — avoid NUL characters in payloads that need portability.
 - **One writer at a time (SQLite).** `claim` / `submit` / worker writes are short,
   but heavy write concurrency serializes. Idle workers stay off the write lock (a
   read-only probe gates each poll); busy ones still contend. This is built for
