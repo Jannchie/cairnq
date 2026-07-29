@@ -9,5 +9,7 @@ where (:status::text is null or status = :status)
   and (:name::text is null or name = :name)
   and (:root_id::text is null or root_id = :root_id)
   and (:correlation_id::text is null or correlation_id = :correlation_id)
-order by created_at_ms desc
+-- id breaks created_at_ms ties, as in claim.sql: without it, paginating with
+-- offset across same-millisecond rows could repeat or skip a task.
+order by created_at_ms desc, id desc
 limit :limit offset :offset;

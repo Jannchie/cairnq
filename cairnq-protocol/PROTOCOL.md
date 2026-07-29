@@ -102,7 +102,11 @@ A worker **leases** a task rather than popping it:
 - `claim` sets `status=running`, `worker_id`, `lease_until_ms = now + lease_ms`,
   and `attempt += 1`. It is atomic: a single `UPDATE … WHERE id IN (SELECT … LIMIT)
   RETURNING *` run inside `BEGIN IMMEDIATE` — the SQLite equivalent of
-  `FOR UPDATE SKIP LOCKED`. `busy_timeout` absorbs `SQLITE_BUSY`.
+  `FOR UPDATE SKIP LOCKED`. `busy_timeout` absorbs `SQLITE_BUSY`. Claim order is
+  deterministic in both dialects: `priority desc, created_at_ms asc, id asc` —
+  FIFO at millisecond granularity, with same-millisecond ties broken stably by
+  the id (its random half decides, not submit order). `list` breaks its
+  `created_at_ms desc` ties the same way.
 - **`claim` filters by task name, not only by queue.** `:names` carries the names
   the caller can actually run; a worker passes its registered handlers (`NULL`
   means no filter, an empty set claims nothing). Queues do not partition work by

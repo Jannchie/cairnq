@@ -22,7 +22,10 @@ where id in (
       and queue in (select value from json_each(:queues))
       and (:names is null or name in (select value from json_each(:names)))
       and run_at_ms <= :now_ms
-    order by priority desc, created_at_ms asc
+    -- id breaks created_at_ms ties (same-millisecond submits), so claim order
+    -- is deterministic: FIFO at millisecond granularity; within one millisecond
+    -- the id's random half decides, stably but not in submit order.
+    order by priority desc, created_at_ms asc, id asc
     limit :limit
 )
 returning *;
