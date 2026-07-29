@@ -126,13 +126,27 @@ A worker **leases** a task rather than popping it:
 ## Key conflict (`cairnq_task_keys`)
 
 `key` is a business-stable pointer to the *current* task; `task_id` is one
-execution. On `submit` with a `key`, inside `BEGIN IMMEDIATE`:
+execution. On `submit` with a `key`, inside one transaction:
 
 - `reuse` — key exists → return the existing task.
 - `reject` — key exists → raise `AlreadyExists`.
 - `replace` — cancel the existing task, insert a new one, repoint the key.
 
-Single-writer + `BEGIN IMMEDIATE` serializes concurrent same-key submits.
+**Every keyed operation (submit-with-key and the `*_by_key` ops) takes
+`lock_key` as the first statement of its transaction.** The transaction alone
+is not enough on Postgres: under READ COMMITTED there is no row to lock when
+the key does not exist yet, so two concurrent same-key submits would both see
+"no existing task" and both insert. The Postgres dialect locks with
+`pg_advisory_xact_lock` on the key's hash; SQLite's `lock_key.sql` is a no-op
+because `BEGIN IMMEDIATE` already serializes every keyed transaction. A new
+dialect MUST ship a `lock_key.sql` with equivalent serialization.
+
+**A purged task frees its key.** The key row cascades away with the task
+(`ON DELETE CASCADE`), so a later keyed submit inserts a new task under that
+key, whatever the conflict strategy — and an implementation must re-read the
+task inside the keyed transaction, treating a vanished task as "key free"
+(on Postgres a concurrent purge can remove it between the transaction's
+statement snapshots). Pinned by `key_reuse_after_purge`.
 
 > **`reuse` returns the recorded task whatever its state** — including a terminal
 > `succeeded`/`failed`/`canceled` one. It is idempotent submit, not "re-run if the
@@ -184,6 +198,15 @@ depends on a notification being delivered; a lost one costs one poll interval
 of latency, nothing else. SQLite has no push channel — a shared file has no
 reliable cross-process notification primitive — and keeps the identical polling
 behavior it always had. Purely additive: `protocol_version` stays 1.
+
+The SDK-side seam is a pair of store methods with a wake-or-timeout contract:
+`claim_wake(queues, timeout)` resolves when a task may have become claimable
+**on one of the given queues** (the `cairnq_queued` payload is filtered against
+them, so a worker is not woken by other queues' traffic), and
+`task_done_wake(task_id, timeout)` when that task may have gone terminal. Both
+resolve after the timeout at the latest; the default implementation is a plain
+sleep — polling *is* the wake mechanism. A custom store may override them, but
+nothing may ever *require* a wake to arrive.
 
 Retries carry **exponential backoff**: a failed attempt is requeued at
 `now + base * 2^(attempt-1)`, capped (SDK defaults: 1s base, 30s cap, 0 disables).
