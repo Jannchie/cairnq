@@ -296,6 +296,11 @@ CairnQ targets same-host coordination. Know the edges:
   operations in-process (one connection behind a lock), so a transaction can't be
   interleaved with another operation. Both are fine for low-write, long-running AI
   workloads; neither is a high-throughput MQ.
+- **Planner statistics are refreshed at open, and only then.** Both SDKs run
+  `PRAGMA optimize` after migrating, because without `sqlite_stat1` the planner
+  passes over the partial index lease recovery depends on. A connection held for
+  days keeps the statistics it opened with, so restart a long-lived worker after the
+  database grows by an order of magnitude.
 - **Same host only (SQLite).** Do not put the database on a network filesystem and
   do not share the file across machines — WAL requires processes on one host. For
   multi-host, use the Postgres backend, which takes time from the DB clock and
@@ -310,6 +315,13 @@ CairnQ targets same-host coordination. Know the edges:
 
 `cairnq_meta` holds `protocol_version` and `schema_version`. On startup an SDK
 reads `protocol_version` and refuses to run if its supported major differs.
+
+Ordinals are **one sequence shared by both dialects**, so a dialect may have no
+file at an ordinal — `0003` is the Postgres-only LISTEN/NOTIFY trigger, and SQLite
+goes 0001, 0002, 0004. A migration that closes an ordinal sets `schema_version` to
+it in *every* dialect it ships in, so the two never report different numbers for the
+same schema. (`0003` predates this rule and sets nothing, which is why both dialects
+read 2 until 0004 takes them to 4.)
 
 Migrations are applied in filename order and recorded in `cairnq_migrations`
 (name primary key). The check and the apply share **one write transaction** —

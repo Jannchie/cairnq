@@ -128,6 +128,22 @@ class SQLiteStore(TaskStore):
                 await _enable_wal(conn)
             await conn.execute("pragma foreign_keys = ON")
             await self._apply_migrations(conn)
+            # Give the query planner statistics: without sqlite_stat1 it misreads
+            # `status = 'running'` as a large fraction of the table and passes over
+            # the partial cairnq_tasks_lease_idx that lease recovery is indexed for.
+            # PRAGMA optimize decides for itself whether an ANALYZE is worth running
+            # — a no-op on a fresh or little-changed database.
+            #
+            # Connect-time only: a worker holds its connection for days, so a
+            # database that grows an order of magnitude mid-session plans against
+            # its startup shape until it restarts.
+            try:
+                await conn.execute("pragma optimize")
+            except sqlite3.OperationalError:
+                # Statistics are an optimization, never correctness, so losing them
+                # to a concurrent writer must not fail the connect — the next one
+                # gets another chance.
+                pass
             self._conn = conn
             check_protocol_version(await self.protocol_version())
 

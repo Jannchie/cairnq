@@ -6,7 +6,7 @@ import Database from "better-sqlite3";
 
 import { CairnQ } from "../src/index.js";
 import { nowMs } from "../src/ids.js";
-import { loadMigrations } from "../src/sql.js";
+import { loadMigrations, loadStatements } from "../src/sql.js";
 import { freshDbPath } from "./helpers.js";
 
 function indexNames(path: string): Set<string> {
@@ -49,8 +49,10 @@ describe("migrations", () => {
     db.close();
 
     expect(applied).toEqual(new Set(loadMigrations("sqlite").map((m) => m.name)));
-    expect(indexNames(path).has("cairnq_tasks_completed_idx")).toBe(true);
-    expect(meta(path, "schema_version")).toBe("2");
+    const names = indexNames(path);
+    expect(names.has("cairnq_tasks_completed_idx")).toBe(true);
+    expect(names.has("cairnq_tasks_lease_idx")).toBe(true);
+    expect(meta(path, "schema_version")).toBe("4");
   });
 
   it("upgrades a database left at an older migration", async () => {
@@ -75,7 +77,8 @@ describe("migrations", () => {
     await client.connect();
     try {
       expect(indexNames(path).has("cairnq_tasks_completed_idx")).toBe(true);
-      expect(meta(path, "schema_version")).toBe("2");
+      expect(indexNames(path).has("cairnq_tasks_lease_idx")).toBe(true);
+      expect(meta(path, "schema_version")).toBe("4");
       const task = await client.submit("job", { v: 1 });
       expect((await client.get(task.id))?.payload).toEqual({ v: 1 });
     } finally {
@@ -104,6 +107,49 @@ describe("migrations", () => {
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.every((r) => r.n === 1)).toBe(true);
     expect(indexNames(path).has("cairnq_tasks_completed_idx")).toBe(true);
+  });
+
+  // Migration 0004's index and the `PRAGMA optimize` on the open path are one
+  // feature, not two — without statistics the planner passes the index over (see
+  // 0004_lease_index.sql). So assert the pair, or either half can rot unnoticed:
+  // nothing else fails when lease recovery quietly goes back to a full status scan.
+  it("analyzes on open, so recover_leases uses its partial index", async () => {
+    const path = freshDbPath();
+    const client = CairnQ.sqlite(path);
+    await client.connect();
+    await client.close();
+
+    // Terminal rows keep a stale lease_until_ms (complete.sql does not clear it),
+    // which is exactly why the index has to be partial on status.
+    const seed = new Database(path);
+    const ins = seed.prepare(
+      "insert into cairnq_tasks (id,name,queue,status,payload,run_at_ms," +
+        "lease_until_ms,created_at_ms,updated_at_ms,completed_at_ms) " +
+        "values (?,'job','default','succeeded','{}',?,?,?,?,?)",
+    );
+    seed.transaction(() => {
+      for (let i = 0; i < 2_000; i++) ins.run(`seed_${i}`, i, i + 500, i, i, i);
+    })();
+    seed.close();
+
+    const reopened = CairnQ.sqlite(path);
+    await reopened.connect();
+    await reopened.close();
+
+    const db = new Database(path);
+    try {
+      const analyzed = db
+        .prepare("select idx from sqlite_stat1 where idx = 'cairnq_tasks_lease_idx'")
+        .all();
+      expect(analyzed).toHaveLength(1);
+
+      const plan = db
+        .prepare(`explain query plan ${loadStatements("sqlite").recover_leases}`)
+        .all({ now_ms: 0, lease_expired_error: "{}" }) as { detail: string }[];
+      expect(plan.map((r) => r.detail).join("\n")).toContain("cairnq_tasks_lease_idx");
+    } finally {
+      db.close();
+    }
   });
 
   it("does not reapply on reopen", async () => {

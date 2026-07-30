@@ -176,8 +176,26 @@ export class SQLiteStore extends TaskStore {
     if (!memory) enableWal(db);
     db.pragma("foreign_keys = ON");
     this.applyMigrations(db);
-    // Open path over: everything past here awaits its retry instead of blocking.
+    // Everything past here either awaits its retry or is optional, so stop blocking.
     db.pragma("busy_timeout = 0");
+    // Give the query planner statistics: without sqlite_stat1 it misreads
+    // `status = 'running'` as a large fraction of the table and passes over the
+    // partial cairnq_tasks_lease_idx that lease recovery is indexed for. PRAGMA
+    // optimize decides for itself whether an ANALYZE is worth running — a no-op on
+    // a fresh or little-changed database — and must precede the prepare loop below,
+    // which is what bakes the resulting plans in.
+    //
+    // Open-time only: a worker holds its connection for days, so a database that
+    // grows an order of magnitude mid-session plans against its startup shape until
+    // it restarts.
+    try {
+      db.pragma("optimize");
+    } catch (err) {
+      // Statistics are an optimization, never correctness, so losing them to a
+      // concurrent writer must not fail the open — the next one gets another
+      // chance. Anything else is a real fault and belongs to the caller.
+      if (!isBusy(err)) throw err;
+    }
     for (const [name, sql] of Object.entries(this.statements)) {
       this.stmts[name] = db.prepare(sql);
     }
