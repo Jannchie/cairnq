@@ -2,18 +2,16 @@
 //
 // better-sqlite3 is synchronous, and a transaction holds SQLite's write lock
 // across `await`s (the seam is shared with Postgres, so the callback is async).
-// A second connection in this process then blocks the only thread waiting for
-// that lock — and the holder can never reach COMMIT, because reaching it needs
-// the thread the waiter is sitting on. busy_timeout cannot break that inversion:
-// it is one thread, so the wait just burns the timeout and throws "database is
-// locked". The two must not overlap in the first place.
+// Two connections in this process therefore must not contend for that lock
+// directly — they queue behind one per-file lock instead, which is why that lock
+// is keyed by database rather than by store object.
 //
-// This is the API-and-worker-in-one-process deployment, and it is why the lock
-// belongs to the database file rather than to the store object.
+// This is the API-and-worker-in-one-process deployment.
 import { describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 
 import { CairnQ } from "../src/index.js";
-import { freshDbPath } from "./helpers.js";
+import { freshDbPath, sleep } from "./helpers.js";
 
 describe("sqlite concurrency", () => {
   it("lets two handles on one file write concurrently", async () => {
@@ -37,6 +35,52 @@ describe("sqlite concurrency", () => {
       await b.close();
     }
   });
+
+  // A lost write lock must be waited out by the event loop, not by the thread.
+  // A nonzero busy_timeout waits inside the synchronous driver, so a caller that
+  // loses the lock freezes this process for up to the whole timeout — and in the
+  // cases below it would never get the lock at all, because the timer that
+  // releases it needs the thread the wait is sitting on.
+  //
+  // The blocker is a plain connection, not a store: nothing serializes it against
+  // the store, which is what a competing *process* looks like from here.
+  for (const keyed of [false, true]) {
+    it(`waits out a contended write lock without blocking the event loop (${
+      keyed ? "transaction" : "single statement"
+    })`, async () => {
+      const dbPath = freshDbPath();
+      const client = CairnQ.sqlite(dbPath);
+      await client.connect();
+
+      const blocker = new Database(dbPath);
+      blocker.pragma("busy_timeout = 0");
+      blocker.exec("BEGIN IMMEDIATE");
+      const released = sleep(300).then(() => {
+        blocker.exec("COMMIT");
+        blocker.close();
+      });
+
+      let ticks = 0;
+      const ticker = setInterval(() => ticks++, 10);
+      const started = Date.now();
+      try {
+        const task = await client.submit("job", { v: 1 }, keyed ? { key: "k" } : {});
+        const elapsed = Date.now() - started;
+
+        // It really did have to wait for the blocker...
+        expect(elapsed).toBeGreaterThan(250);
+        // ...and the event loop ran throughout, which is also the only reason the
+        // COMMIT above ever happened. ~30 ticks are due in 300ms; anything well
+        // clear of zero proves the thread was free.
+        expect(ticks).toBeGreaterThan(10);
+        expect((await client.get(task.id))?.payload).toEqual({ v: 1 });
+      } finally {
+        clearInterval(ticker);
+        await released;
+        await client.close();
+      }
+    });
+  }
 
   it("connects to an in-memory database", async () => {
     // WAL is a property of an on-disk file; an in-memory database reports

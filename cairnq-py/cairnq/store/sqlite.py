@@ -8,7 +8,14 @@ the SDK (`:now_ms`) rather than by the database.
 Concurrency model: SQLite is a single writer anyway, and the lock prevents
 multi-statement transactions (submit-with-key, recover+claim) from interleaving on
 the shared connection. It is only ever held for short DB work — never while a task
-handler runs. Cross-process contention is absorbed by busy_timeout."""
+handler runs.
+
+Cross-process contention is absorbed by busy_timeout, which is right here and wrong
+in the TypeScript twin: aiosqlite waits on its own connection thread, so the event
+loop never stalls, while better-sqlite3 would block the only thread there is (that
+SDK sets busy_timeout = 0 and retries instead). Restoring symmetry here would move
+the wait onto the event loop for no gain, and this seam is a context manager rather
+than a callback, so it could not re-run an attempt anyway."""
 
 from __future__ import annotations
 

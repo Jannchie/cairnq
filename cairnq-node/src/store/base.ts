@@ -156,7 +156,14 @@ export abstract class TaskStore {
 
   /** Run one protocol statement outside a transaction, connecting if needed. */
   protected abstract fetch(name: string, params: Params): Promise<any[]>;
-  /** Run several statements atomically; `fn` receives a Fetch bound to the txn. */
+  /**
+   * Run several statements atomically; `fn` receives a Fetch bound to the txn.
+   *
+   * A backend may invoke `fn` more than once, retrying the transaction after a
+   * transient failure (SQLite does, on write-lock contention). So `fn` must be
+   * replayable: derive nothing inside it that the caller cannot derive twice —
+   * build ids and payloads before opening the transaction, not within it.
+   */
   protected abstract tx<T>(fn: (fetch: Fetch) => Promise<T>): Promise<T>;
 
   /**

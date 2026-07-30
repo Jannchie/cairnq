@@ -179,9 +179,9 @@ SQLite accepts it, so keep NUL characters out of payloads that need portability.
   but heavy write concurrency serializes. Idle workers stay off the write lock (a
   read-only probe gates each poll); busy ones still contend. This is built for
   low-write, long-running AI work — not as a high-throughput message queue.
-- **A contended SQLite write can block the process.** The TypeScript SDK
-  (`better-sqlite3`) is synchronous: on lock contention it blocks the event loop
-  up to `busy_timeout` (5s default). Fine at low write rates.
+- **A contended SQLite write waits, but does not block.** Losing the write lock
+  costs up to `busyTimeoutMs` (5s default) before the write fails — and the
+  process stays responsive throughout, in both SDKs.
 - **Nothing is deleted for you.** Terminal tasks accumulate until you call
   `purge` — budget for a retention sweep on a long-lived database.
 - **Full trust on the store.** There is no in-database authorization — any process

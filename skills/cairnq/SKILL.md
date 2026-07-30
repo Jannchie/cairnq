@@ -143,9 +143,10 @@ Same API, same canonical SQL, one shared conformance suite — the choice is pur
 operational.
 
 - **SQLite:** one host only. WAL needs every process on one machine and a local
-  disk, never a network FS. Writes serialize, and in TS (`better-sqlite3` is
-  synchronous) a contended write blocks the event loop up to `busy_timeout` (5s).
-  Built for low-write, long-running AI jobs, not a high-throughput MQ.
+  disk, never a network FS. Writes serialize; a contended write waits up to
+  `busyTimeoutMs` (5s) before raising `SQLITE_BUSY`, but in TS that wait is an
+  awaited retry rather than a blocked event loop. Built for low-write,
+  long-running AI jobs, not a high-throughput MQ.
 - **Postgres:** multi-host, claims with `FOR UPDATE SKIP LOCKED`, and LISTEN/NOTIFY
   wakes idle workers plus `wait`/`call` the moment a task is queued or finishes
   (polling stays as the fallback). Needs the optional driver (`cairnq[postgres]` / `pg`).

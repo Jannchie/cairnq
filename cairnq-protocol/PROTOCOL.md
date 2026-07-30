@@ -102,7 +102,8 @@ A worker **leases** a task rather than popping it:
 - `claim` sets `status=running`, `worker_id`, `lease_until_ms = now + lease_ms`,
   and `attempt += 1`. It is atomic: a single `UPDATE … WHERE id IN (SELECT … LIMIT)
   RETURNING *` run inside `BEGIN IMMEDIATE` — the SQLite equivalent of
-  `FOR UPDATE SKIP LOCKED`. `busy_timeout` absorbs `SQLITE_BUSY`. Claim order is
+  `FOR UPDATE SKIP LOCKED`. `SQLITE_BUSY` is waited out rather than surfaced (each
+  SDK does that differently — see "Concurrency, limits & security"). Claim order is
   deterministic in both dialects: `priority desc, created_at_ms asc, id asc` —
   FIFO at millisecond granularity, with same-millisecond ties broken stably by
   the id (its random half decides, not submit order). `list` breaks its
@@ -285,12 +286,16 @@ CairnQ targets same-host coordination. Know the edges:
   writer. `claim` / `submit` / worker writes are short transactions, but under
   many writers they serialize. The `claimable_probe` keeps *idle* workers off the
   write lock; busy workers still contend.
-- **A contended write can block synchronously.** The TypeScript SDK uses
-  better-sqlite3 (synchronous); on `SQLITE_BUSY` it blocks the thread up to
-  `busy_timeout` (default 5s), stalling that process's event loop meanwhile. Both
-  SDKs also serialize their own operations in-process (one connection behind a
-  lock), so a transaction can't be interleaved with another operation. Both are
-  fine for low-write, long-running AI workloads; neither is a high-throughput MQ.
+- **A contended write waits up to `busyTimeoutMs` (default 5s), then raises
+  `SQLITE_BUSY`** — without stalling the caller's event loop. The two SDKs reach
+  that differently, and deliberately: aiosqlite waits on its own connection thread,
+  so Python keeps a real `busy_timeout`, while better-sqlite3 would block the only
+  thread there is, so the TypeScript SDK sets `busy_timeout = 0` past the open path
+  and retries on an awaited backoff instead. Statement execution stays synchronous
+  either way, on the order of microseconds. Both SDKs also serialize their own
+  operations in-process (one connection behind a lock), so a transaction can't be
+  interleaved with another operation. Both are fine for low-write, long-running AI
+  workloads; neither is a high-throughput MQ.
 - **Same host only (SQLite).** Do not put the database on a network filesystem and
   do not share the file across machines — WAL requires processes on one host. For
   multi-host, use the Postgres backend, which takes time from the DB clock and
