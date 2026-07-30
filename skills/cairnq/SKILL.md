@@ -1,173 +1,168 @@
 ---
 name: cairnq
 description: >-
-  Use cairnq, the SQLite-first cross-language durable task runtime. Covers the
-  worker side (register handlers, run them), the API side (submit / call / get /
-  cancel / retry by id or business key), idempotency keys, retries, cooperative
-  cancel, and the same-host / at-least-once limits. Trigger when code imports
-  `cairnq` (Python or TypeScript), defines a Worker or handler, calls
-  submit/call/getByKey, or the user mentions cairnq, tasks.db, a durable task
-  queue, or an embedded SQLite job runtime.
+  Use cairnq, the cross-language durable task runtime that coordinates through a
+  shared database (SQLite for one host, Postgres for many). Covers the worker side
+  (register handlers, run them), the API side (submit / call / get / cancel /
+  retry / stats by id or business key), idempotency keys, retries, cooperative
+  cancel, and the at-least-once limits. Trigger when code imports `cairnq` (Python
+  or TypeScript), defines a Worker or handler, calls submit/call/getByKey, or the
+  user mentions cairnq, tasks.db, a durable task queue, or an embedded SQLite job
+  runtime.
 ---
 
 # Using cairnq
 
 ## Mental model — read this first
 
-Two processes that **never call each other**. They coordinate only through one
-shared SQLite file. The API `submit`s a task; the worker `claim`s and runs it;
-result and state flow back through the database.
+Two processes that **never call each other**, coordinating only through one shared
+database: the API `submit`s a task, the worker `claim`s and runs it, result and
+state flow back through the store.
 
 ```
  API process  ─┐
-               ├──  tasks.db   (shared SQLite, WAL)
+               ├──  tasks.db  (SQLite, one host)  |  Postgres (many hosts)
  Worker       ─┘
 ```
 
-- Either side can be Python or TypeScript — the only thing that crosses the DB is
-  the **task name (a string)** and JSON payload/result.
-- Same host only, one local disk. Not a network broker, not high-throughput.
-- TS methods are camelCase (`getByKey`, `maxAttempts`), Python is snake_case
-  (`get_by_key`, `max_attempts`). Otherwise the two SDKs mirror each other.
+Either side can be Python or TypeScript — only the **task name (a string)** and
+JSON payload/result cross the store. `CairnQ.sqlite(path)` vs `.postgres(dsn)` is
+the whole difference between backends. **TS is camelCase, Python snake_case**
+(`getByKey`/`get_by_key`, `maxAttempts`/`max_attempts`); the examples below use
+Python for the worker and TS for the API, but either language works on either side.
 
-## Worker side — define and run handlers
+## Worker side
 
-A handler **always** receives `(ctx, payload)`. `payload` is the whole dict —
-destructure it yourself.
+A handler **always** receives `(ctx, payload)` — `payload` is the whole dict.
 
 ```python
 from cairnq import Worker
 
-worker = Worker.sqlite("tasks.db")          # add queues=["gpu"] to consume named queues
+worker = Worker.sqlite("tasks.db", queues=["gpu"], concurrency=4, max_run_ms=600_000)
 
-@worker.task                                # name defaults to the function name: "summarize"
+@worker.task                                # name defaults to the function name
 async def summarize(ctx, payload):
     await ctx.progress(0.2, "reading")
+    if await ctx.canceled():
+        return
     return {"summary": await llm(payload["text"])}
 
 worker.serve()                              # blocks; Ctrl-C / SIGTERM closes cleanly
 ```
 
-```ts
-import { Worker } from "cairnq";
+TS: `worker.task("summarize", async (ctx, payload) => {…})`, or `worker.task(fn)`
+→ name = `fn.name`. For a dotted/namespaced name pass it explicitly:
+`@worker.task("summary.create")`.
 
-const worker = Worker.sqlite("tasks.db", { queues: ["gpu"] });
-worker.task("summarize", async (ctx, payload) => {   // or worker.task(fn) → name = fn.name
-  await ctx.progress(0.2, "reading");
-  return { summary: await llm(payload.text) };
-});
-await worker.serve();
-```
+**Options:** `queues` (`["default"]`), `concurrency` (1, also `serve(concurrency=…)`),
+`lease_ms` (30s), `poll_interval_ms` (500ms), `retry_backoff_ms` /
+`retry_backoff_max_ms` (1s doubling to 30s), `max_run_ms`, `on_error`. `serve()`
+owns the process and its signals; `run()` / `background()` embed the worker in an
+event loop you manage.
 
-Need a dotted/namespaced name? Pass it explicitly: `@worker.task("summary.create")`.
+**`ctx`:** `payload`, `attempt`, `taskId`, `name`, `queue`, `metadata`, `rootId`,
+`correlationId`; `await ctx.progress(value, msg)` (null = leave that field alone);
+`await ctx.canceled()`; `await ctx.submit(name, payload)` for a child task
+(parent/root/correlation wired automatically). Heartbeats are automatic — call
+`ctx.heartbeat()` only if one step outlasts the lease.
 
-**`ctx` gives you:** `ctx.payload`, `ctx.attempt`, `ctx.taskId`, `ctx.metadata`,
-`ctx.rootId`, `ctx.correlationId`; `await ctx.progress(value, msg)`;
-`await ctx.canceled()` (cooperative cancel check); `await ctx.submit(name, payload)`
-(child task — parent/root/correlation wired automatically). Heartbeats are
-automatic; you don't call `ctx.heartbeat()` unless a single step runs longer than
-the lease.
+`ctx.lostLease` / `ctx.lost_lease` goes true once another worker took the task over
+after this lease expired: nothing written after that is recorded, so a handler with
+real side effects should check it and return. For cancellable I/O, TS exposes
+`ctx.signal` (`AbortSignal`), Python `ctx.lease_lost` (`asyncio.Event`).
 
-`ctx.lostLease` / `ctx.lost_lease` (plus `ctx.signal`, an `AbortSignal`, in TS and
-`ctx.lease_lost`, an `asyncio.Event`, in Python) goes true when this worker's lease
-expired and another worker took the task over. Nothing you write after that is
-recorded and the task is running elsewhere — a handler doing real side effects
-should check it and return.
-
-`progress` treats null as "leave it alone": `progress(0.5)` keeps the previous
-message, `progress(null, "msg")` keeps the previous fraction.
-
-## API side — submit and follow up
-
-```python
-from cairnq import CairnQ
-tasks = CairnQ.sqlite("tasks.db")
-
-# fire-and-forget, returns immediately:
-t = await tasks.submit("summarize", {"text": text}, key=f"summary:{doc_id}")
-
-# submit + wait for the result:
-result = await tasks.call("summarize", {"text": text}, wait_timeout_ms=10_000)
-
-# look it up later by id or business key (no status-string matching):
-t = await tasks.get_by_key(f"summary:{doc_id}")
-if t and t.succeeded:        # also .failed / .canceled / .running / .queued / .is_terminal
-    use(t.result)
-```
+## API side
 
 ```ts
 import { CairnQ, isSucceeded } from "cairnq";
-const tasks = CairnQ.sqlite("tasks.db");
+const tasks = CairnQ.sqlite("tasks.db");        // or CairnQ.postgres(dsn)
 
-const t = await tasks.submit("summarize", { text }, { key: `summary:${docId}` });
+await tasks.submit("summarize", { text }, { key: `summary:${docId}` });   // returns at once
 const result = await tasks.call("summarize", { text }, { waitTimeoutMs: 10_000 });
 
-const got = await tasks.getByKey(`summary:${docId}`);
-if (got && isSucceeded(got)) use(got.result);   // also isFailed/isCanceled/isRunning/isQueued/isTerminal
+const t = await tasks.getByKey(`summary:${docId}`);    // predicates, not status strings
+if (t && isSucceeded(t)) use(t.result);
 ```
 
-**Full surface** (by `task_id` or business `key`): `submit`, `get` / `getByKey`,
-`list`, `wait`, `call`, `cancel` / `cancelByKey`, `retry` / `retryByKey`, `purge`.
+Python exposes the same checks as properties: `t.succeeded` / `.failed` /
+`.canceled` / `.running` / `.queued` / `.is_terminal`.
 
-**`submit` options:** `key`, `queue` (default `"default"`), `conflict`
-(`"reuse"` | `"reject"` | `"replace"`, default `reuse`), `maxAttempts` (default 3),
-`priority`, `metadata`, `correlationId`, delayed start
-(`runAtDelayMs` / `run_at_delay_ms`).
+**Full surface**, each by `task_id` or business `key`: `submit`, `get` / `getByKey`,
+`list`, `wait`, `call`, `cancel` / `cancelByKey`, `retry` / `retryByKey`, `purge`,
+`stats`.
+
+- **`submit`:** `key`, `queue` (`"default"`), `conflict` (`reuse` | `reject` |
+  `replace`), `maxAttempts` (3), `priority`, `metadata`, `parentId`,
+  `correlationId`, `runAtDelayMs`.
+- **`list`:** `status`, `queue`, `name`, `rootId`, `correlationId`, `limit` (100),
+  `offset`.
+- **`retry(id, {resetAttempt: true})`** restarts from attempt 0 rather than
+  spending the remaining `maxAttempts` budget.
+- **`stats()`** → zero-filled counts per queue per status;
+  `stats()["default"]["queued"]` is a backlog without listing rows.
 
 ## The non-obvious rules — where people go wrong
 
 - **At-least-once, not exactly-once.** A worker can finish a side effect and crash
-  before recording success; after the lease expires the task is redelivered. Make
-  side effects idempotent, keyed on `ctx.taskId` or the business `key`.
+  before recording success; the task is redelivered once the lease expires. Key
+  side effects on `ctx.taskId` or the business `key`.
 - **`conflict: "reuse"` is *idempotent submit*, not "re-run if it failed".** It
-  returns the task already under that key — *whatever its state*, including a
-  terminal `failed`/`canceled` one. To force a fresh run use `replace` (new task,
-  repoints the key) or `retry` (re-enqueue the same task).
-- **Failing a task — choose retryable or not.** Raise/throw `TaskError(msg)` →
-  fails **permanently** (default `retryable=False`, so deterministic errors fail
-  fast). `TaskError(msg, retryable=True)` → retried with backoff up to
-  `max_attempts`. **Any other** exception → treated as retryable.
-- **A worker only claims what it has a handler for.** Queues do not have to
-  partition work by task name: two workers with different handler sets (say a
-  Python one and a TypeScript one) can share `default` and each takes only its
-  own. A worker with no handlers registered claims nothing.
-- **Progress belongs to the attempt.** Anything that puts a task back in `queued`
-  — a retryable failure, `retry`, a worker crash — clears `progress`/`message`. A
-  terminal task keeps them, so a failed task still shows how far it got.
-- **Cooperative cancel.** Cancelling a *queued* task is immediate. Cancelling a
-  *running* one only sets a flag — the handler must `if await ctx.canceled(): return`.
-  On return the task finalizes as `canceled` and **the result is discarded** (cancel
-  wins). Cancel wins over *every* outcome: if the attempt instead throws, or the
-  worker dies and the lease expires, the task still ends `canceled` — never
-  redelivered.
-- **Nothing is deleted for you.** Terminal tasks stay forever until you call
-  `purge(olderThanMs=…)` / `purge(older_than_ms=…)`. Schedule it, or the database
-  grows without bound.
-- **Worker errors are silent unless you ask.** Pass `onError` / `on_error` to the
-  Worker to see what the run loop survived (a claim that threw, a store write that
-  failed while finalizing). Task *failures* go to the DB; these do not.
-- **Same host, one writer — on SQLite.** WAL needs all processes on one machine and
-  a local disk — never a network FS. Writes serialize; in TS (`better-sqlite3` is
+  returns whatever task is under that key, *including a terminal `failed`/`canceled`
+  one*. To force a fresh run: `replace` (new task, repoints the key) or `retry`
+  (re-enqueue the same task).
+- **Failing a task — pick retryable or not.** `TaskError(msg)` fails
+  **permanently** (`retryable=False` by default, so deterministic bugs fail fast);
+  `TaskError(msg, retryable=True)` retries with backoff up to `max_attempts`. Any
+  **other** exception is treated as retryable.
+- **A worker only claims what it has a handler for.** Queues need not partition
+  work by name — a Python and a TypeScript worker can share `default`, each taking
+  only its own tasks. A worker with no handlers claims nothing.
+- **Cooperative cancel.** Cancelling a *queued* task is immediate; cancelling a
+  *running* one only sets a flag, so the handler must check `ctx.canceled()` and
+  return. Cancel then beats every other outcome — the result is discarded, a
+  throwing attempt or expired lease still ends `canceled`, never redelivered.
+- **A hung handler needs `max_run_ms`.** Heartbeats renew the lease for as long as
+  a handler runs, so without a ceiling a wedged one holds its task `running` and
+  its concurrency slot forever (cancel can't help — cooperative checks need a live
+  handler). At the ceiling the attempt is abandoned and recorded as a retryable
+  `handler_timeout`, so backoff and `max_attempts` still apply.
+- **Progress belongs to the attempt.** Anything returning a task to `queued` — a
+  retryable failure, `retry`, a crash — clears `progress`/`message`. Terminal tasks
+  keep them, so a failed task still shows how far it got.
+- **Nothing is deleted for you.** Terminal tasks stay until `purge(olderThanMs=…)`,
+  which is bounded by `limit` (1000) per call — loop until it returns fewer than
+  `limit`, on a schedule, or the database grows without bound.
+- **Worker errors are silent unless you ask.** `on_error` / `onError` reports what
+  the run loop survived (a claim that threw, a store write that failed while
+  finalizing). Task *failures* go to the DB; these do not.
+- **No in-DB auth.** Any process that can open the store has full access.
+
+## SQLite vs Postgres
+
+Same API, same canonical SQL, one shared conformance suite — the choice is purely
+operational.
+
+- **SQLite:** one host only. WAL needs every process on one machine and a local
+  disk, never a network FS. Writes serialize, and in TS (`better-sqlite3` is
   synchronous) a contended write blocks the event loop up to `busy_timeout` (5s).
-  Built for low-write, long-running AI jobs, not a high-throughput MQ. For
-  multi-host, use `CairnQ.postgres(dsn)` / `Worker.postgres(dsn)` — same API.
-- **No in-DB auth.** Any process that can open the file has full access — protect
-  it with OS permissions.
+  Built for low-write, long-running AI jobs, not a high-throughput MQ.
+- **Postgres:** multi-host, claims with `FOR UPDATE SKIP LOCKED`, and LISTEN/NOTIFY
+  wakes idle workers plus `wait`/`call` the moment a task is queued or finishes
+  (polling stays as the fallback). Needs the optional driver (`cairnq[postgres]` / `pg`).
+- **Portability:** Postgres `jsonb` rejects NUL (`\u0000`) inside strings, SQLite
+  accepts it — keep NUL out of payloads meant to run on both.
 
-## Errors when waiting (`call` / `wait`)
+## Waiting (`call` / `wait`)
 
-`call` returns the result on success, otherwise raises/throws:
+`call` returns the result on success, otherwise raises/throws `TaskFailed` (read
+`.code` / `.message` / `.retryable` / `.details`; raw envelope on `.error`),
+`TaskCanceled`, or `TaskTimeout` — on which **the task keeps running**, so follow
+up via `.taskId` / `.task_id`.
 
-- `TaskFailed` — the task ended in `failed`. Read `.code` / `.message` /
-  `.retryable` / `.details` directly (raw envelope on `.error`).
-- `TaskTimeout` — didn't finish in time. **The task keeps running**; `.task_id` /
-  `.taskId` lets you follow up.
-- `TaskCanceled` — ended in `canceled`.
+## Typed tasks (optional, worth it as task types grow)
 
-## Typed tasks (optional, recommended as task types grow)
-
-Define a name **once**, share the symbol on both ends — no `"summarize"` vs
-`"sumarize"` drift, the editor finds every caller, and in TS payload + result are
+Define a name **once** and share the symbol on both ends — no `"summarize"` vs
+`"sumarize"` drift, the editor finds every caller, and in TS payload and result are
 fully typed:
 
 ```ts
@@ -177,19 +172,12 @@ worker.task(summarize, async (ctx, p) => ({ summary: await llm(p.text) }));
 const { summary } = await tasks.call(summarize, { text });   // typed, no cast
 ```
 
-```python
-from cairnq import TaskDef
-summarize = TaskDef[dict, dict]("summarize")
-@worker.task(summarize)
-async def handle(ctx, payload): ...
-result = await tasks.call(summarize, {"text": text})
-```
-
-Purely opt-in — every API still takes a plain name string, which is what a
-cross-language caller uses (only the name crosses the DB).
+Python: `TaskDef[dict, dict]("summarize")`, passed the same way to `@worker.task(…)`
+and `call(…)`. Opt-in — every API still takes a plain name string, which is what a
+cross-language caller uses.
 
 ## Reference
 
-Protocol contract and canonical SQL: `cairnq-protocol/PROTOCOL.md`. The Python
-(`cairnq-py`) and TS (`cairnq-node`) SDKs load the same SQL and pass one shared
-conformance suite, so behaviour matches across languages.
+`cairnq-protocol/PROTOCOL.md` holds the contract and canonical SQL. Both SDKs load
+that same SQL and pass one conformance suite against both dialects, so behaviour
+matches across languages and backends.

@@ -1,21 +1,22 @@
 # CairnQ
 
-**A SQLite-first, cross-language, storage-centered durable task runtime.**
+**A SQLite-first, cross-language, storage-centered durable task runtime — and the
+same code on Postgres once you outgrow one host.**
 
 Your API process and your worker process never call each other. They coordinate
-through a shared SQLite file: the API `submit`s tasks, the worker `claim`s and
-runs them, results and state flow back through the database. Python and
-TypeScript SDKs are interchangeable on either side.
+through a shared database: the API `submit`s tasks, the worker `claim`s and runs
+them, results and state flow back through the store. Python and TypeScript SDKs
+are interchangeable on either side.
 
 ```
  API process  ─┐
-               ├──  tasks.db   (shared SQLite, WAL)
+               ├──  tasks.db  (SQLite, one host)  |  Postgres (many hosts)
  Worker       ─┘
 ```
 
 Built for embedded / local-first AI work: desktop apps, single-host deployments,
 edge nodes, small internal services — an API server handing long jobs to AI
-workers on the same machine. No broker, no server, no HTTP.
+workers on the same machine. No broker, no HTTP — and on SQLite, no server at all.
 
 ## Quick start
 
@@ -147,30 +148,44 @@ idempotent using `task_id` or `key`.
 its state*, including a terminal `failed`/`canceled` one. To force a new run use
 `replace` (new task, repoints the key) or `retry` (re-enqueue the same task).
 
+## Storage: SQLite or Postgres
+
+Both backends load the same canonical SQL and pass the same conformance suite, and
+everything above the storage seam is identical — the choice is operational, and
+switching is one constructor call:
+
+```python
+tasks  = CairnQ.sqlite("tasks.db")      # or CairnQ.postgres(dsn)
+worker = Worker.sqlite("tasks.db")      # or Worker.postgres(dsn)
+```
+
+- **SQLite** — zero setup: the database *is* the runtime. One file, no server, no
+  broker, nothing to operate. One host only (see limits below).
+- **Postgres** — many hosts, claiming with `FOR UPDATE SKIP LOCKED`, no
+  single-writer bottleneck. LISTEN/NOTIFY additionally wakes idle workers and
+  `wait`/`call` the moment a task is queued or finishes — millisecond pickup
+  instead of the poll interval, with polling kept as the fallback (a lost
+  notification costs one poll, never a task). Needs the optional driver:
+  `cairnq[postgres]` / `pg`.
+
+One caveat if you target both: Postgres `jsonb` rejects `\u0000` inside strings and
+SQLite accepts it, so keep NUL characters out of payloads that need portability.
+
 ## Concurrency, limits & when *not* to use it
 
-- **Same host only, on SQLite.** WAL needs all processes on one machine and a local
-  disk — don't put the file on a network filesystem or share it across hosts. For
-  multi-host, switch the same code to Postgres: `CairnQ.postgres(dsn)` /
-  `Worker.postgres(dsn)`. Everything above the storage seam is identical, and both
-  backends run the same conformance suite. On Postgres, LISTEN/NOTIFY additionally
-  wakes idle workers and `wait`/`call` the moment a task is queued or finishes —
-  millisecond pickup instead of the poll interval, with polling kept as the
-  fallback (a lost notification costs one poll, never a task). One payload caveat
-  when targeting both backends: Postgres `jsonb` rejects `\u0000` inside strings,
-  SQLite accepts it — avoid NUL characters in payloads that need portability.
-- **One writer at a time (SQLite).** `claim` / `submit` / worker writes are short,
+- **SQLite is same-host only.** WAL needs all processes on one machine and a local
+  disk — don't put the file on a network filesystem or share it across hosts.
+- **One SQLite writer at a time.** `claim` / `submit` / worker writes are short,
   but heavy write concurrency serializes. Idle workers stay off the write lock (a
   read-only probe gates each poll); busy ones still contend. This is built for
   low-write, long-running AI work — not as a high-throughput message queue.
-  Postgres has no such limit: it claims with `FOR UPDATE SKIP LOCKED`.
-- **A contended write can block the process.** The TypeScript SDK
+- **A contended SQLite write can block the process.** The TypeScript SDK
   (`better-sqlite3`) is synchronous: on lock contention it blocks the event loop
   up to `busy_timeout` (5s default). Fine at low write rates.
 - **Nothing is deleted for you.** Terminal tasks accumulate until you call
   `purge` — budget for a retention sweep on a long-lived database.
-- **Full trust on the file.** There is no in-database authorization — any process
-  that can open the file has full access. Protect it with OS permissions.
+- **Full trust on the store.** There is no in-database authorization — any process
+  that can open it has full access. Protect the file with OS permissions.
 
 ## Layout
 
