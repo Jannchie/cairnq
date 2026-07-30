@@ -319,18 +319,20 @@ CairnQ targets same-host coordination. Know the edges:
   — and a worker that started against an empty database would otherwise plan as if
   it were still empty for the days its connection lives. A never-analyzed table gets
   an explicit `ANALYZE cairnq_tasks`; after that it is `PRAGMA optimize`, which
-  decides for itself whether an ANALYZE is warranted (roughly a 24x growth), so the
-  interval buys no-ops rather than work. Prepared statements pick up the new plans on
-  their own: ANALYZE bumps the schema cookie and SQLite re-prepares them.
+  decides for itself whether an ANALYZE is warranted — a 10x change in either
+  direction, on SQLite 3.46+ — so the interval buys no-ops rather than work. Prepared
+  statements pick up the new plans on their own: ANALYZE bumps the schema cookie and
+  SQLite re-prepares them.
   - The explicit bootstrap is **not** redundant. Before SQLite **3.46** `PRAGMA
     optimize` skips a table with no `sqlite_stat1` entry entirely, whatever mask it
     is given, so it can never produce the first statistics. That is the SQLite most
     distro Pythons link (Ubuntu 24.04 ships 3.45.1), while better-sqlite3 bundles a
     newer one — so without the bootstrap the index would be live in TypeScript and
     dead in Python, by accident of packaging rather than by design.
-  - Not covered: shrinkage. After a large purge the statistics keep the old row
-    counts until the table grows into them again, which overestimates and so errs
-    toward using an index.
+  - 3.46 also made the reanalysis test two-sided. Older builds reanalyze on growth
+    only, and only past roughly 24x, so there a large purge leaves the statistics
+    overestimating until the table grows back into them — which at least errs toward
+    using an index.
 - **Watching several queues costs a sort per claim.** Only the single-queue claim
   reads the index in claim order (see the lease model above), so a worker with two
   or more queues pays a sort proportional to the queued backlog on every claim, and

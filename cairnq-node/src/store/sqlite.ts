@@ -28,7 +28,7 @@ const BUSY_RETRY_MAX_DELAY_MS = 50;
  * Bounds how long the planner can work from a stale table shape; a minute is
  * arbitrary but small next to the days a worker holds its connection. It does not
  * set how often an ANALYZE actually runs — SQLite decides that itself, and only
- * when a table has outgrown its statistics by roughly 24x, so a shorter interval
+ * once the table has diverged from its statistics by 10x, so a shorter interval
  * costs more no-ops (a few microseconds each) rather than more analyzing.
  */
 const STATS_REFRESH_INTERVAL_MS = 60_000;
