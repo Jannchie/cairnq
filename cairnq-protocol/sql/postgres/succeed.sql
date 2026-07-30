@@ -7,6 +7,10 @@ set
     result = :result::jsonb,
     progress = 1.0,
     message = coalesce(:message, message),
+    -- A lease describes an attempt in flight; this one just ended. worker_id is
+    -- what carries the audit trail (who ran it), so nothing is lost by clearing
+    -- it, and the terminal-lease invariant holds — see PROTOCOL.md §Lease model.
+    lease_until_ms = null,
     completed_at_ms = (extract(epoch from now()) * 1000)::bigint,
     updated_at_ms = (extract(epoch from now()) * 1000)::bigint
 where id = :id

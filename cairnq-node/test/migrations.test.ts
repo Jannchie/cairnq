@@ -52,7 +52,7 @@ describe("migrations", () => {
     const names = indexNames(path);
     expect(names.has("cairnq_tasks_completed_idx")).toBe(true);
     expect(names.has("cairnq_tasks_lease_idx")).toBe(true);
-    expect(meta(path, "schema_version")).toBe("4");
+    expect(meta(path, "schema_version")).toBe("5");
   });
 
   it("upgrades a database left at an older migration", async () => {
@@ -78,7 +78,7 @@ describe("migrations", () => {
     try {
       expect(indexNames(path).has("cairnq_tasks_completed_idx")).toBe(true);
       expect(indexNames(path).has("cairnq_tasks_lease_idx")).toBe(true);
-      expect(meta(path, "schema_version")).toBe("4");
+      expect(meta(path, "schema_version")).toBe("5");
       const task = await client.submit("job", { v: 1 });
       expect((await client.get(task.id))?.payload).toEqual({ v: 1 });
     } finally {
@@ -119,16 +119,18 @@ describe("migrations", () => {
     await client.connect();
     await client.close();
 
-    // Terminal rows keep a stale lease_until_ms (complete.sql does not clear it),
-    // which is exactly why the index has to be partial on status.
+    // The shape the index is designed for, and the reason it beats a plain scan of
+    // 'running': a large drift of terminal rows (lease null — see PROTOCOL.md
+    // §Lease model) over a handful of live leases bounded by worker concurrency.
     const seed = new Database(path);
     const ins = seed.prepare(
       "insert into cairnq_tasks (id,name,queue,status,payload,run_at_ms," +
         "lease_until_ms,created_at_ms,updated_at_ms,completed_at_ms) " +
-        "values (?,'job','default','succeeded','{}',?,?,?,?,?)",
+        "values (?,'job','default',?,'{}',?,?,?,?,?)",
     );
     seed.transaction(() => {
-      for (let i = 0; i < 2_000; i++) ins.run(`seed_${i}`, i, i + 500, i, i, i);
+      for (let i = 0; i < 2_000; i++) ins.run(`seed_${i}`, "succeeded", i, null, i, i, i);
+      for (let i = 0; i < 8; i++) ins.run(`live_${i}`, "running", i, 2 ** 42 + i, i, i, null);
     })();
     seed.close();
 
@@ -149,6 +151,45 @@ describe("migrations", () => {
       expect(plan.map((r) => r.detail).join("\n")).toContain("cairnq_tasks_lease_idx");
     } finally {
       db.close();
+    }
+  });
+
+  // 0005 backfills rows the old succeed/complete wrote, so unlike the other
+  // migrations it is not observable on an empty table — and a backfill that silently
+  // matches nothing looks exactly like one that worked.
+  it("clears the lease left on terminal rows by an older SDK", async () => {
+    const path = freshDbPath();
+    const db = new Database(path);
+    db.exec(
+      "create table if not exists cairnq_migrations " +
+        "(name text primary key, applied_at_ms integer not null)",
+    );
+    const record = db.prepare(
+      "insert into cairnq_migrations (name, applied_at_ms) values (?, ?)",
+    );
+    // Everything before the backfill, by name rather than by position: a later
+    // migration must not turn this into a test that applies 0005 itself.
+    for (const { name, sql } of loadMigrations("sqlite")) {
+      if (name.startsWith("0005_")) break;
+      db.exec(sql);
+      record.run(name, nowMs());
+    }
+    db.prepare(
+      "insert into cairnq_tasks (id,name,queue,status,payload,run_at_ms," +
+        "worker_id,lease_until_ms,created_at_ms,updated_at_ms,completed_at_ms) " +
+        "values ('stale','job','default','succeeded','{}',1,'w1',?,1,1,1)",
+    ).run(2 ** 42);
+    db.close();
+
+    const client = CairnQ.sqlite(path);
+    await client.connect();
+    try {
+      const task = await client.get("stale");
+      expect(task?.lease_until_ms).toBeNull();
+      // The audit trail is what survives instead — see PROTOCOL.md §Lease model.
+      expect(task?.worker_id).toBe("w1");
+    } finally {
+      await client.close();
     }
   });
 

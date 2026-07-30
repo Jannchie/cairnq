@@ -8,6 +8,9 @@ set
     status = case when cancel_requested_at_ms is not null then 'canceled' else 'succeeded' end,
     result = case when cancel_requested_at_ms is not null then result else :result::jsonb end,
     progress = case when cancel_requested_at_ms is not null then progress else 1.0 end,
+    -- Terminal on both branches, so unconditional: a lease describes an attempt in
+    -- flight and this one just ended (see succeed.sql).
+    lease_until_ms = null,
     completed_at_ms = (extract(epoch from now()) * 1000)::bigint,
     updated_at_ms = (extract(epoch from now()) * 1000)::bigint
 where id = :id

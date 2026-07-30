@@ -23,8 +23,10 @@ set
     error = :error,
     worker_id = case when cancel_requested_at_ms is null and :retryable = 1 and attempt < max_attempts
                      then null else worker_id end,
-    lease_until_ms = case when cancel_requested_at_ms is null and :retryable = 1 and attempt < max_attempts
-                          then null else lease_until_ms end,
+    -- Unconditional, unlike worker_id above: all three branches end the attempt
+    -- that held the lease — two terminally, one to wait for redelivery — and none
+    -- of them leaves anyone owning it (see succeed.sql).
+    lease_until_ms = null,
     run_at_ms = case when cancel_requested_at_ms is null and :retryable = 1 and attempt < max_attempts
                      then :now_ms + :delay_ms else run_at_ms end,
     completed_at_ms = case when cancel_requested_at_ms is null and :retryable = 1 and attempt < max_attempts

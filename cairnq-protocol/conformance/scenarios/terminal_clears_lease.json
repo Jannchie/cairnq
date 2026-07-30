@@ -1,0 +1,35 @@
+{
+  "name": "terminal_clears_lease",
+  "description": "A lease says who is running a task right now, so `lease_until_ms is not null` if and only if `status = 'running'`. Every exit from 'running' clears it — succeed, complete either way cancel resolves, all three fail branches, and lease recovery. Otherwise a succeeded task reports a lease into the future that nobody holds, and the two ways out of 'running' disagree on what a terminal row looks like.",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "ts" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "succeed", "args": { "id": "$ts.id", "worker_id": "w1", "result": { "ok": true } }, "expect": { "equals": { "status": "succeeded" }, "isNull": ["lease_until_ms"] } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "tc" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w2", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "complete", "args": { "id": "$tc.id", "worker_id": "w2", "result": { "ok": true } }, "expect": { "equals": { "status": "succeeded" }, "isNull": ["lease_until_ms"] } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {} }, "save": "tk" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w3", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "cancel", "args": { "id": "$tk.id" }, "expect": { "equals": { "status": "running" } } },
+    { "op": "complete", "args": { "id": "$tk.id", "worker_id": "w3", "result": { "ok": true } }, "expect": { "equals": { "status": "canceled" }, "isNull": ["lease_until_ms"] } },
+
+    { "op": "retry", "args": { "id": "$tk.id" }, "expect": { "equals": { "status": "queued" } } },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w4", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "cancel", "args": { "id": "$tk.id" }, "expect": { "equals": { "status": "running" } } },
+    { "op": "fail", "args": { "id": "$tk.id", "worker_id": "w4", "error": { "type": "E", "code": "e", "message": "boom", "retryable": true }, "retryable": true, "delay_ms": 0 }, "expect": { "equals": { "status": "canceled" }, "isNull": ["lease_until_ms"] } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "max_attempts": 2 }, "save": "tf" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w5", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$tf.id", "worker_id": "w5", "error": { "type": "E", "code": "e", "message": "boom", "retryable": true }, "retryable": true, "delay_ms": 0 }, "expect": { "equals": { "status": "queued" }, "isNull": ["lease_until_ms"] } },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w6", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$tf.id", "worker_id": "w6", "error": { "type": "E", "code": "e", "message": "boom", "retryable": true }, "retryable": true, "delay_ms": 0 }, "expect": { "equals": { "status": "failed" }, "isNull": ["lease_until_ms"] } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "max_attempts": 1 }, "save": "tr" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w7", "lease_ms": 150 }, "expect": { "length": 1 } },
+    { "op": "sleep", "args": { "ms": 300 } },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w8", "lease_ms": 5000 }, "expect": { "length": 0 } },
+    { "op": "get", "args": { "id": "$tr.id" }, "expect": { "equals": { "status": "failed" }, "isNull": ["lease_until_ms"] } }
+  ]
+}

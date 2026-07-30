@@ -130,6 +130,13 @@ A worker **leases** a task rather than popping it:
   `status='running' AND worker_id=:worker_id AND lease_until_ms > :now_ms`.
   Zero rows updated ⇒ the lease was lost (expired and reclaimed by another
   worker) ⇒ the SDK raises `LostLease`.
+- **`lease_until_ms is not null` if and only if `status = 'running'`.** A lease
+  names who is running a task right now, so every exit from `running` clears it —
+  `succeed`, `complete` whichever way cancel resolves, all three `fail` branches,
+  and `recover_leases` — as does `retry`. `worker_id` is what survives instead: a
+  terminal row still records who ran it. The invariant is what lets
+  `cairnq_tasks_lease_idx` be partial on both terms, and it is also the reading a
+  caller gets from `get`, where a stale lease on a finished task is simply wrong.
 - **A lost lease is a signal, not a stop.** Nothing can forcibly interrupt a
   running handler, so the SDK stops *recording* (further writes are rejected, the
   worker discards the outcome) and exposes the loss on the context —
