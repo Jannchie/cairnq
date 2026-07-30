@@ -23,7 +23,7 @@ const BUSY_RETRY_BASE_MS = 1;
 const BUSY_RETRY_MAX_DELAY_MS = 50;
 
 /**
- * How often a live connection re-offers its statistics to `PRAGMA optimize`.
+ * How often a live connection revisits its planner statistics.
  *
  * Bounds how long the planner can work from a stale table shape; a minute is
  * arbitrary but small next to the days a worker holds its connection. It does not
@@ -31,7 +31,7 @@ const BUSY_RETRY_MAX_DELAY_MS = 50;
  * when a table has outgrown its statistics by roughly 24x, so a shorter interval
  * costs more no-ops (a few microseconds each) rather than more analyzing.
  */
-const OPTIMIZE_INTERVAL_MS = 60_000;
+const STATS_REFRESH_INTERVAL_MS = 60_000;
 
 /** Sleep without yielding — the whole open path is synchronous already. */
 function sleepSync(ms: number): void {
@@ -59,6 +59,49 @@ function isBusy(err: unknown): boolean {
 /** Whether this path names an in-memory database rather than a file. */
 function isMemory(path: string): boolean {
   return path === ":memory:" || path.includes("mode=memory");
+}
+
+/**
+ * Whether cairnq_tasks has been analyzed at all.
+ *
+ * Two steps because sqlite_stat1 does not exist until something runs ANALYZE, and
+ * querying a missing table is an error rather than an empty result.
+ */
+function hasStatistics(db: DB): boolean {
+  const table = db
+    .prepare("select 1 from sqlite_master where type = 'table' and name = 'sqlite_stat1'")
+    .get();
+  if (!table) return false;
+  return Boolean(
+    db.prepare("select 1 from sqlite_stat1 where tbl = 'cairnq_tasks'").get(),
+  );
+}
+
+/**
+ * Bring cairnq_tasks' statistics up to date, cheaply enough to call on a timer.
+ *
+ * Without them the planner misreads `status = 'running'` as a large fraction of the
+ * table and passes over the partial cairnq_tasks_lease_idx that lease recovery is
+ * indexed for.
+ *
+ * The explicit bootstrap is not redundant with `PRAGMA optimize`. Before SQLite
+ * 3.46 the pragma skips a table that has no sqlite_stat1 entry entirely — no mask
+ * changes that, verified on 3.45.1 — so on those builds it can never produce the
+ * *first* statistics, and the index stays unused for the life of the database.
+ * Distro Pythons link exactly those builds (Ubuntu 24.04 ships 3.45.1), while
+ * better-sqlite3 bundles its own newer one, so this is also what keeps the two SDKs
+ * behaving alike rather than by luck of packaging.
+ *
+ * Once an entry exists, every version's pragma applies its own growth heuristic,
+ * which is the part worth deferring to: it is a few microseconds when there is
+ * nothing to do, where a bare ANALYZE would rescan the table every time.
+ */
+function refreshStatistics(db: DB): void {
+  if (hasStatistics(db)) db.pragma("optimize");
+  // Scoped to the one table whose shape the planner gets wrong; the key and meta
+  // tables are read by primary key, where statistics change nothing. A database
+  // this one shares with the caller's own tables is left alone.
+  else db.exec("ANALYZE cairnq_tasks");
 }
 
 /**
@@ -144,8 +187,8 @@ export class SQLiteStore extends TaskStore {
   private readonly lockKey: string;
   /** How long a single operation may keep retrying a lost write lock. */
   private readonly busyBudgetMs: number;
-  /** When this connection may next offer its statistics to `PRAGMA optimize`. */
-  private nextOptimizeAt = 0;
+  /** When this connection may next revisit its planner statistics. */
+  private nextStatsRefreshAt = 0;
 
   constructor(
     private readonly path: string,
@@ -191,21 +234,17 @@ export class SQLiteStore extends TaskStore {
     this.applyMigrations(db);
     // Everything past here either awaits its retry or is optional, so stop blocking.
     db.pragma("busy_timeout = 0");
-    // Give the query planner statistics: without sqlite_stat1 it misreads
-    // `status = 'running'` as a large fraction of the table and passes over the
-    // partial cairnq_tasks_lease_idx that lease recovery is indexed for. PRAGMA
-    // optimize decides for itself whether an ANALYZE is worth running — a no-op on
-    // a fresh or little-changed database — and is repeated on a timer from then on
-    // (see maybeOptimize).
+    // Give the query planner statistics (see refreshStatistics), repeated on a timer
+    // from here on (see maybeRefreshStatistics).
     try {
-      db.pragma("optimize");
+      refreshStatistics(db);
     } catch (err) {
       // Statistics are an optimization, never correctness, so losing them to a
       // concurrent writer must not fail the open — the next one gets another
       // chance. Anything else is a real fault and belongs to the caller.
       if (!isBusy(err)) throw err;
     }
-    this.nextOptimizeAt = Date.now() + OPTIMIZE_INTERVAL_MS;
+    this.nextStatsRefreshAt = Date.now() + STATS_REFRESH_INTERVAL_MS;
     for (const [name, sql] of Object.entries(this.statements)) {
       this.stmts[name] = db.prepare(sql);
     }
@@ -356,8 +395,8 @@ export class SQLiteStore extends TaskStore {
   }
 
   /**
-   * Re-offer this connection's statistics to `PRAGMA optimize`, at most once per
-   * OPTIMIZE_INTERVAL_MS.
+   * Revisit this connection's planner statistics, at most once per
+   * STATS_REFRESH_INTERVAL_MS.
    *
    * A connection lives for days, and the statements were prepared against whatever
    * the table looked like when it opened — a worker started against an empty
@@ -370,14 +409,14 @@ export class SQLiteStore extends TaskStore {
    * the write lock to another process should cost nothing — skip and let the next
    * interval try, instead of spending an operation's whole retry budget on them.
    */
-  private async maybeOptimize(db: DB): Promise<void> {
+  private async maybeRefreshStatistics(db: DB): Promise<void> {
     const now = Date.now();
-    if (now < this.nextOptimizeAt) return;
+    if (now < this.nextStatsRefreshAt) return;
     // Claim the slot before running, not after: otherwise a burst of concurrent
     // operations all see it due and queue an ANALYZE apiece.
-    this.nextOptimizeAt = now + OPTIMIZE_INTERVAL_MS;
+    this.nextStatsRefreshAt = now + STATS_REFRESH_INTERVAL_MS;
     try {
-      await this.enqueue(() => db.pragma("optimize"));
+      await this.enqueue(() => refreshStatistics(db));
     } catch (err) {
       if (!isBusy(err)) throw err;
     }
@@ -385,13 +424,13 @@ export class SQLiteStore extends TaskStore {
 
   protected async fetch(name: string, params: Params): Promise<any[]> {
     const db = this.ensure();
-    await this.maybeOptimize(db);
+    await this.maybeRefreshStatistics(db);
     return this.withLock(() => this.runNow(name, params));
   }
 
   protected async tx<T>(fn: (fetch: Fetch) => Promise<T>): Promise<T> {
     const db = this.ensure();
-    await this.maybeOptimize(db);
+    await this.maybeRefreshStatistics(db);
     // BEGIN IMMEDIATE by hand rather than db.transaction(): the callback is async
     // (the seam is shared with Postgres), and better-sqlite3's wrapper only takes
     // a synchronous one. The lock above makes the manual version safe.

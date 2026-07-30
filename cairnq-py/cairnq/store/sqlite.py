@@ -57,14 +57,60 @@ def _split_script(script: str) -> list[str]:
 _WAL_RETRY_DELAY_S = 0.05
 _WAL_RETRY_BUDGET_S = 5.0
 
-# How often a live connection re-offers its statistics to `PRAGMA optimize`.
+# How often a live connection revisits its planner statistics.
 #
 # Bounds how long the planner can work from a stale table shape; a minute is
 # arbitrary but small next to the days a worker holds its connection. It does not
 # set how often an ANALYZE actually runs — SQLite decides that itself, and only when
 # a table has outgrown its statistics by roughly 24x, so a shorter interval costs
 # more no-ops (a few microseconds each) rather than more analyzing.
-_OPTIMIZE_INTERVAL_S = 60.0
+_STATS_REFRESH_INTERVAL_S = 60.0
+
+
+async def _has_statistics(conn: aiosqlite.Connection) -> bool:
+    """Whether cairnq_tasks has been analyzed at all.
+
+    Two steps because sqlite_stat1 does not exist until something runs ANALYZE, and
+    querying a missing table is an error rather than an empty result."""
+    cur = await conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = 'sqlite_stat1'"
+    )
+    table = await cur.fetchone()
+    await cur.close()
+    if table is None:
+        return False
+    cur = await conn.execute("select 1 from sqlite_stat1 where tbl = 'cairnq_tasks'")
+    row = await cur.fetchone()
+    await cur.close()
+    return row is not None
+
+
+async def _refresh_statistics(conn: aiosqlite.Connection) -> None:
+    """Bring cairnq_tasks' statistics up to date, cheaply enough to call on a timer.
+
+    Without them the planner misreads `status = 'running'` as a large fraction of the
+    table and passes over the partial cairnq_tasks_lease_idx that lease recovery is
+    indexed for.
+
+    The explicit bootstrap is not redundant with `PRAGMA optimize`. Before SQLite
+    3.46 the pragma skips a table that has no sqlite_stat1 entry entirely — no mask
+    changes that, verified on 3.45.1 — so on those builds it can never produce the
+    *first* statistics, and the index stays unused for the life of the database. This
+    SDK links whatever SQLite the interpreter was built against, and distro Pythons
+    ship exactly those builds (Ubuntu 24.04: 3.45.1), so without the bootstrap the
+    partial index would be dead for most Python deployments while working in
+    TypeScript, which bundles a newer SQLite.
+
+    Once an entry exists, every version's pragma applies its own growth heuristic,
+    which is the part worth deferring to: it is a few microseconds when there is
+    nothing to do, where a bare ANALYZE would rescan the table every time."""
+    if await _has_statistics(conn):
+        await conn.execute("pragma optimize")
+    else:
+        # Scoped to the one table whose shape the planner gets wrong; the key and
+        # meta tables are read by primary key, where statistics change nothing. A
+        # database this one shares with the caller's own tables is left alone.
+        await conn.execute("ANALYZE cairnq_tasks")
 
 
 def _is_memory(path: str) -> bool:
@@ -114,9 +160,9 @@ class SQLiteStore(TaskStore):
         self._sql = load_statements("sqlite")
         self._lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
-        # When this connection may next offer its statistics to `PRAGMA optimize`.
-        # Set on connect, which is also where the first one runs.
-        self._next_optimize_at = 0.0
+        # When this connection may next revisit its planner statistics. Set on
+        # connect, which is also where the first refresh runs.
+        self._next_stats_refresh_at = 0.0
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
@@ -143,18 +189,17 @@ class SQLiteStore(TaskStore):
             # Give the query planner statistics: without sqlite_stat1 it misreads
             # `status = 'running'` as a large fraction of the table and passes over
             # the partial cairnq_tasks_lease_idx that lease recovery is indexed for.
-            # PRAGMA optimize decides for itself whether an ANALYZE is worth running
-            # — a no-op on a fresh or little-changed database — and is repeated on a
-            # timer from then on (see _maybe_optimize).
+            # See _refresh_statistics; repeated on a timer from here on (see
+            # _maybe_refresh_statistics).
             try:
-                await conn.execute("pragma optimize")
+                await _refresh_statistics(conn)
             except sqlite3.OperationalError:
                 # Statistics are an optimization, never correctness, so losing them
                 # to a concurrent writer must not fail the connect — the next one
                 # gets another chance.
                 pass
-            self._next_optimize_at = (
-                asyncio.get_running_loop().time() + _OPTIMIZE_INTERVAL_S
+            self._next_stats_refresh_at = (
+                asyncio.get_running_loop().time() + _STATS_REFRESH_INTERVAL_S
             )
             self._conn = conn
             check_protocol_version(await self.protocol_version())
@@ -251,9 +296,9 @@ class SQLiteStore(TaskStore):
         await cur.close()
         return rows
 
-    async def _maybe_optimize(self) -> None:
-        """Re-offer this connection's statistics to `PRAGMA optimize`, at most once
-        per _OPTIMIZE_INTERVAL_S.
+    async def _maybe_refresh_statistics(self) -> None:
+        """Revisit this connection's planner statistics, at most once per
+        _STATS_REFRESH_INTERVAL_S.
 
         A connection lives for days, and its statements were prepared against
         whatever the table looked like when it opened — a worker started against an
@@ -264,20 +309,20 @@ class SQLiteStore(TaskStore):
 
         Must be called with the store lock free — it takes it."""
         loop = asyncio.get_running_loop()
-        if loop.time() < self._next_optimize_at:
+        if loop.time() < self._next_stats_refresh_at:
             return
         # Claim the slot before running, not after: otherwise a burst of concurrent
         # operations all see it due and queue an ANALYZE apiece.
-        self._next_optimize_at = loop.time() + _OPTIMIZE_INTERVAL_S
+        self._next_stats_refresh_at = loop.time() + _STATS_REFRESH_INTERVAL_S
         async with self._lock:
             # Statistics are best-effort; a writer this could not wait out costs
             # nothing but the interval until the next attempt.
             with contextlib.suppress(sqlite3.OperationalError):
-                await self._conn.execute("pragma optimize")
+                await _refresh_statistics(self._conn)
 
     async def _fetch(self, name: str, params: dict[str, Any]) -> list[aiosqlite.Row]:
         await self._ensure()
-        await self._maybe_optimize()
+        await self._maybe_refresh_statistics()
         async with self._lock:
             return await self._run(name, params)
 
@@ -287,7 +332,7 @@ class SQLiteStore(TaskStore):
         error. The store lock is held for the whole transaction, so no other
         operation can slip a statement into it."""
         await self._ensure()
-        await self._maybe_optimize()
+        await self._maybe_refresh_statistics()
         async with self._lock:
             await self._conn.execute("BEGIN IMMEDIATE")
             try:

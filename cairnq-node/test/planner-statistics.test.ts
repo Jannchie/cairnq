@@ -2,9 +2,13 @@
 //
 // Without statistics SQLite misreads `status = 'running'` as a large fraction of
 // the table and passes over the partial cairnq_tasks_lease_idx that lease recovery
-// is indexed for — so migration 0004's index and the store's `PRAGMA optimize` are
+// is indexed for — so migration 0004's index and the store's statistics upkeep are
 // one feature, not two. Nothing else fails when either half rots: lease recovery
 // just quietly goes back to scanning every running task.
+//
+// These also pin the behavior across SQLite versions, which better-sqlite3 hides by
+// bundling its own: before 3.46 `PRAGMA optimize` alone cannot bootstrap statistics,
+// and the Python twin links whatever the interpreter has.
 import { describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 
@@ -12,10 +16,19 @@ import { CairnQ } from "../src/index.js";
 import { loadStatements } from "../src/sql.js";
 import { freshDbPath } from "./helpers.js";
 
-/** Rows sqlite_stat1 currently credits to an index — 0 when it has no entry. */
+/**
+ * Rows sqlite_stat1 currently credits to an index — 0 when it has no entry.
+ *
+ * sqlite_stat1 does not exist until something runs ANALYZE, so "never analyzed" has
+ * to read as 0 rather than throw.
+ */
 function analyzedRows(path: string, idx: string): number {
   const db = new Database(path);
   try {
+    const present = db
+      .prepare("select 1 from sqlite_master where type = 'table' and name = 'sqlite_stat1'")
+      .get();
+    if (!present) return 0;
     const row = db.prepare("select stat from sqlite_stat1 where idx = ?").get(idx) as
       | { stat: string }
       | undefined;

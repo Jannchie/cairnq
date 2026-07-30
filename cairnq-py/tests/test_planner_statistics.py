@@ -2,9 +2,13 @@
 
 Without statistics SQLite misreads `status = 'running'` as a large fraction of the
 table and passes over the partial cairnq_tasks_lease_idx that lease recovery is
-indexed for — so migration 0004's index and the store's `PRAGMA optimize` are one
+indexed for — so migration 0004's index and the store's statistics upkeep are one
 feature, not two. Nothing else fails when either half rots: lease recovery just
-quietly goes back to scanning every running task."""
+quietly goes back to scanning every running task.
+
+This SDK links whatever SQLite the interpreter was built against, so it is where the
+version spread actually bites: before 3.46 `PRAGMA optimize` alone cannot bootstrap
+statistics, and distro Pythons ship exactly those builds (Ubuntu 24.04: 3.45.1)."""
 
 from __future__ import annotations
 
@@ -19,9 +23,16 @@ from cairnq.store import sqlite as sqlite_store
 
 
 def analyzed_rows(path: str, idx: str) -> int:
-    """Rows sqlite_stat1 currently credits to an index — 0 when it has no entry."""
+    """Rows sqlite_stat1 currently credits to an index — 0 when it has no entry.
+
+    sqlite_stat1 does not exist until something runs ANALYZE, so "never analyzed"
+    has to read as 0 rather than raise."""
     db = sqlite3.connect(path)
     try:
+        if not db.execute(
+            "select 1 from sqlite_master where type = 'table' and name = 'sqlite_stat1'"
+        ).fetchone():
+            return 0
         row = db.execute("select stat from sqlite_stat1 where idx = ?", (idx,)).fetchone()
         return int(row[0].split(" ")[0]) if row else 0
     finally:
@@ -91,7 +102,7 @@ async def test_re_analyzes_a_connection_that_outlived_its_statistics(
     A second of real interval rather than a patched-to-zero one, so the throttle is
     exercised too: without it every operation would analyze, which is 15ms of write
     lock per call at a few hundred thousand rows."""
-    monkeypatch.setattr(sqlite_store, "_OPTIMIZE_INTERVAL_S", 1.0)
+    monkeypatch.setattr(sqlite_store, "_STATS_REFRESH_INTERVAL_S", 1.0)
 
     client = CairnQ.sqlite(db_path)
     await client.connect()
