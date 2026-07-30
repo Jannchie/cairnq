@@ -7,6 +7,7 @@ import { nowMs } from "../ids.js";
 import { loadMigrations, loadStatements } from "../sql.js";
 import {
   checkProtocolVersion,
+  COMMENT,
   type Fetch,
   type Params,
   statementParams,
@@ -59,6 +60,34 @@ function isBusy(err: unknown): boolean {
 /** Whether this path names an in-memory database rather than a file. */
 function isMemory(path: string): boolean {
   return path === ":memory:" || path.includes("mode=memory");
+}
+
+/**
+ * Whether this statement writes, and so belongs in a group commit.
+ *
+ * Read from the SQL rather than from a list of statement names, which would be a
+ * second place to remember when the protocol gains a statement. Every protocol
+ * statement is a single top-level `select`, `insert`, `update` or `delete`.
+ *
+ * Reads must stay out of the batch: `claimable_probe` exists precisely so an idle
+ * worker never takes SQLite's write lock, and a BEGIN IMMEDIATE around it would
+ * hand that back.
+ */
+function isWriteStatement(sql: string): boolean {
+  return !/^\s*select/i.test(sql.replace(COMMENT, ""));
+}
+
+/**
+ * One write waiting for its turn on the shared connection.
+ *
+ * The rows go back to the caller that asked for them, so a batch resolves each
+ * member with its own result rather than a merged one.
+ */
+interface Pending {
+  name: string;
+  params: Params;
+  resolve(rows: any[]): void;
+  reject(err: unknown): void;
 }
 
 /**
@@ -189,6 +218,12 @@ export class SQLiteStore extends TaskStore {
   private readonly busyBudgetMs: number;
   /** When this connection may next revisit its planner statistics. */
   private nextStatsRefreshAt = 0;
+  /** Which statements are writes — see isWriteStatement. */
+  private readonly writes: Record<string, boolean>;
+  /** Writes waiting to be group-committed — see flush(). */
+  private pending: Pending[] = [];
+  /** Whether a flusher is already queued to drain `pending`. */
+  private flushing = false;
 
   constructor(
     private readonly path: string,
@@ -197,6 +232,9 @@ export class SQLiteStore extends TaskStore {
     super();
     this.busyBudgetMs = opts.busyTimeoutMs ?? 5000;
     this.statements = loadStatements("sqlite");
+    this.writes = Object.fromEntries(
+      Object.entries(this.statements).map(([name, sql]) => [name, isWriteStatement(sql)]),
+    );
     // Only a bare ":memory:" is guaranteed private to its connection, so only
     // it gets a lock of its own. A "mode=memory" URI stays path-keyed: with
     // cache=shared it names ONE shared database, and on a build without URI
@@ -422,10 +460,135 @@ export class SQLiteStore extends TaskStore {
     }
   }
 
+  /**
+   * Group commit: one transaction for every write already waiting on the lock.
+   *
+   * A write costs microseconds to execute and a transaction costs a WAL commit, so
+   * N concurrent writes spend nearly all their time on N commits they could have
+   * shared. Measured at 200 finalizes: 80µs each one-transaction-apiece against
+   * 10µs each in one transaction (`bench/sweep` sweep B).
+   *
+   * Nothing waits to form a batch — a flusher takes whatever arrived while the
+   * previous one held the lock, so this trades no latency for the throughput. What
+   * it does trade is atomicity: two callers' writes now land together or not at
+   * all. Under at-least-once that is not observable (a lost batch is a
+   * redelivery), and it is why every member is resolved only after COMMIT.
+   */
+  private flush(db: DB): void {
+    // One writer waiting is the uncontended case, and it stays exactly as cheap as
+    // before: wrapping a single statement in BEGIN/COMMIT would add two statements
+    // to every write on an idle store.
+    if (this.pending.length === 1) {
+      const only = this.pending[0];
+      let rows: any[];
+      try {
+        rows = this.runNow(only.name, only.params);
+      } catch (err) {
+        // Leave it pending on a lost write lock: withLock re-runs this flusher.
+        if (isBusy(err)) throw err;
+        this.pending.shift();
+        only.reject(err);
+        return;
+      }
+      this.pending.shift();
+      only.resolve(rows);
+      return;
+    }
+
+    // BEGIN before consuming, so a lost write lock leaves the batch where the
+    // retry will find it — with anything that arrived meanwhile.
+    db.exec("BEGIN IMMEDIATE");
+    const batch = this.pending;
+    this.pending = [];
+    const out: { rows?: any[]; err?: unknown }[] = [];
+    try {
+      for (const w of batch) {
+        try {
+          out.push({ rows: this.runNow(w.name, w.params) });
+        } catch (err) {
+          // A statement error aborts that statement, not the transaction, so the
+          // rest of the batch is still good and this one waiter carries the error.
+          // If SQLite tore the transaction down instead, nothing in it survived
+          // and every member has to hear about it.
+          if (!db.inTransaction) throw err;
+          out.push({ err });
+        }
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      if (db.inTransaction) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Raced with SQLite's own rollback; the transaction is gone either way.
+        }
+      }
+      if (isBusy(err)) {
+        // Back to the head of the queue, ahead of later arrivals, so the retry
+        // preserves the order the writes were issued in.
+        this.pending = batch.concat(this.pending);
+        throw err;
+      }
+      for (const w of batch) w.reject(err);
+      return;
+    }
+    // Only now: before COMMIT a rollback could still take the write back, and a
+    // caller holding its row would have observed a write that never happened.
+    for (let i = 0; i < batch.length; i++) {
+      // Presence, not truthiness — a thrown value is not guaranteed to be one.
+      if ("err" in out[i]) batch[i].reject(out[i].err);
+      else batch[i].resolve(out[i].rows!);
+    }
+  }
+
+  /**
+   * Make sure some flusher is draining `pending`, without ever running two.
+   *
+   * The flusher loops instead of re-arming itself per batch. A caller that awaits
+   * its writes one at a time resumes and issues the next one *before* the flusher
+   * gets its turn back, so re-arming would cost that write an extra trip through
+   * the lock queue — measured as ~2x on sequential writes, which is most of them.
+   * Looping picks it up in the same session for free.
+   *
+   * The exit is safe because the last `pending` check and clearing the flag happen
+   * in one synchronous step: a write that arrives before it keeps the loop going,
+   * and one that arrives after sees the flag down and starts a new flusher.
+   */
+  private scheduleFlush(db: DB): void {
+    if (this.flushing) return;
+    this.flushing = true;
+    void (async () => {
+      try {
+        while (this.pending.length) {
+          try {
+            await this.withLock(() => this.flush(db));
+          } catch (err) {
+            // flush only throws on a lost write lock, and only after putting its
+            // batch back — so reaching here means withLock spent the whole budget
+            // and those writes are still queued with nobody else coming for them.
+            // Anything that arrived behind them is failed with the same error
+            // rather than left hanging: this store cannot write at all right now,
+            // which is what a lone write would have been told too.
+            const stranded = this.pending;
+            this.pending = [];
+            for (const w of stranded) w.reject(err);
+          }
+        }
+      } finally {
+        this.flushing = false;
+      }
+    })();
+  }
+
   protected async fetch(name: string, params: Params): Promise<any[]> {
     const db = this.ensure();
     await this.maybeRefreshStatistics(db);
-    return this.withLock(() => this.runNow(name, params));
+    // Reads keep their own turn on the lock — see isWriteStatement.
+    if (!this.writes[name]) return this.withLock(() => this.runNow(name, params));
+    return new Promise<any[]>((resolve, reject) => {
+      this.pending.push({ name, params, resolve, reject });
+      this.scheduleFlush(db);
+    });
   }
 
   protected async tx<T>(fn: (fetch: Fetch) => Promise<T>): Promise<T> {

@@ -313,6 +313,20 @@ CairnQ targets same-host coordination. Know the edges:
   operations in-process (one connection behind a lock), so a transaction can't be
   interleaved with another operation. Both are fine for low-write, long-running AI
   workloads; neither is a high-throughput MQ.
+  - Writes already waiting on that lock are **group-committed**: whoever gets the
+    lock runs all of them in one transaction. Nothing waits to form a batch, so
+    there is no added latency, and a lone write on an idle store is still its own
+    transaction. It raises concurrent write throughput several-fold (`bench/sweep`
+    sweep A: 2.5k to 20k no-op tasks/s at concurrency 64 in TypeScript) because the
+    cost being shared is the WAL commit, not the statement.
+  - What that trades is **atomicity granularity**: two callers' writes now land
+    together or not at all. Nothing observable follows from it — a batch lost to a
+    crash is a redelivery, which at-least-once already allows — and no caller is
+    told its write succeeded before the COMMIT that made it durable. A statement
+    that fails on its own still fails only its own caller.
+  - Postgres does none of this and needs none of it: there is no in-process lock to
+    queue behind, and per-transaction durability cost is `synchronous_commit`, which
+    belongs to the server rather than to this SDK.
 - **Planner statistics keep themselves current.** Both SDKs revisit them after
   migrating and once a minute per connection thereafter, because without
   `sqlite_stat1` the planner passes over the partial index lease recovery depends on

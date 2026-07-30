@@ -22,8 +22,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import sqlite3
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +33,7 @@ import aiosqlite
 
 from .._ids import now_ms
 from .._sql import load_migrations, load_statements
-from .base import Fetch, TaskStore, check_protocol_version, statement_params
+from .base import COMMENT, Fetch, TaskStore, check_protocol_version, statement_params
 
 
 def _split_script(script: str) -> list[str]:
@@ -152,6 +154,41 @@ async def _enable_wal(conn: aiosqlite.Connection) -> None:
         await asyncio.sleep(_WAL_RETRY_DELAY_S)
 
 
+def _is_write_statement(sql: str) -> bool:
+    """Whether this statement writes, and so belongs in a group commit.
+
+    Read from the SQL rather than from a list of statement names, which would be a
+    second place to remember when the protocol gains a statement. Every protocol
+    statement is a single top-level select, insert, update or delete.
+
+    Reads must stay out of the batch: claimable_probe exists precisely so an idle
+    worker never takes SQLite's write lock, and a BEGIN IMMEDIATE around it would
+    hand that back."""
+    return not re.match(r"\s*select", re.sub(COMMENT, "", sql), re.IGNORECASE)
+
+
+@dataclass
+class _Pending:
+    """One write waiting for its turn on the shared connection.
+
+    The rows go back to the caller that asked for them, so a batch resolves each
+    member with its own result rather than a merged one."""
+
+    name: str
+    params: dict[str, Any]
+    future: asyncio.Future[list[aiosqlite.Row]]
+
+    def resolve(self, rows: list[aiosqlite.Row]) -> None:
+        # A caller whose await was cancelled leaves a done future behind, and its
+        # write still ran — there is simply nobody left to hand the rows to.
+        if not self.future.done():
+            self.future.set_result(rows)
+
+    def reject(self, exc: BaseException) -> None:
+        if not self.future.done():
+            self.future.set_exception(exc)
+
+
 class SQLiteStore(TaskStore):
     def __init__(self, path: str, *, busy_timeout_ms: int = 5_000):
         self._path = path
@@ -163,6 +200,13 @@ class SQLiteStore(TaskStore):
         # When this connection may next revisit its planner statistics. Set on
         # connect, which is also where the first refresh runs.
         self._next_stats_refresh_at = 0.0
+        # Group commit: which statements write, and the writes waiting to share a
+        # transaction. See _flush.
+        self._writes = {name: _is_write_statement(sql) for name, sql in self._sql.items()}
+        self._pending: list[_Pending] = []
+        self._flushing = False
+        # Held so the fire-and-forget flusher cannot be garbage collected mid-batch.
+        self._flusher: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
@@ -239,6 +283,13 @@ class SQLiteStore(TaskStore):
                 await conn.execute("COMMIT")
 
     async def close(self) -> None:
+        # Let an in-flight group commit finish first: it is holding writes whose
+        # callers are still awaiting them, and closing the connection underneath it
+        # would turn those into connection errors for work that was about to land.
+        flusher, self._flusher = self._flusher, None
+        if flusher is not None:
+            with contextlib.suppress(BaseException):
+                await flusher
         if self._conn is not None:
             conn, self._conn = self._conn, None
             await conn.close()
@@ -320,11 +371,115 @@ class SQLiteStore(TaskStore):
             with contextlib.suppress(sqlite3.OperationalError):
                 await _refresh_statistics(self._conn)
 
+    async def _flush(self) -> None:
+        """Group commit: one transaction for every write already waiting on the lock.
+
+        A write costs microseconds to execute and a WAL commit to durably land, so N
+        concurrent writes spend nearly all their time on N commits they could have
+        shared. Measured at 200 finalizes: 1414µs each one-transaction-apiece against
+        302µs each in one transaction (`bench/sweep` sweep B).
+
+        Nothing waits to form a batch — a flusher takes whatever arrived while the
+        previous one held the lock — so this trades no latency for the throughput.
+        What it does trade is atomicity: two callers' writes now land together or not
+        at all. Under at-least-once that is not observable (a lost batch is a
+        redelivery), and it is why every member is resolved only after COMMIT.
+
+        Called with the store lock held."""
+        # One writer waiting is the uncontended case, and it stays exactly as cheap
+        # as before: wrapping a single statement in BEGIN/COMMIT would add two
+        # statements to every write on an idle store.
+        if len(self._pending) == 1:
+            only = self._pending.pop()
+            try:
+                only.resolve(await self._run(only.name, only.params))
+            except BaseException as exc:  # noqa: BLE001 - handed to its own waiter
+                only.reject(exc)
+            return
+
+        batch: list[_Pending] = []
+        out: list[tuple[list[aiosqlite.Row] | None, BaseException | None]] = []
+        try:
+            # BEGIN before taking the batch, so a failure here still finds it in
+            # _pending — see the handler below.
+            await self._conn.execute("BEGIN IMMEDIATE")
+            batch, self._pending = self._pending, []
+            for write in batch:
+                try:
+                    out.append((await self._run(write.name, write.params), None))
+                except BaseException as exc:  # noqa: BLE001 - may belong to one waiter
+                    # A statement error aborts that statement, not the transaction,
+                    # so the rest of the batch is still good and this one waiter
+                    # carries the error. If SQLite tore the transaction down instead,
+                    # nothing in it survived and every member has to hear about it.
+                    if not self._conn.in_transaction:
+                        raise
+                    out.append((None, exc))
+            await self._conn.execute("COMMIT")
+        except BaseException as exc:  # noqa: BLE001 - fanned out to the whole batch
+            if self._conn.in_transaction:
+                # Shielded and BaseException-suppressed for the same reason as
+                # _transaction: a cancellation here must not leave the shared
+                # connection inside an open write transaction.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(self._conn.execute("ROLLBACK"))
+            # BEGIN itself failed, so the batch was never taken and is still queued.
+            if not batch:
+                batch, self._pending = self._pending, []
+            for write in batch:
+                write.reject(exc)
+            return
+        # Only now: before COMMIT a rollback could still take the write back, and a
+        # caller holding its row would have observed a write that never happened.
+        for write, (rows, failure) in zip(batch, out, strict=True):
+            if failure is not None:
+                write.reject(failure)
+            else:
+                write.resolve(rows or [])
+
+    async def _flush_loop(self) -> None:
+        """Drain `_pending`, one transaction per turn on the lock.
+
+        Loops rather than re-arming per batch: a caller that awaits its writes one at
+        a time resumes and issues the next one before the flusher gets its turn back,
+        so re-arming would cost that write an extra trip through the lock queue.
+
+        The exit is safe because the last `_pending` check and clearing the flag
+        happen without an await between them: a write that arrives before it keeps
+        the loop going, and one that arrives after sees the flag down and starts a new
+        flusher."""
+        try:
+            while self._pending:
+                async with self._lock:
+                    await self._flush()
+        except BaseException as exc:  # noqa: BLE001 - nothing above may be silent
+            # _flush delivers every outcome to its own waiter, so reaching here means
+            # something outside it failed — losing the connection under a close, say.
+            # A fire-and-forget task must not swallow that: the writes still queued
+            # would wait forever for a flusher that is already gone.
+            stranded, self._pending = self._pending, []
+            for write in stranded:
+                write.reject(exc)
+        finally:
+            self._flushing = False
+
+    def _schedule_flush(self) -> None:
+        if self._flushing:
+            return
+        self._flushing = True
+        self._flusher = asyncio.ensure_future(self._flush_loop())
+
     async def _fetch(self, name: str, params: dict[str, Any]) -> list[aiosqlite.Row]:
         await self._ensure()
         await self._maybe_refresh_statistics()
-        async with self._lock:
-            return await self._run(name, params)
+        # Reads keep their own turn on the lock — see _is_write_statement.
+        if not self._writes[name]:
+            async with self._lock:
+                return await self._run(name, params)
+        pending = _Pending(name, params, asyncio.get_running_loop().create_future())
+        self._pending.append(pending)
+        self._schedule_flush()
+        return await pending.future
 
     @contextlib.asynccontextmanager
     async def _transaction(self) -> AsyncIterator[Fetch]:
