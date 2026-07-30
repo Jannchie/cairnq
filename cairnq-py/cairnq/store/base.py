@@ -332,8 +332,16 @@ class TaskStore(ABC):
         handlers. Queues alone do not partition work, so without it a worker
         claims a task it cannot run and fails it permanently. None means no
         filter; an empty list claims nothing."""
+        # One queue is the common case and gets its own statement: a list-valued
+        # queue filter cannot be read in claim order, so the planner sorts every
+        # claimable row to take LIMIT of them, and claim's cost grows with the
+        # queued backlog while it holds the claim transaction. See
+        # claim_one_queue.sql.
+        queue_list = list(queues)
+        one_queue = len(queue_list) == 1
         params = {
-            "queues": list(queues),
+            "queues": queue_list,
+            "queue": queue_list[0] if one_queue else None,
             "names": None if names is None else list(names),
             "worker_id": worker_id,
             "lease_ms": lease_ms,
@@ -346,7 +354,7 @@ class TaskStore(ABC):
         # to be visible to the claim that follows, and to nobody in between.
         async with self._transaction() as fetch:
             await fetch("recover_leases", params)
-            rows = await fetch("claim", params)
+            rows = await fetch("claim_one_queue" if one_queue else "claim", params)
             return [Task.from_row(r) for r in rows]
 
     async def heartbeat(self, *, task_id: str, worker_id: str, lease_ms: int = 30_000) -> Task:

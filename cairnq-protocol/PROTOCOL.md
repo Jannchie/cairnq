@@ -108,6 +108,16 @@ A worker **leases** a task rather than popping it:
   FIFO at millisecond granularity, with same-millisecond ties broken stably by
   the id (its random half decides, not submit order). `list` breaks its
   `created_at_ms desc` ties the same way.
+- **`claim` ships as two statements, one per queue arity.** A caller watching a
+  single queue uses `claim_one_queue.sql`, which filters `queue = :queue`;
+  several queues use `claim.sql` and its list-valued filter. They are the same
+  statement otherwise — a drift-guard test pins them to differing on exactly that
+  one line — and both produce the same task, so the choice is invisible to
+  behavior and to conformance. It exists because only the equality form can be
+  read in `cairnq_tasks_claim_idx` order: the list form has to merge several index
+  ranges, so the planner materializes and sorts every claimable row to take
+  `LIMIT` of them, and claim's cost then grows with the queued backlog *inside the
+  transaction that holds the claim*.
 - **`claim` filters by task name, not only by queue.** `:names` carries the names
   the caller can actually run; a worker passes its registered handlers (`NULL`
   means no filter, an empty set claims nothing). Queues do not partition work by
@@ -301,6 +311,14 @@ CairnQ targets same-host coordination. Know the edges:
   passes over the partial index lease recovery depends on. A connection held for
   days keeps the statistics it opened with, so restart a long-lived worker after the
   database grows by an order of magnitude.
+- **Watching several queues costs a sort per claim.** Only the single-queue claim
+  reads the index in claim order (see the lease model above), so a worker with two
+  or more queues pays a sort proportional to the queued backlog on every claim, and
+  pays it while holding the claim transaction. Measured through the SDK against a
+  batch backlog of 500 / 5k / 20k queued tasks: 281µs / 953µs / 2972µs per claim,
+  versus 236µs / 287µs / 360µs for one queue. Prefer one queue per worker and use
+  `names` to partition work; reach for several queues when you need cross-queue
+  priority in one claim, and keep the backlog in mind if you do.
 - **Same host only (SQLite).** Do not put the database on a network filesystem and
   do not share the file across machines — WAL requires processes on one host. For
   multi-host, use the Postgres backend, which takes time from the DB clock and

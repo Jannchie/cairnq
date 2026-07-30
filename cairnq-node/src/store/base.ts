@@ -385,8 +385,14 @@ export abstract class TaskStore {
     limit?: number;
     names?: string[];
   }): Promise<Task[]> {
+    // One queue is the common case and gets its own statement: a list-valued queue
+    // filter cannot be read in claim order, so the planner sorts every claimable
+    // row to take LIMIT of them, and claim's cost grows with the queued backlog
+    // while it holds the claim transaction. See claim_one_queue.sql.
+    const oneQueue = input.queues.length === 1;
     const params: Params = {
       queues: input.queues,
+      queue: oneQueue ? input.queues[0] : null,
       names: input.names ?? null,
       worker_id: input.workerId,
       lease_ms: input.leaseMs ?? 30_000,
@@ -398,7 +404,7 @@ export abstract class TaskStore {
     // be visible to the claim that follows, and to nobody in between.
     return this.tx(async (fetch) => {
       await fetch("recover_leases", params);
-      return (await fetch("claim", params)).map(rowToTask);
+      return (await fetch(oneQueue ? "claim_one_queue" : "claim", params)).map(rowToTask);
     });
   }
 

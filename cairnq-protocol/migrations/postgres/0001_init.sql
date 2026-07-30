@@ -46,7 +46,9 @@ create table if not exists cairnq_tasks (
 );
 
 -- Serves the claim query: WHERE queue=? AND status='queued' ORDER BY priority
--- desc, created_at_ms asc (run_at_ms applied as a residual filter).
+-- desc, created_at_ms asc (run_at_ms applied as a residual filter). Only
+-- claim_one_queue.sql can read it in claim order; claim.sql's array-valued queue
+-- filter forces a sort, and past a few thousand queued rows a sequential scan.
 create index if not exists cairnq_tasks_claim_idx
     on cairnq_tasks (queue, status, priority desc, created_at_ms);
 create index if not exists cairnq_tasks_status_idx on cairnq_tasks (status);

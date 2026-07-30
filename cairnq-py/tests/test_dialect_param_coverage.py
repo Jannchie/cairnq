@@ -64,6 +64,13 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     await store.succeed(task_id=claimed[1].id, worker_id=worker, result={"ok": True})
     await store.complete(task_id=claimed[2].id, worker_id=worker, result={"ok": True})
 
+    # Both claim statements. The claim above watched one queue, so it took the
+    # equality variant; several queues take the list form (see claim_one_queue.sql).
+    # They bind different parameters, so exercising only one leaves the other's
+    # superset unchecked — which is exactly what this file is for.
+    await store.submit(name="job", payload={}, queue="other")
+    await store.claim(queues=["default", "other"], worker_id=worker, lease_ms=5_000, limit=1)
+
     await store.cancel(task.id)
     await store.retry(task.id, reset_attempt=False)
     await store.stats()
