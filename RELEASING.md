@@ -63,6 +63,13 @@ Then on the package's npmjs.com settings → *Trusted Publisher* → add GitHub
 Actions with repository `Jannchie/cairnq` and workflow `publish.yml`. Every
 later release publishes over OIDC (with provenance) — no token needed.
 
+**The repository must be public.** npm accepts a provenance attestation only from
+a public source repo; from a private one `npm publish --provenance` fails with a
+`422` on provenance verification *even when the trusted publisher is configured
+correctly* — the OIDC exchange succeeds and the registry rejects the attestation,
+so the error looks nothing like a permissions problem. Either keep the repo public
+or drop `--provenance` from `publish.yml`.
+
 ## Why the vendor step
 
 `cairnq-protocol/` (the canonical SQL) is gitignored inside each package and
