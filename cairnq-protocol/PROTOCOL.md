@@ -324,7 +324,12 @@ CairnQ targets same-host coordination. Know the edges:
   multi-host, use the Postgres backend, which takes time from the DB clock and
   claims with `FOR UPDATE SKIP LOCKED`.
 - **Unbounded growth without `purge`.** Terminal tasks are kept forever until the
-  application deletes them. Budget for a retention sweep.
+  application deletes them. Budget for a retention sweep — it costs latency, not
+  just disk: on Postgres the lease-recovery pass that precedes every claim joins
+  against the table, and the planner cannot estimate how many leases have expired
+  (the cutoff is a runtime value), so it scans. Measured with 20k leases in flight:
+  1.5ms on a 20k-row table, 25ms once 300k terminal rows have piled up behind them.
+  Retention is the lever there, not an index.
 - **No in-database authorization.** Unlike a Postgres role model, any process that
   can open the SQLite file has full read/write access and executes SQL directly.
   Protect the file with OS permissions; treat DB access as full trust.

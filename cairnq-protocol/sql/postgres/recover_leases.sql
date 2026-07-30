@@ -38,7 +38,18 @@ where id in (
     select id from cairnq_tasks
     where status = 'running'
       and lease_until_ms is not null
-      and lease_until_ms <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+      -- The scalar subselect is load-bearing, not noise: clock_timestamp() is
+      -- VOLATILE, so inlined here it becomes a per-row filter and this scan
+      -- degrades to reading every running task (20k in flight: Seq Scan 20000
+      -- rows, 19997 removed by filter). Wrapped, it is an InitPlan evaluated once
+      -- and usable as an index bound on cairnq_tasks_lease_idx — same 20k table,
+      -- 3 rows read. Do not "simplify" it away.
+      --
+      -- Deliberately not now(): that is STABLE and would also index, but it
+      -- freezes at BEGIN, and this runs in a transaction that may have waited on
+      -- row locks — the cutoff would then be older than the caller thinks and
+      -- leave expired leases behind for another poll.
+      and lease_until_ms <= (select (extract(epoch from clock_timestamp()) * 1000)::bigint)
     for update skip locked
 )
 returning *;
