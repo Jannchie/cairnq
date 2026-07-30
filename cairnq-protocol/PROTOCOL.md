@@ -340,7 +340,9 @@ CairnQ targets same-host coordination. Know the edges:
   batch backlog of 500 / 5k / 20k queued tasks: 281µs / 953µs / 2972µs per claim,
   versus 236µs / 287µs / 360µs for one queue. Prefer one queue per worker and use
   `names` to partition work; reach for several queues when you need cross-queue
-  priority in one claim, and keep the backlog in mind if you do.
+  priority in one claim, and keep the backlog in mind if you do. `bench/sweep`
+  sweep D re-derives these, so they can be re-checked after a SQLite or driver
+  upgrade rather than trusted indefinitely.
 - **Same host only (SQLite).** Do not put the database on a network filesystem and
   do not share the file across machines — WAL requires processes on one host. For
   multi-host, use the Postgres backend, which takes time from the DB clock and

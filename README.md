@@ -218,6 +218,11 @@ cd conformance && pnpm test:cross-lang
 # Micro-benchmarks (same workload in both SDKs; add `postgres` to hit a real PG)
 cd cairnq-node && pnpm bench
 cd cairnq-py && uv run python bench/run.py
+
+# Parameter sweeps: where a drain's time goes, and what concurrency / claim
+# batch size / queue count actually cost
+cd cairnq-node && pnpm bench:sweep
+cd cairnq-py && uv run python bench/sweep.py
 ```
 
 No database server to start — the runtime is the SQLite file. Set
