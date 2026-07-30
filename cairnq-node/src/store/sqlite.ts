@@ -22,6 +22,17 @@ const WAL_RETRY_BUDGET_MS = 5_000;
 const BUSY_RETRY_BASE_MS = 1;
 const BUSY_RETRY_MAX_DELAY_MS = 50;
 
+/**
+ * How often a live connection re-offers its statistics to `PRAGMA optimize`.
+ *
+ * Bounds how long the planner can work from a stale table shape; a minute is
+ * arbitrary but small next to the days a worker holds its connection. It does not
+ * set how often an ANALYZE actually runs — SQLite decides that itself, and only
+ * when a table has outgrown its statistics by roughly 24x, so a shorter interval
+ * costs more no-ops (a few microseconds each) rather than more analyzing.
+ */
+const OPTIMIZE_INTERVAL_MS = 60_000;
+
 /** Sleep without yielding — the whole open path is synchronous already. */
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -133,6 +144,8 @@ export class SQLiteStore extends TaskStore {
   private readonly lockKey: string;
   /** How long a single operation may keep retrying a lost write lock. */
   private readonly busyBudgetMs: number;
+  /** When this connection may next offer its statistics to `PRAGMA optimize`. */
+  private nextOptimizeAt = 0;
 
   constructor(
     private readonly path: string,
@@ -182,12 +195,8 @@ export class SQLiteStore extends TaskStore {
     // `status = 'running'` as a large fraction of the table and passes over the
     // partial cairnq_tasks_lease_idx that lease recovery is indexed for. PRAGMA
     // optimize decides for itself whether an ANALYZE is worth running — a no-op on
-    // a fresh or little-changed database — and must precede the prepare loop below,
-    // which is what bakes the resulting plans in.
-    //
-    // Open-time only: a worker holds its connection for days, so a database that
-    // grows an order of magnitude mid-session plans against its startup shape until
-    // it restarts.
+    // a fresh or little-changed database — and is repeated on a timer from then on
+    // (see maybeOptimize).
     try {
       db.pragma("optimize");
     } catch (err) {
@@ -196,6 +205,7 @@ export class SQLiteStore extends TaskStore {
       // chance. Anything else is a real fault and belongs to the caller.
       if (!isBusy(err)) throw err;
     }
+    this.nextOptimizeAt = Date.now() + OPTIMIZE_INTERVAL_MS;
     for (const [name, sql] of Object.entries(this.statements)) {
       this.stmts[name] = db.prepare(sql);
     }
@@ -345,13 +355,43 @@ export class SQLiteStore extends TaskStore {
     }
   }
 
+  /**
+   * Re-offer this connection's statistics to `PRAGMA optimize`, at most once per
+   * OPTIMIZE_INTERVAL_MS.
+   *
+   * A connection lives for days, and the statements were prepared against whatever
+   * the table looked like when it opened — a worker started against an empty
+   * database plans as if it were still empty however large the backlog grows. The
+   * prepared statements do pick the refreshed plans up: ANALYZE bumps the schema
+   * cookie, so SQLite silently re-prepares them on next use. That is what makes
+   * this worth doing rather than a restart-only concern.
+   *
+   * Queued rather than run under `withLock`: statistics are best-effort, so losing
+   * the write lock to another process should cost nothing — skip and let the next
+   * interval try, instead of spending an operation's whole retry budget on them.
+   */
+  private async maybeOptimize(db: DB): Promise<void> {
+    const now = Date.now();
+    if (now < this.nextOptimizeAt) return;
+    // Claim the slot before running, not after: otherwise a burst of concurrent
+    // operations all see it due and queue an ANALYZE apiece.
+    this.nextOptimizeAt = now + OPTIMIZE_INTERVAL_MS;
+    try {
+      await this.enqueue(() => db.pragma("optimize"));
+    } catch (err) {
+      if (!isBusy(err)) throw err;
+    }
+  }
+
   protected async fetch(name: string, params: Params): Promise<any[]> {
-    this.ensure();
+    const db = this.ensure();
+    await this.maybeOptimize(db);
     return this.withLock(() => this.runNow(name, params));
   }
 
   protected async tx<T>(fn: (fetch: Fetch) => Promise<T>): Promise<T> {
     const db = this.ensure();
+    await this.maybeOptimize(db);
     // BEGIN IMMEDIATE by hand rather than db.transaction(): the callback is async
     // (the seam is shared with Postgres), and better-sqlite3's wrapper only takes
     // a synchronous one. The lock above makes the manual version safe.

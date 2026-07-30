@@ -313,11 +313,17 @@ CairnQ targets same-host coordination. Know the edges:
   operations in-process (one connection behind a lock), so a transaction can't be
   interleaved with another operation. Both are fine for low-write, long-running AI
   workloads; neither is a high-throughput MQ.
-- **Planner statistics are refreshed at open, and only then.** Both SDKs run
-  `PRAGMA optimize` after migrating, because without `sqlite_stat1` the planner
-  passes over the partial index lease recovery depends on. A connection held for
-  days keeps the statistics it opened with, so restart a long-lived worker after the
-  database grows by an order of magnitude.
+- **Planner statistics keep themselves current.** Both SDKs run `PRAGMA optimize`
+  after migrating and once a minute per connection thereafter, because without
+  `sqlite_stat1` the planner passes over the partial index lease recovery depends on
+  — and a worker that started against an empty database would otherwise plan as if
+  it were still empty for the days its connection lives. SQLite decides for itself
+  whether an ANALYZE is warranted (roughly a 24x growth in a table), so the interval
+  buys no-ops, not work; prepared statements pick up the new plans on their own,
+  because ANALYZE bumps the schema cookie and SQLite re-prepares them. What is *not*
+  covered is shrinkage: after a large purge the statistics keep the old row counts
+  until the table grows into them again, which overestimates and so errs toward
+  using an index.
 - **Watching several queues costs a sort per claim.** Only the single-queue claim
   reads the index in claim order (see the lease model above), so a worker with two
   or more queues pays a sort proportional to the queued backlog on every claim, and

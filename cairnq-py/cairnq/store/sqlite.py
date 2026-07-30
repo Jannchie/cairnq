@@ -57,6 +57,15 @@ def _split_script(script: str) -> list[str]:
 _WAL_RETRY_DELAY_S = 0.05
 _WAL_RETRY_BUDGET_S = 5.0
 
+# How often a live connection re-offers its statistics to `PRAGMA optimize`.
+#
+# Bounds how long the planner can work from a stale table shape; a minute is
+# arbitrary but small next to the days a worker holds its connection. It does not
+# set how often an ANALYZE actually runs — SQLite decides that itself, and only when
+# a table has outgrown its statistics by roughly 24x, so a shorter interval costs
+# more no-ops (a few microseconds each) rather than more analyzing.
+_OPTIMIZE_INTERVAL_S = 60.0
+
 
 def _is_memory(path: str) -> bool:
     """Whether this path names an in-memory database rather than a file."""
@@ -105,6 +114,9 @@ class SQLiteStore(TaskStore):
         self._sql = load_statements("sqlite")
         self._lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
+        # When this connection may next offer its statistics to `PRAGMA optimize`.
+        # Set on connect, which is also where the first one runs.
+        self._next_optimize_at = 0.0
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
@@ -132,11 +144,8 @@ class SQLiteStore(TaskStore):
             # `status = 'running'` as a large fraction of the table and passes over
             # the partial cairnq_tasks_lease_idx that lease recovery is indexed for.
             # PRAGMA optimize decides for itself whether an ANALYZE is worth running
-            # — a no-op on a fresh or little-changed database.
-            #
-            # Connect-time only: a worker holds its connection for days, so a
-            # database that grows an order of magnitude mid-session plans against
-            # its startup shape until it restarts.
+            # — a no-op on a fresh or little-changed database — and is repeated on a
+            # timer from then on (see _maybe_optimize).
             try:
                 await conn.execute("pragma optimize")
             except sqlite3.OperationalError:
@@ -144,6 +153,9 @@ class SQLiteStore(TaskStore):
                 # to a concurrent writer must not fail the connect — the next one
                 # gets another chance.
                 pass
+            self._next_optimize_at = (
+                asyncio.get_running_loop().time() + _OPTIMIZE_INTERVAL_S
+            )
             self._conn = conn
             check_protocol_version(await self.protocol_version())
 
@@ -239,8 +251,33 @@ class SQLiteStore(TaskStore):
         await cur.close()
         return rows
 
+    async def _maybe_optimize(self) -> None:
+        """Re-offer this connection's statistics to `PRAGMA optimize`, at most once
+        per _OPTIMIZE_INTERVAL_S.
+
+        A connection lives for days, and its statements were prepared against
+        whatever the table looked like when it opened — a worker started against an
+        empty database plans as if it were still empty however large the backlog
+        grows. Cached statements do pick the refreshed plans up: ANALYZE bumps the
+        schema cookie, so SQLite silently re-prepares them on next use. That is what
+        makes this worth doing rather than a restart-only concern.
+
+        Must be called with the store lock free — it takes it."""
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._next_optimize_at:
+            return
+        # Claim the slot before running, not after: otherwise a burst of concurrent
+        # operations all see it due and queue an ANALYZE apiece.
+        self._next_optimize_at = loop.time() + _OPTIMIZE_INTERVAL_S
+        async with self._lock:
+            # Statistics are best-effort; a writer this could not wait out costs
+            # nothing but the interval until the next attempt.
+            with contextlib.suppress(sqlite3.OperationalError):
+                await self._conn.execute("pragma optimize")
+
     async def _fetch(self, name: str, params: dict[str, Any]) -> list[aiosqlite.Row]:
         await self._ensure()
+        await self._maybe_optimize()
         async with self._lock:
             return await self._run(name, params)
 
@@ -250,6 +287,7 @@ class SQLiteStore(TaskStore):
         error. The store lock is held for the whole transaction, so no other
         operation can slip a statement into it."""
         await self._ensure()
+        await self._maybe_optimize()
         async with self._lock:
             await self._conn.execute("BEGIN IMMEDIATE")
             try:
