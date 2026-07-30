@@ -14,8 +14,8 @@ tag.
    in sync — it exits non-zero on drift, so it also works as a CI guard.
 2. Commit, then tag and push:
    ```bash
-   git commit -am "chore: release v0.2.0"
-   git tag v0.2.0
+   git commit -am "chore: release v0.3.0"
+   git tag v0.3.0
    git push origin main --tags
    ```
 3. The `v*` tag triggers the workflow. It runs each SDK's tests, builds, vendors
@@ -26,49 +26,41 @@ To validate without publishing: Actions → **Publish** → *Run workflow*. It
 defaults to `dry_run` (test + build + `npm pack` / `uv build`, no upload).
 Untick `dry_run` to publish from a manual run.
 
-## One-time registry setup
+## The repo has to stay public
 
-OIDC requires a trusted publisher to be registered on each registry. Do this
-once per package.
+npm accepts a provenance attestation only from a **public** source repository. From
+a private one `npm publish --provenance` fails with a `422` on provenance
+verification *even when the trusted publisher is configured correctly* — the OIDC
+exchange succeeds and npm signs the attestation, then the registry rejects it on
+visibility, so the error looks nothing like a permissions problem. Either keep the
+repo public or drop `--provenance` from `publish.yml`.
 
-### PyPI — works for the first publish
+## Registry setup — already done
 
-PyPI supports *pending* publishers, so this can be configured before the package
-exists. On <https://pypi.org/manage/account/publishing/> add:
+Both trusted publishers are registered and both registries have published over
+OIDC, so cutting a release needs no registry work at all. The rest of this section
+is reference, for recreating a publisher or setting up a second package.
 
-| Field        | Value          |
-| ------------ | -------------- |
-| PyPI Project | `cairnq`       |
-| Owner        | `Jannchie`     |
-| Repository   | `cairnq`       |
-| Workflow     | `publish.yml`  |
+PyPI accepts *pending* publishers, so it can be configured before the package
+exists — on <https://pypi.org/manage/account/publishing/>:
+
+| Field        | Value           |
+| ------------ | --------------- |
+| PyPI Project | `cairnq`        |
+| Owner        | `Jannchie`      |
+| Repository   | `cairnq`        |
+| Workflow     | `publish.yml`   |
 | Environment  | *(leave blank)* |
 
-The first tagged release then publishes over OIDC with no further action.
+Environment must stay empty: `publish.yml` declares none, and a value here puts a
+claim in the OIDC token that no longer matches.
 
-### npm — needs a one-time bootstrap
-
-npm can only attach a trusted publisher to a package that **already exists**, so
-the very first publish must be done manually with your own login:
-
-```bash
-npm login
-cd cairnq-node
-pnpm install && pnpm build
-node ../scripts/vendor-protocol.mjs   # must run AFTER build (fills dist/_protocol)
-npm publish --access public
-```
-
-Then on the package's npmjs.com settings → *Trusted Publisher* → add GitHub
-Actions with repository `Jannchie/cairnq` and workflow `publish.yml`. Every
-later release publishes over OIDC (with provenance) — no token needed.
-
-**The repository must be public.** npm accepts a provenance attestation only from
-a public source repo; from a private one `npm publish --provenance` fails with a
-`422` on provenance verification *even when the trusted publisher is configured
-correctly* — the OIDC exchange succeeds and the registry rejects the attestation,
-so the error looks nothing like a permissions problem. Either keep the repo public
-or drop `--provenance` from `publish.yml`.
+npm is the harder one, because it can only attach a trusted publisher to a package
+that **already exists**. A brand-new package therefore needs one manual
+`npm publish --access public` first — after `pnpm build` and
+`node ../scripts/vendor-protocol.mjs`, in that order — before *Trusted Publisher*
+can be added under the package's npmjs.com settings. `cairnq` was bootstrapped that
+way for 0.1.0 and will not need it again.
 
 ## Why the vendor step
 
