@@ -361,9 +361,9 @@ reads `protocol_version` and refuses to run if its supported major differs.
 
 Ordinals are **one sequence shared by both dialects**, so a dialect may have no
 file at an ordinal — `0003` is the Postgres-only LISTEN/NOTIFY trigger, and SQLite
-goes 0001, 0002, 0004. A migration that closes an ordinal sets `schema_version` to
-it in *every* dialect it ships in, so the two never report different numbers for the
-same schema. (`0003` predates this rule and sets nothing, which is why both dialects
+goes 0001, 0002, 0004, 0005. A migration that closes an ordinal sets
+`schema_version` to it in *every* dialect it ships in, so the two never report
+different numbers for the same schema. (`0003` predates this rule and sets nothing, which is why both dialects
 read 2 until 0004 takes them to 4.)
 
 Migrations are applied in filename order and recorded in `cairnq_migrations`
