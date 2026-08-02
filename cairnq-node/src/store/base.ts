@@ -370,6 +370,22 @@ export abstract class TaskStore {
     return out;
   }
 
+  /**
+   * How many more tasks fit on `queue` under `maxDepth` — 0 once it is full.
+   *
+   * The cheap half of backpressure: bounded at `maxDepth` index entries, unlike
+   * `stats()`, which aggregates the whole table (terminal rows included) and so
+   * costs more the longer a database has been running. Use it directly to shed
+   * load or shape a producer; `QueueDepthGate` builds the blocking form on top.
+   */
+  async queueDepth(queue: string, maxDepth: number): Promise<number> {
+    if (!Number.isInteger(maxDepth) || maxDepth < 0) {
+      throw new Error(`maxDepth must be a non-negative integer, got ${maxDepth}`);
+    }
+    const rows = await this.fetch("queue_depth", { queue, max_depth: maxDepth });
+    return Number(rows[0]?.headroom ?? 0);
+  }
+
   // ------------------------------------------------------------- worker side
   /**
    * Take up to `limit` claimable tasks. `names` restricts the claim to task names

@@ -1,3 +1,4 @@
+import { type BackpressureOptions, QueueDepthGate } from "./backpressure.js";
 import { TaskCanceled, TaskFailed } from "./errors.js";
 import { isFailed, isSucceeded, type Task, type TaskStatus } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
@@ -12,18 +13,37 @@ export interface CallOptions extends SubmitOptions {
   pollMs?: number;
 }
 
+/** Client options that are not a store's own. Backpressure lives here rather
+ * than on the store because it is SDK-orchestrated policy, like wait/call: the
+ * store keeps offering an ungated `submit`. */
+export type ClientOptions = Partial<BackpressureOptions>;
+
+const DEFAULT_QUEUE = "default";
+
 /** API-side handle. Thin wrapper over a TaskStore + SDK-orchestrated wait/call. */
 export class CairnQ {
-  constructor(private readonly _store: TaskStore) {}
+  private readonly gate: QueueDepthGate | null;
 
-  static sqlite(path: string, opts?: { busyTimeoutMs?: number }): CairnQ {
-    return new CairnQ(new SQLiteStore(path, opts));
+  constructor(
+    private readonly _store: TaskStore,
+    opts: ClientOptions = {},
+  ) {
+    this.gate =
+      opts.maxQueueDepth == null
+        ? null
+        : new QueueDepthGate(_store, opts as BackpressureOptions);
+  }
+
+  static sqlite(path: string, opts: { busyTimeoutMs?: number } & ClientOptions = {}): CairnQ {
+    const { busyTimeoutMs, ...client } = opts;
+    return new CairnQ(new SQLiteStore(path, { busyTimeoutMs }), client);
   }
 
   /** Multi-host backend. `dsn` is a libpq connection string; requires the
    * optional `pg` package. */
-  static postgres(dsn: string, opts?: { max?: number }): CairnQ {
-    return new CairnQ(new PostgresStore(dsn, opts));
+  static postgres(dsn: string, opts: { max?: number } & ClientOptions = {}): CairnQ {
+    const { max, ...client } = opts;
+    return new CairnQ(new PostgresStore(dsn, { max }), client);
   }
 
   get store(): TaskStore {
@@ -38,10 +58,27 @@ export class CairnQ {
     return this._store.close();
   }
 
+  /** Enqueue a task. With `maxQueueDepth` configured this blocks while the
+   * target queue is at its limit, and raises QueueFull if it stays there for
+   * `maxQueueWaitMs` — see QueueDepthGate for why that bound is approximate
+   * across several producers. */
   submit(name: string, payload?: unknown, opts?: SubmitOptions): Promise<Task>;
   submit<P, R>(task: TaskDef<P, R>, payload?: P, opts?: SubmitOptions): Promise<Task>;
-  submit(task: string | TaskDef, payload?: unknown, opts: SubmitOptions = {}): Promise<Task> {
+  async submit(
+    task: string | TaskDef,
+    payload?: unknown,
+    opts: SubmitOptions = {},
+  ): Promise<Task> {
+    if (this.gate) await this.gate.acquire(opts.queue ?? DEFAULT_QUEUE);
     return this._store.submit({ name: taskName(task), payload, ...opts });
+  }
+
+  /** How many more tasks fit on `queue` under `maxDepth` — 0 once it is full.
+   * The non-blocking read behind `maxQueueDepth`, for a producer that would
+   * rather shed load or pick another queue than wait. Cheaper than `stats()`:
+   * bounded at `maxDepth` index entries instead of aggregating the table. */
+  queueDepth(queue: string, maxDepth: number): Promise<number> {
+    return this._store.queueDepth(queue, maxDepth);
   }
 
   get(taskId: string): Promise<Task | null> {

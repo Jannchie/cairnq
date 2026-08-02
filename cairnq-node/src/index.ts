@@ -1,5 +1,7 @@
 export { CairnQ } from "./client.js";
-export type { CallOptions, SubmitOptions } from "./client.js";
+export type { CallOptions, ClientOptions, SubmitOptions } from "./client.js";
+export { QueueDepthGate } from "./backpressure.js";
+export type { BackpressureOptions, QueueDepthLimit } from "./backpressure.js";
 export { Worker } from "./worker.js";
 export type { Handler, TypedHandler, WorkerOptions } from "./worker.js";
 export { TaskContext } from "./context.js";
@@ -23,6 +25,7 @@ export {
 export {
   CairnQError,
   AlreadyExists,
+  QueueFull,
   TaskTimeout,
   TaskFailed,
   TaskCanceled,

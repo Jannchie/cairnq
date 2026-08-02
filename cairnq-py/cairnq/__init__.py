@@ -5,6 +5,7 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
+from .backpressure import QueueDepthGate, QueueDepthLimit
 from .client import CairnQ
 from .context import TaskContext
 from .errors import (
@@ -12,6 +13,7 @@ from .errors import (
     CairnQError,
     LostLease,
     ProtocolVersionMismatch,
+    QueueFull,
     SerializationError,
     TaskCanceled,
     TaskError,
@@ -41,8 +43,11 @@ __all__ = [
     "TaskStore",
     "SQLiteStore",
     "PostgresStore",
+    "QueueDepthGate",
+    "QueueDepthLimit",
     "CairnQError",
     "AlreadyExists",
+    "QueueFull",
     "TaskTimeout",
     "TaskFailed",
     "TaskCanceled",

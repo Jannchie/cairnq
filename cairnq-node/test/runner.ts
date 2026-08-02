@@ -152,6 +152,8 @@ export class Runner {
         return c.purge({ olderThanMs: a.older_than_ms, limit: a.limit });
       case "stats":
         return c.stats();
+      case "queue_depth":
+        return c.queueDepth(a.queue, a.max_depth);
       case "sleep":
         await sleep(a.ms);
         return null;

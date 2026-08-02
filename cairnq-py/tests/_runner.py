@@ -139,6 +139,8 @@ class Runner:
             )
         if op == "stats":
             return await c.stats()
+        if op == "queue_depth":
+            return await c.queue_depth(a["queue"], a["max_depth"])
         if op == "sleep":
             await asyncio.sleep(a["ms"] / 1000)
             return None

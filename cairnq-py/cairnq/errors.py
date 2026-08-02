@@ -42,6 +42,24 @@ class AlreadyExists(CairnQError):
         super().__init__(f"task with key {key!r} already exists")
 
 
+class QueueFull(CairnQError):
+    """A gated submit waited out `max_queue_wait_ms` without the queue draining
+    below its depth limit. Nothing was enqueued.
+
+    Distinct from a slow submit on purpose: a queue this far behind is a capacity
+    problem, and a caller that silently retries forever converts it into an
+    invisible one."""
+
+    def __init__(self, queue: str, max_depth: int, waited_ms: int):
+        self.queue = queue
+        self.max_depth = max_depth
+        self.waited_ms = waited_ms
+        super().__init__(
+            f"queue {queue!r} still holds {max_depth} or more queued tasks after "
+            f"{waited_ms}ms; refusing to enqueue more"
+        )
+
+
 def _timeout_detail(task: Task | None) -> str:
     """One line of "why hasn't this finished" from the last snapshot wait()
     observed. No worker running, no handler for the name, wrong queue, and two

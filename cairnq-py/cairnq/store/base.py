@@ -317,6 +317,20 @@ class TaskStore(ABC):
             per[row["status"]] = int(row["count"])
         return out
 
+    async def queue_depth(self, queue: str, max_depth: int) -> int:
+        """How many more tasks fit on `queue` under `max_depth` — 0 once it is
+        full.
+
+        The cheap half of backpressure: bounded at `max_depth` index entries,
+        unlike `stats()`, which aggregates the whole table (terminal rows
+        included) and so costs more the longer a database has been running. Use
+        it directly to shed load or shape a producer; `QueueDepthGate` builds the
+        blocking form on top."""
+        if max_depth < 0:
+            raise ValueError(f"max_depth must be >= 0, got {max_depth}")
+        rows = await self._fetch("queue_depth", {"queue": queue, "max_depth": max_depth})
+        return int(rows[0]["headroom"]) if rows else 0
+
     # ------------------------------------------------------------- worker side
     async def claim(
         self,

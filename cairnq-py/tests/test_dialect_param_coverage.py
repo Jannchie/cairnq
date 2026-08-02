@@ -74,6 +74,7 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     await store.cancel(task.id)
     await store.retry(task.id, reset_attempt=False)
     await store.stats()
+    await store.queue_depth("default", 10)
     await store.purge(older_than_ms=0, limit=10)
 
 

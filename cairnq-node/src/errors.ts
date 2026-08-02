@@ -37,6 +37,24 @@ export class AlreadyExists extends CairnQError {
   }
 }
 
+/** A gated submit waited out `maxWaitMs` without the queue draining below its
+ * depth limit. Nothing was enqueued. Distinct from a slow submit on purpose: a
+ * queue this far behind is a capacity problem, and a caller that silently
+ * retries forever converts it into an invisible one. */
+export class QueueFull extends CairnQError {
+  constructor(
+    public queue: string,
+    public maxDepth: number,
+    public waitedMs: number,
+  ) {
+    super(
+      `queue ${queue} still holds ${maxDepth} or more queued tasks after ` +
+        `${waitedMs}ms; refusing to enqueue more`,
+    );
+    this.name = "QueueFull";
+  }
+}
+
 /** One line of "why hasn't this finished" from the last snapshot wait()
  * observed. No worker running, no handler for the name, wrong queue, and two
  * processes on different database files all look identical from the API side —

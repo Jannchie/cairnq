@@ -136,6 +136,25 @@ and a JSON protocol.
   survived (a failed claim, a store write that blew up while finalizing) —
   without it those are silent.
 
+- **Backpressure**, so a producer that outruns its workers is bounded by
+  something other than disk. Give the client a depth limit and `submit` blocks
+  while the queue is at it, then raises `QueueFull` rather than waiting forever:
+
+  ```python
+  tasks = CairnQ.postgres(dsn, max_queue_depth={"gpu": 2_000}, max_queue_wait_ms=60_000)
+  ```
+
+  `queue_depth(queue, max_depth)` is the same read without the blocking, for a
+  producer that would rather shed load than wait — bounded at `max_depth` index
+  entries, so it stays cheap to ask on every enqueue. The limit is soft across
+  several producers (see PROTOCOL.md).
+
+  On the worker side, `max_in_flight_bytes` / `maxInFlightBytes` bounds resident
+  payload bytes rather than task count. `concurrency` alone does not: a worker
+  sized for small payloads holds `concurrency * largest-payload` bytes the moment
+  a batch of big ones arrives, which for payloads carrying media inline is the
+  difference between megabytes and gigabytes.
+
 ### At-least-once, not exactly-once
 
 A worker can finish an external side effect and then crash before recording

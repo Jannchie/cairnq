@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import signal
 from typing import Any, Callable, Literal
 
@@ -50,6 +51,23 @@ def _timeout_envelope(name: str, max_run_ms: int) -> dict[str, Any]:
         "the attempt was abandoned",
         retryable=True,
     )
+
+
+def _payload_bytes(task: Task) -> int:
+    """Resident size of a task's payload, for the max_in_flight_bytes budget.
+
+    Measured by re-serializing rather than read off the row: a jsonb-aware driver
+    (asyncpg) hands back an already-decoded object with no wire length attached,
+    so there is nothing to read there. What the budget is really after is the
+    memory a payload pins while its handler runs, and its JSON length tracks that
+    closely enough to size one by."""
+    try:
+        return len(json.dumps(task.payload, ensure_ascii=False).encode())
+    except (TypeError, ValueError):
+        # Unmeasurable, and it came out of the store, so it is already resident:
+        # charging nothing under-counts, but failing the claim over an accounting
+        # detail would drop a task the worker can otherwise run.
+        return 0
 
 
 def _consume_result(task: asyncio.Task) -> None:
@@ -111,10 +129,13 @@ class Worker:
         retry_backoff_ms: int = DEFAULT_RETRY_BACKOFF_MS,
         retry_backoff_max_ms: int = DEFAULT_RETRY_BACKOFF_MAX_MS,
         max_run_ms: int | None = None,
+        max_in_flight_bytes: int | None = None,
         on_error: OnError | None = None,
     ):
         if max_run_ms is not None and max_run_ms <= 0:
             raise ValueError(f"max_run_ms must be > 0, got {max_run_ms}")
+        if max_in_flight_bytes is not None and max_in_flight_bytes <= 0:
+            raise ValueError(f"max_in_flight_bytes must be > 0, got {max_in_flight_bytes}")
         self._store = store
         self._queues = list(queues)
         self._concurrency = concurrency
@@ -130,6 +151,21 @@ class Worker:
         # task `running` (and its concurrency slot) forever — cancel can't help,
         # cooperative checks need a live handler. None disables the ceiling.
         self._max_run_ms = max_run_ms
+        # Resident payload bytes allowed across running handlers, independent of
+        # their count. `concurrency` bounds tasks, not memory, so a worker sized
+        # for small payloads holds concurrency * largest-payload bytes the moment
+        # a batch of big ones arrives — for payloads carrying media inline, the
+        # difference between megabytes and gigabytes resident. Once spent, the
+        # worker stops claiming until running handlers give it back.
+        #
+        # The bound is on tasks already executing: a claim commits to a whole
+        # batch before any size is known, so one batch can overshoot by up to
+        # `claim_batch` payloads (lower it to tighten that), and a single payload
+        # larger than the whole budget still runs — alone, rather than
+        # deadlocking the worker. None disables the budget, and the measurement
+        # with it.
+        self._max_in_flight_bytes = max_in_flight_bytes
+        self._in_flight_bytes = 0
         # Called for errors the worker survived — a claim that threw, a store
         # write that failed while finalizing a task. Without it these are silent:
         # the run loop carries on either way, so this is the only place an
@@ -269,7 +305,17 @@ class Worker:
         try:
             while not self._stop.is_set():
                 free = concurrency - len(running)
-                if free <= 0:
+                # Two ceilings, either of which stops the claim: task count and
+                # resident payload bytes. The byte arm is guarded on `running`
+                # being non-empty because it must never be the reason we wait on
+                # an empty set — asyncio.wait(set()) raises. With nothing
+                # running, nothing is resident, so the budget cannot be what is
+                # holding us back anyway.
+                over_budget = (
+                    self._max_in_flight_bytes is not None
+                    and self._in_flight_bytes >= self._max_in_flight_bytes
+                )
+                if running and (free <= 0 or over_budget):
                     # Wait for a slot rather than polling for one. _execute never
                     # raises, so waiting on it cannot surface an exception here.
                     await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
@@ -298,12 +344,26 @@ class Worker:
                     await self._idle(self._poll)
                     continue
                 for task in claimed:
+                    # Charged before the handler starts and refunded when it
+                    # settles, so the budget covers exactly the span the payload
+                    # is pinned in memory.
+                    charged = 0 if self._max_in_flight_bytes is None else _payload_bytes(task)
+                    self._in_flight_bytes += charged
                     fut = asyncio.create_task(self._execute(task))
                     running.add(fut)
                     fut.add_done_callback(running.discard)
+                    fut.add_done_callback(
+                        lambda _f, size=charged: self._release_bytes(size)
+                    )
         finally:
             if running:
                 await asyncio.gather(*running, return_exceptions=True)
+
+    def _release_bytes(self, size: int) -> None:
+        """Refund a finished handler's payload charge. Clamped at zero: the
+        budget is an accounting aid, and a running total that drifted negative
+        would silently widen it for every task after."""
+        self._in_flight_bytes = max(0, self._in_flight_bytes - size)
 
     async def _execute(self, task: Task) -> None:
         """Run one task to completion. Never raises: a task-level failure is

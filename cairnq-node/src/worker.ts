@@ -34,6 +34,25 @@ export interface WorkerOptions {
    */
   maxRunMs?: number;
   /**
+   * Resident payload bytes allowed across running handlers, independent of
+   * their count.
+   *
+   * `concurrency` bounds tasks, not memory, so a worker sized for small payloads
+   * holds concurrency * largest-payload bytes the moment a batch of big ones
+   * arrives — for payloads that carry media inline, that is the difference
+   * between megabytes and gigabytes resident. Once the budget is spent the
+   * worker stops claiming until running handlers give it back.
+   *
+   * The bound is on tasks already executing. A claim commits to a whole batch
+   * before any size is known, so one batch can overshoot by up to `claimBatch`
+   * payloads; lower `claimBatch` to tighten that. A single payload larger than
+   * the entire budget still runs — alone, rather than deadlocking the worker.
+   *
+   * Costs one JSON serialization per task to measure, so it is only computed
+   * when set. Unset disables the budget.
+   */
+  maxInFlightBytes?: number;
+  /**
    * Called for errors the worker survived — a claim that threw, a store write
    * that failed while finalizing a task. Without it these are silent: the run
    * loop carries on either way, so this is the only place an operator learns a
@@ -82,9 +101,31 @@ function timeoutEnvelope(name: string, maxRunMs: number): Record<string, unknown
 
 const TIMED_OUT = Symbol("cairnq.timedOut");
 
+/**
+ * Resident size of a task's payload, for the maxInFlightBytes budget.
+ *
+ * Measured by re-serializing rather than read off the row: a jsonb-aware driver
+ * (Postgres `pg`) hands back an already-decoded object with no wire length
+ * attached, so there is nothing to read there. What the budget is really after
+ * is the memory a payload pins while its handler runs, and its JSON length
+ * tracks that closely enough to size one by.
+ */
+function payloadBytes(task: Task): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(task.payload) ?? "");
+  } catch {
+    // Unmeasurable, and it came out of the store, so it is already resident:
+    // charging nothing under-counts, but failing the claim over an accounting
+    // detail would drop a task the worker can otherwise run.
+    return 0;
+  }
+}
+
 export class Worker {
   private readonly handlers = new Map<string, Handler>();
   private readonly workerId = newId("worker");
+  /** Payload bytes charged to running handlers — see maxInFlightBytes. */
+  private inFlightBytes = 0;
   private stopped = false;
   private stopWake!: () => void;
   // Resolved once by stop(); every sleep races against it. A stopped worker
@@ -208,9 +249,16 @@ export class Worker {
     running: Set<Promise<void>>,
   ): Promise<void> {
     const pollMs = this.opts.pollIntervalMs ?? 500;
+    const byteBudget = this.opts.maxInFlightBytes;
     while (!this.stopped) {
       const free = concurrency - running.size;
-      if (free <= 0) {
+      // Two ceilings, either of which stops the claim: task count and resident
+      // payload bytes. The byte arm is guarded on running.size because it must
+      // never be the reason we race an empty set — Promise.race([]) is pending
+      // forever, past even stop(). With nothing running, nothing is resident, so
+      // the budget cannot be the thing holding us back anyway.
+      const overBudget = byteBudget != null && this.inFlightBytes >= byteBudget;
+      if (running.size > 0 && (free <= 0 || overBudget)) {
         // Wait for a slot rather than spinning. execute() never rejects, so
         // racing these is safe.
         await Promise.race([...running]);
@@ -241,7 +289,14 @@ export class Worker {
         continue;
       }
       for (const task of claimed) {
-        const p = this.execute(task, leaseMs).finally(() => running.delete(p));
+        // Charged before the handler starts and refunded when it settles, so the
+        // budget covers exactly the span the payload is pinned in memory.
+        const bytes = byteBudget == null ? 0 : payloadBytes(task);
+        this.inFlightBytes += bytes;
+        const p = this.execute(task, leaseMs).finally(() => {
+          this.inFlightBytes -= bytes;
+          running.delete(p);
+        });
         running.add(p);
       }
     }

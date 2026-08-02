@@ -1,0 +1,32 @@
+{
+  "name": "queue_depth",
+  "description": "queue_depth returns headroom under max_depth, saturating at 0, counting queued tasks of one queue only — a claimed task frees headroom again",
+  "steps": [
+    { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "empty" },
+    { "op": "expect", "target": "$empty", "equalsRef": 3 },
+
+    { "op": "submit", "args": { "name": "a", "payload": {}, "queue": "q1" } },
+    { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "one" },
+    { "op": "expect", "target": "$one", "equalsRef": 2 },
+
+    { "op": "submit", "args": { "name": "b", "payload": {}, "queue": "q1" } },
+    { "op": "submit", "args": { "name": "c", "payload": {}, "queue": "q1" } },
+    { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "full" },
+    { "op": "expect", "target": "$full", "equalsRef": 0 },
+
+    { "op": "submit", "args": { "name": "d", "payload": {}, "queue": "q1" } },
+    { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "over" },
+    { "op": "expect", "target": "$over", "equalsRef": 0 },
+
+    { "op": "queue_depth", "args": { "queue": "q2", "max_depth": 3 }, "save": "other" },
+    { "op": "expect", "target": "$other", "equalsRef": 3 },
+
+    { "op": "claim", "args": { "queues": ["q1"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "afterClaim" },
+    { "op": "expect", "target": "$afterClaim", "equalsRef": 0 },
+
+    { "op": "claim", "args": { "queues": ["q1"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "afterSecondClaim" },
+    { "op": "expect", "target": "$afterSecondClaim", "equalsRef": 1 }
+  ]
+}

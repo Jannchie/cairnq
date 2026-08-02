@@ -201,7 +201,7 @@ statement snapshots). Pinned by `key_reuse_after_purge`.
 ## Operations
 
 Client-side (API role): `submit`, `get`, `get_by_key`, `list`, `stats`,
-`cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus
+`queue_depth`, `cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus
 SDK-orchestrated `wait` / `call`. Worker-side: `claim`, `heartbeat`,
 `progress`, `complete`, `succeed`, `fail`.
 
@@ -209,6 +209,17 @@ SDK-orchestrated `wait` / `call`. Worker-side: `claim`, `heartbeat`,
 (`stats.sql`). SDKs zero-fill the statuses a queue has no rows in; a queue with
 no rows at all does not appear. Terminal tasks keep counting until `purge`
 removes them, so the numbers describe the database, not just the live backlog.
+
+`queue_depth` is the bounded one, and the read behind backpressure: it returns
+**headroom** — how many more tasks fit on one queue under a caller-supplied
+`max_depth` — rather than a depth. Wrapping the count in a `LIMIT :max_depth`
+subquery is what makes it affordable to ask often: it reads at most `max_depth`
+index entries off `cairnq_tasks_claim_idx`, where `stats` aggregates the whole
+table. Headroom saturates at 0 rather than going negative. It counts `queued`
+only: a running task already has a worker and is bounded by that worker's
+concurrency, so the backlog worth pushing back on is work nobody has picked up.
+Delayed tasks (`run_at_ms` in the future) count — they are queued work that will
+run, and excluding them would let an unbounded pile of them through a gate.
 
 `claim` first runs a read-only `claimable_probe` (SQLite only); only if it reports
 work does it open the `BEGIN IMMEDIATE` write transaction (recover expired leases +
@@ -368,6 +379,20 @@ CairnQ targets same-host coordination. Know the edges:
   (the cutoff is a runtime value), so it scans. Measured with 20k leases in flight:
   1.5ms on a 20k-row table, 25ms once 300k terminal rows have piled up behind them.
   Retention is the lever there, not an index.
+- **A queue depth limit is a soft limit.** The gate behind `max_queue_depth` is a
+  `queue_depth` read followed by an `insert_task` other producers can interleave
+  with, and each producer holds a grant of up to 64 submits on one probe's word,
+  so N producers can overshoot the limit by up to (N-1) * 64 tasks. Making it
+  exact would mean putting the depth predicate inside `insert_task`'s
+  transaction, which is an unbounded scan on the hot path of every submit and
+  turns concurrent submits into lock contention — a steep price for a bound whose
+  whole purpose is approximate. Size the limit for the pushback you want, not as
+  a capacity assertion.
+- **A worker's byte budget bounds what is already executing.** `max_in_flight_bytes`
+  is consulted between claims, and a claim commits to a whole batch before any
+  payload's size is known, so one batch can overshoot by up to `claim_batch`
+  payloads; lower `claim_batch` to tighten it. A single payload larger than the
+  entire budget still runs — alone, rather than deadlocking the worker.
 - **No in-database authorization.** Unlike a Postgres role model, any process that
   can open the SQLite file has full read/write access and executes SQL directly.
   Protect the file with OS permissions; treat DB access as full trust.

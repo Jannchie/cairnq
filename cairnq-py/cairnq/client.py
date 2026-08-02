@@ -3,29 +3,69 @@ from __future__ import annotations
 from typing import Any
 
 from ._wait import DEFAULT_POLL_MS, poll_wait
+from .backpressure import (
+    DEFAULT_MAX_WAIT_MS,
+    INITIAL_POLL_MS,
+    QueueDepthGate,
+    QueueDepthLimit,
+)
 from .errors import TaskCanceled, TaskFailed
 from .models import Task, TaskDef, TaskStatus, task_name
 from .store.base import Conflict, TaskStore
 from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
 
+#: Constructor arguments that configure the client rather than its store, so
+#: CairnQ.sqlite/.postgres can forward the rest verbatim.
+_CLIENT_KWARGS = ("max_queue_depth", "max_queue_wait_ms", "queue_poll_interval_ms")
+
+
+def _split_client_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Separate client options from store options. Only names actually passed
+    move across, so an omitted one keeps the constructor's default rather than
+    being pinned here."""
+    client = {k: kwargs.pop(k) for k in _CLIENT_KWARGS if k in kwargs}
+    return client, kwargs
+
 
 class CairnQ:
     """The API-side handle. Thin wrapper over a TaskStore plus SDK-orchestrated
     wait/call polling."""
 
-    def __init__(self, store: TaskStore):
+    def __init__(
+        self,
+        store: TaskStore,
+        *,
+        max_queue_depth: QueueDepthLimit | None = None,
+        max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
+        queue_poll_interval_ms: int = INITIAL_POLL_MS,
+    ):
         self._store = store
+        # Backpressure is client-side policy, like wait/call polling: the store
+        # keeps offering an ungated submit for callers that want to gate it
+        # themselves (or not at all).
+        self._gate = (
+            None
+            if max_queue_depth is None
+            else QueueDepthGate(
+                store,
+                max_queue_depth,
+                max_queue_wait_ms=max_queue_wait_ms,
+                queue_poll_interval_ms=queue_poll_interval_ms,
+            )
+        )
 
     @classmethod
     def sqlite(cls, path: str, **kwargs: Any) -> "CairnQ":
-        return cls(SQLiteStore(path, **kwargs))
+        client, store = _split_client_kwargs(kwargs)
+        return cls(SQLiteStore(path, **store), **client)
 
     @classmethod
     def postgres(cls, dsn: str, **kwargs: Any) -> "CairnQ":
         """Multi-host backend. `dsn` is a libpq connection string; requires the
         optional asyncpg package (install cairnq[postgres])."""
-        return cls(PostgresStore(dsn, **kwargs))
+        client, store = _split_client_kwargs(kwargs)
+        return cls(PostgresStore(dsn, **store), **client)
 
     @property
     def store(self) -> TaskStore:
@@ -53,6 +93,12 @@ class CairnQ:
         correlation_id: str | None = None,
         run_at_delay_ms: int = 0,
     ) -> Task:
+        """Enqueue a task. With `max_queue_depth` configured this blocks while
+        the target queue is at its limit, and raises QueueFull if it stays there
+        for `max_queue_wait_ms` — see QueueDepthGate for why that bound is
+        approximate across several producers."""
+        if self._gate is not None:
+            await self._gate.acquire(queue)
         return await self._store.submit(
             name=task_name(name),
             payload=payload,
@@ -118,6 +164,14 @@ class CairnQ:
         """Task counts per queue, keyed by status and zero-filled across all
         statuses — `stats()["default"]["queued"]` is the backlog of a queue."""
         return await self._store.stats()
+
+    async def queue_depth(self, queue: str, max_depth: int) -> int:
+        """How many more tasks fit on `queue` under `max_depth` — 0 once it is
+        full. The non-blocking read behind `max_queue_depth`, for a producer that
+        would rather shed load or pick another queue than wait. Cheaper than
+        `stats()`: bounded at `max_depth` index entries instead of aggregating
+        the table."""
+        return await self._store.queue_depth(queue, max_depth)
 
     async def wait(
         self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS
