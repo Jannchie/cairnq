@@ -404,6 +404,14 @@ CairnQ targets same-host coordination. Know the edges:
 `cairnq_meta` holds `protocol_version` and `schema_version`. On startup an SDK
 reads `protocol_version` and refuses to run if its supported major differs.
 
+Adding a **statement** moves neither number. Statements live in the SDK (vendored
+from `sql/<dialect>/` at publish time), not in the database, so a new one is
+available the moment the SDK carrying it is installed, and an older SDK against a
+newer database simply has no such statement to call and needs none — `queue_depth`
+was added this way. `schema_version` moves only for a migration, i.e. something
+that changes the tables; `protocol_version` moves only for a change to the
+contract that an existing SDK could get wrong.
+
 Ordinals are **one sequence shared by both dialects**, so a dialect may have no
 file at an ordinal — `0003` is the Postgres-only LISTEN/NOTIFY trigger, and SQLite
 goes 0001, 0002, 0004, 0005. A migration that closes an ordinal sets
