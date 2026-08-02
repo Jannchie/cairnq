@@ -144,6 +144,10 @@ and a JSON protocol.
   tasks = CairnQ.postgres(dsn, max_queue_depth={"gpu": 2_000}, max_queue_wait_ms=60_000)
   ```
 
+  The limit is installed on the store, so it holds for every submit — including
+  the `ctx.submit` a handler uses to spawn children, which is why `Worker` takes
+  the same option (a worker process has no client handle to have set it).
+
   `queue_depth(queue, max_depth)` is the same read without the blocking, for a
   producer that would rather shed load than wait — bounded at `max_depth` index
   entries, so it stays cheap to ask on every enqueue. The limit is soft across

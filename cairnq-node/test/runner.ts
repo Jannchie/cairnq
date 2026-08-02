@@ -95,6 +95,7 @@ export class Runner {
           priority: a.priority,
           metadata: a.metadata,
           correlationId: a.correlation_id,
+          runAtDelayMs: a.run_at_delay_ms,
         });
       case "get":
         return c.get(a.id);

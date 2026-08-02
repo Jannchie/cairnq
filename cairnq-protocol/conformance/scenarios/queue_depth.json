@@ -1,6 +1,6 @@
 {
   "name": "queue_depth",
-  "description": "queue_depth returns headroom under max_depth, saturating at 0, counting queued tasks of one queue only — a claimed task frees headroom again",
+  "description": "queue_depth returns headroom under max_depth, saturating at 0, counting queued tasks of one queue only — a claimed task frees headroom again, while a delayed one still counts",
   "steps": [
     { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "empty" },
     { "op": "expect", "target": "$empty", "equalsRef": 3 },
@@ -20,6 +20,10 @@
 
     { "op": "queue_depth", "args": { "queue": "q2", "max_depth": 3 }, "save": "other" },
     { "op": "expect", "target": "$other", "equalsRef": 3 },
+
+    { "op": "submit", "args": { "name": "e", "payload": {}, "queue": "q2", "run_at_delay_ms": 60000 } },
+    { "op": "queue_depth", "args": { "queue": "q2", "max_depth": 3 }, "save": "delayed" },
+    { "op": "expect", "target": "$delayed", "equalsRef": 2 },
 
     { "op": "claim", "args": { "queues": ["q1"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
     { "op": "queue_depth", "args": { "queue": "q1", "max_depth": 3 }, "save": "afterClaim" },

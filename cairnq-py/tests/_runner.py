@@ -93,6 +93,7 @@ class Runner:
                 conflict=a.get("conflict", "reuse"),
                 max_attempts=a.get("max_attempts", 3), priority=a.get("priority", 0),
                 metadata=a.get("metadata"), correlation_id=a.get("correlation_id"),
+                run_at_delay_ms=a.get("run_at_delay_ms", 0),
             )
         if op == "get":
             return await c.get(a["id"])

@@ -18,8 +18,12 @@ if TYPE_CHECKING:
 #: (N-1) * MAX_GRANT rather than unbounded.
 MAX_GRANT = 64
 
-INITIAL_POLL_MS = 250
-MAX_POLL_MS = 5_000
+# Named for probing, not polling: _wait.py exports DEFAULT_POLL_MS / MAX_POLL_MS
+# for the get() loop behind wait(), an order of magnitude tighter and answering a
+# different question. Two constants of the same name in one SDK would be read as
+# one policy.
+INITIAL_PROBE_INTERVAL_MS = 250
+MAX_PROBE_INTERVAL_MS = 5_000
 DEFAULT_MAX_WAIT_MS = 600_000
 
 #: Per-queue depth limits. An int applies one limit to every queue; a dict gates
@@ -52,12 +56,12 @@ class QueueDepthGate:
         max_queue_depth: QueueDepthLimit,
         *,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
-        queue_poll_interval_ms: int = INITIAL_POLL_MS,
+        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
     ):
         self._store = store
         self._limits = max_queue_depth
         self._max_wait_ms = max_queue_wait_ms
-        self._initial_poll_ms = queue_poll_interval_ms
+        self._initial_probe_ms = queue_poll_interval_ms
         #: Remaining grant per queue: submits allowed before the next probe.
         self._headroom: dict[str, int] = {}
         #: In-flight probe per queue, so concurrent submits share one read rather
@@ -93,7 +97,7 @@ class QueueDepthGate:
             return
 
         started_at = time.monotonic()
-        wait_ms = self._initial_poll_ms
+        wait_ms = self._initial_probe_ms
         while True:
             left = self._headroom.get(queue, 0)
             if left > 0:
@@ -110,7 +114,7 @@ class QueueDepthGate:
             # interval, and re-probing tightly adds read load to a database
             # already behind.
             await asyncio.sleep(min(wait_ms, self._max_wait_ms - waited_ms) / 1000)
-            wait_ms = min(wait_ms * 2, MAX_POLL_MS)
+            wait_ms = min(wait_ms * 2, MAX_PROBE_INTERVAL_MS)
 
     async def _probe(self, queue: str, limit: int) -> None:
         """Refresh `queue`'s grant from the store, at most one probe in flight.

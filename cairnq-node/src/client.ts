@@ -1,4 +1,4 @@
-import { type BackpressureOptions, QueueDepthGate } from "./backpressure.js";
+import type { BackpressureOptions } from "./backpressure.js";
 import { TaskCanceled, TaskFailed } from "./errors.js";
 import { isFailed, isSucceeded, type Task, type TaskStatus } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
@@ -13,25 +13,21 @@ export interface CallOptions extends SubmitOptions {
   pollMs?: number;
 }
 
-/** Client options that are not a store's own. Backpressure lives here rather
- * than on the store because it is SDK-orchestrated policy, like wait/call: the
- * store keeps offering an ungated `submit`. */
+/** Options this handle configures on the store it wraps, rather than the
+ * store's own constructor arguments. */
 export type ClientOptions = Partial<BackpressureOptions>;
-
-const DEFAULT_QUEUE = "default";
 
 /** API-side handle. Thin wrapper over a TaskStore + SDK-orchestrated wait/call. */
 export class CairnQ {
-  private readonly gate: QueueDepthGate | null;
-
   constructor(
     private readonly _store: TaskStore,
     opts: ClientOptions = {},
   ) {
-    this.gate =
-      opts.maxQueueDepth == null
-        ? null
-        : new QueueDepthGate(_store, opts as BackpressureOptions);
+    // Installed on the store, not held here: every submit path goes through the
+    // store, including TaskContext.submit, which this handle never sees.
+    if (opts.maxQueueDepth != null) {
+      _store.useBackpressure(opts as BackpressureOptions);
+    }
   }
 
   static sqlite(path: string, opts: { busyTimeoutMs?: number } & ClientOptions = {}): CairnQ {
@@ -64,12 +60,7 @@ export class CairnQ {
    * across several producers. */
   submit(name: string, payload?: unknown, opts?: SubmitOptions): Promise<Task>;
   submit<P, R>(task: TaskDef<P, R>, payload?: P, opts?: SubmitOptions): Promise<Task>;
-  async submit(
-    task: string | TaskDef,
-    payload?: unknown,
-    opts: SubmitOptions = {},
-  ): Promise<Task> {
-    if (this.gate) await this.gate.acquire(opts.queue ?? DEFAULT_QUEUE);
+  submit(task: string | TaskDef, payload?: unknown, opts: SubmitOptions = {}): Promise<Task> {
     return this._store.submit({ name: taskName(task), payload, ...opts });
   }
 

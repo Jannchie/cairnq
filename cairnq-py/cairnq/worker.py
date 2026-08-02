@@ -8,6 +8,11 @@ import signal
 from typing import Any, Callable, Literal
 
 from ._ids import new_id
+from .backpressure import (
+    DEFAULT_MAX_WAIT_MS,
+    INITIAL_PROBE_INTERVAL_MS,
+    QueueDepthLimit,
+)
 from .context import TaskContext
 from .errors import LostLease, SerializationError, TaskError, error_envelope
 from .models import Task, TaskDef, task_name
@@ -53,16 +58,27 @@ def _timeout_envelope(name: str, max_run_ms: int) -> dict[str, Any]:
     )
 
 
+# Module-level for the same reason store/base.py keeps one: json.dumps builds a
+# fresh JSONEncoder for any non-default kwarg, which on the claim path would be
+# per-task construction for nothing. Separators match dump_json so a payload
+# measures the same as it was stored.
+_SIZE_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+
+
 def _payload_bytes(task: Task) -> int:
     """Resident size of a task's payload, for the max_in_flight_bytes budget.
 
-    Measured by re-serializing rather than read off the row: a jsonb-aware driver
-    (asyncpg) hands back an already-decoded object with no wire length attached,
-    so there is nothing to read there. What the budget is really after is the
-    memory a payload pins while its handler runs, and its JSON length tracks that
-    closely enough to size one by."""
+    Re-serializes because by this point the wire form is gone. Both Python
+    backends do hand one back — asyncpg registers no jsonb codec, so
+    `Task.from_row` holds the serialized str right up until json.loads discards
+    it — and capturing its length there would make this free, at the cost of
+    carrying a non-protocol field on Task in both SDKs. Left for when this shows
+    up in a profile.
+
+    What the budget is really after is the memory a payload pins while its
+    handler runs, and its JSON length tracks that closely enough to size one by."""
     try:
-        return len(json.dumps(task.payload, ensure_ascii=False).encode())
+        return len(_SIZE_ENCODER.encode(task.payload).encode())
     except (TypeError, ValueError):
         # Unmeasurable, and it came out of the store, so it is already resident:
         # charging nothing under-counts, but failing the claim over an accounting
@@ -130,12 +146,25 @@ class Worker:
         retry_backoff_max_ms: int = DEFAULT_RETRY_BACKOFF_MAX_MS,
         max_run_ms: int | None = None,
         max_in_flight_bytes: int | None = None,
+        # Backpressure is accepted here too, not only on CairnQ: a handler
+        # spawning children through TaskContext.submit is a producer, and in a
+        # worker process there is usually no CairnQ handle to have configured
+        # the store.
+        max_queue_depth: QueueDepthLimit | None = None,
+        max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
+        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
         on_error: OnError | None = None,
     ):
         if max_run_ms is not None and max_run_ms <= 0:
             raise ValueError(f"max_run_ms must be > 0, got {max_run_ms}")
         if max_in_flight_bytes is not None and max_in_flight_bytes <= 0:
             raise ValueError(f"max_in_flight_bytes must be > 0, got {max_in_flight_bytes}")
+        if max_queue_depth is not None:
+            store.use_backpressure(
+                max_queue_depth,
+                max_queue_wait_ms=max_queue_wait_ms,
+                queue_poll_interval_ms=queue_poll_interval_ms,
+            )
         self._store = store
         self._queues = list(queues)
         self._concurrency = concurrency
@@ -349,21 +378,17 @@ class Worker:
                     # is pinned in memory.
                     charged = 0 if self._max_in_flight_bytes is None else _payload_bytes(task)
                     self._in_flight_bytes += charged
+
+                    def settled(fut: asyncio.Task, size: int = charged) -> None:
+                        running.discard(fut)
+                        self._in_flight_bytes -= size
+
                     fut = asyncio.create_task(self._execute(task))
                     running.add(fut)
-                    fut.add_done_callback(running.discard)
-                    fut.add_done_callback(
-                        lambda _f, size=charged: self._release_bytes(size)
-                    )
+                    fut.add_done_callback(settled)
         finally:
             if running:
                 await asyncio.gather(*running, return_exceptions=True)
-
-    def _release_bytes(self, size: int) -> None:
-        """Refund a finished handler's payload charge. Clamped at zero: the
-        budget is an accounting aid, and a running total that drifted negative
-        would silently widen it for every task after."""
-        self._in_flight_bytes = max(0, self._in_flight_bytes - size)
 
     async def _execute(self, task: Task) -> None:
         """Run one task to completion. Never raises: a task-level failure is

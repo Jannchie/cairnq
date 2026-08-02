@@ -379,10 +379,12 @@ CairnQ targets same-host coordination. Know the edges:
   (the cutoff is a runtime value), so it scans. Measured with 20k leases in flight:
   1.5ms on a 20k-row table, 25ms once 300k terminal rows have piled up behind them.
   Retention is the lever there, not an index.
-- **A queue depth limit is a soft limit.** The gate behind `max_queue_depth` is a
-  `queue_depth` read followed by an `insert_task` other producers can interleave
-  with, and each producer holds a grant of up to 64 submits on one probe's word,
-  so N producers can overshoot the limit by up to (N-1) * 64 tasks. Making it
+- **A queue depth limit is a soft limit.** The gate behind `max_queue_depth` sits
+  on the store, so every submit passes it — including `TaskContext.submit`, the
+  fan-out path a handler uses to spawn children. It is a `queue_depth` read
+  followed by an `insert_task` other producers can interleave with, and each
+  producer holds a grant of up to 64 submits on one probe's word, so N producers
+  can overshoot the limit by up to (N-1) * 64 tasks. Making it
   exact would mean putting the depth predicate inside `insert_task`'s
   transaction, which is an unbounded scan on the hot path of every submit and
   turns concurrent submits into lock contention — a steep price for a bound whose

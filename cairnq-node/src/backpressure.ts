@@ -13,8 +13,12 @@ import type { TaskStore } from "./store/base.js";
  */
 const MAX_GRANT = 64;
 
-const INITIAL_POLL_MS = 250;
-const MAX_POLL_MS = 5_000;
+// Named for probing, not polling: wait.ts exports DEFAULT_POLL_MS / MAX_POLL_MS
+// for the get() loop behind wait(), an order of magnitude tighter and answering
+// a different question. Two constants of the same name in one SDK would be read
+// as one policy.
+const INITIAL_PROBE_INTERVAL_MS = 250;
+const MAX_PROBE_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_WAIT_MS = 600_000;
 
 /** Per-queue depth limits. A number applies one limit to every queue; a record
@@ -56,7 +60,7 @@ export class QueueDepthGate {
   private readonly probing = new Map<string, Promise<void>>();
   private readonly limits: QueueDepthLimit;
   private readonly maxWaitMs: number;
-  private readonly initialPollMs: number;
+  private readonly initialProbeMs: number;
 
   constructor(
     private readonly store: TaskStore,
@@ -64,7 +68,7 @@ export class QueueDepthGate {
   ) {
     this.limits = opts.maxQueueDepth;
     this.maxWaitMs = opts.maxQueueWaitMs ?? DEFAULT_MAX_WAIT_MS;
-    this.initialPollMs = opts.queuePollIntervalMs ?? INITIAL_POLL_MS;
+    this.initialProbeMs = opts.queuePollIntervalMs ?? INITIAL_PROBE_INTERVAL_MS;
     if (typeof this.limits === "number") this.validate("*", this.limits);
     else for (const [q, v] of Object.entries(this.limits)) this.validate(q, v);
   }
@@ -94,7 +98,7 @@ export class QueueDepthGate {
     if (limit == null) return;
 
     const startedAt = Date.now();
-    let waitMs = this.initialPollMs;
+    let waitMs = this.initialProbeMs;
     for (;;) {
       const left = this.headroom.get(queue) ?? 0;
       if (left > 0) {
@@ -109,7 +113,7 @@ export class QueueDepthGate {
       // Back off: a queue at its limit will not drain within one poll interval,
       // and re-probing tightly adds read load to a database already behind.
       await delay(Math.min(waitMs, this.maxWaitMs - waited));
-      waitMs = Math.min(waitMs * 2, MAX_POLL_MS);
+      waitMs = Math.min(waitMs * 2, MAX_PROBE_INTERVAL_MS);
     }
   }
 

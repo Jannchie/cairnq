@@ -23,6 +23,12 @@ from functools import lru_cache
 from typing import Any, Literal, get_args
 
 from .._ids import new_id
+from ..backpressure import (
+    DEFAULT_MAX_WAIT_MS,
+    INITIAL_PROBE_INTERVAL_MS,
+    QueueDepthGate,
+    QueueDepthLimit,
+)
 from ..errors import (
     AlreadyExists,
     LostLease,
@@ -108,6 +114,29 @@ def statement_params(sql: str) -> tuple[str, ...]:
 
 
 class TaskStore(ABC):
+    #: Set by use_backpressure; None means submit is ungated.
+    _gate: QueueDepthGate | None = None
+
+    def use_backpressure(
+        self,
+        max_queue_depth: QueueDepthLimit,
+        *,
+        max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
+        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
+    ) -> None:
+        """Bound how deep a queue may get before `submit` blocks. Off unless set.
+
+        It hangs here rather than on `CairnQ` because the store is the one choke
+        point every submit passes through — a handler spawning children via
+        `TaskContext.submit` is the shape most likely to outrun its workers, and
+        gating only the client would leave exactly that path unbounded."""
+        self._gate = QueueDepthGate(
+            self,
+            max_queue_depth,
+            max_queue_wait_ms=max_queue_wait_ms,
+            queue_poll_interval_ms=queue_poll_interval_ms,
+        )
+
     # ------------------------------------------------------------ dialect seam
     @abstractmethod
     async def connect(self) -> None: ...
@@ -188,6 +217,10 @@ class TaskStore(ABC):
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         if run_at_delay_ms < 0:
             raise ValueError(f"run_at_delay_ms must be >= 0, got {run_at_delay_ms}")
+        # After validation and before the first write: bad arguments should fail
+        # now, not after waiting out a full queue.
+        if self._gate is not None:
+            await self._gate.acquire(queue)
         task_id = new_id("task")
         ins = {
             "id": task_id,

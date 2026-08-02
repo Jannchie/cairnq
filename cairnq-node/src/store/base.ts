@@ -7,6 +7,7 @@ import {
   SerializationError,
 } from "../errors.js";
 import { rowToTask, STATUSES, type Task, type TaskStatus } from "../models.js";
+import { type BackpressureOptions, QueueDepthGate } from "../backpressure.js";
 
 const rejectMangled = function (this: unknown, _key: string, v: unknown): unknown {
   if (typeof v === "number" && !Number.isFinite(v)) {
@@ -63,6 +64,10 @@ export function checkProtocolVersion(version: number): void {
 // STATUSES/TaskStatus in models.ts).
 const CONFLICTS = ["reuse", "reject", "replace"] as const;
 export type Conflict = (typeof CONFLICTS)[number];
+
+/** The queue a submit lands on when it names none. Owned here, where the
+ * default is applied, so nothing above has to re-derive it. */
+export const DEFAULT_QUEUE = "default";
 
 export interface SubmitInput {
   name: string;
@@ -149,6 +154,9 @@ export function statementParams(sql: string): readonly string[] {
  * behavior; the shared SQL already stops them from drifting in wording.
  */
 export abstract class TaskStore {
+  /** Set by useBackpressure; null means submit is ungated. */
+  private gate: QueueDepthGate | null = null;
+
   // ------------------------------------------------------------ dialect seam
   abstract connect(): Promise<void>;
   abstract close(): Promise<void>;
@@ -211,12 +219,24 @@ export abstract class TaskStore {
   }
 
   // ------------------------------------------------------------- client side
+  /**
+   * Bound how deep a queue may get before `submit` blocks. Off unless set.
+   *
+   * It hangs here rather than on `CairnQ` because the store is the one choke
+   * point every submit passes through — a handler spawning children via
+   * `TaskContext.submit` is the shape most likely to outrun its workers, and
+   * gating only the client would leave exactly that path unbounded.
+   */
+  useBackpressure(opts: BackpressureOptions): void {
+    this.gate = new QueueDepthGate(this, opts);
+  }
+
   async submit(input: SubmitInput): Promise<Task> {
     const id = newId("task");
     const ins: Params = {
       id,
       name: input.name,
-      queue: input.queue ?? "default",
+      queue: input.queue ?? DEFAULT_QUEUE,
       payload: dumpJson(input.payload ?? {}),
       metadata: dumpJson(input.metadata ?? {}),
       max_attempts: input.maxAttempts ?? 3,
@@ -243,6 +263,10 @@ export abstract class TaskStore {
     if (input.runAtDelayMs != null && input.runAtDelayMs < 0) {
       throw new Error(`runAtDelayMs must be >= 0, got ${input.runAtDelayMs}`);
     }
+    // After validation and before the first write: bad arguments should fail
+    // now, not after waiting out a full queue. Reads the resolved queue, so the
+    // gate cannot throttle one queue while the row lands on another.
+    if (this.gate) await this.gate.acquire(ins.queue as string);
     if (key === null) return rowToTask((await this.fetch("insert_task", ins))[0]);
 
     // A key makes submit a read-then-write, so it has to be one transaction —

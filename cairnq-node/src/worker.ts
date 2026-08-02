@@ -1,3 +1,4 @@
+import type { BackpressureOptions } from "./backpressure.js";
 import { TaskContext } from "./context.js";
 import { errorEnvelope, LostLease, SerializationError, TaskError } from "./errors.js";
 import { newId } from "./ids.js";
@@ -14,7 +15,12 @@ export type TypedHandler<P, R> = (ctx: TaskContext, payload: P) => R | Promise<R
 /** Where an error the worker recovered from came from. */
 export type ErrorPhase = "claim" | "execute";
 
-export interface WorkerOptions {
+/**
+ * Backpressure is accepted here too, not only on CairnQ: a handler spawning
+ * children through TaskContext.submit is a producer, and in a worker process
+ * there is usually no CairnQ handle to have configured the store.
+ */
+export interface WorkerOptions extends Partial<BackpressureOptions> {
   concurrency?: number;
   leaseMs?: number;
   heartbeatIntervalMs?: number;
@@ -104,11 +110,15 @@ const TIMED_OUT = Symbol("cairnq.timedOut");
 /**
  * Resident size of a task's payload, for the maxInFlightBytes budget.
  *
- * Measured by re-serializing rather than read off the row: a jsonb-aware driver
- * (Postgres `pg`) hands back an already-decoded object with no wire length
- * attached, so there is nothing to read there. What the budget is really after
- * is the memory a payload pins while its handler runs, and its JSON length
- * tracks that closely enough to size one by.
+ * Re-serializes because by this point the wire form is gone: `pg` parses a jsonb
+ * column with JSON.parse and discards the text, so on Postgres there is nothing
+ * cheaper to read. On SQLite the column does arrive as a string that rowToTask
+ * sees before parsing — capturing its length there would make this free, at the
+ * cost of carrying a non-protocol field on Task in both SDKs. Left for when the
+ * measurement shows up in a profile.
+ *
+ * What the budget is really after is the memory a payload pins while its handler
+ * runs, and its JSON length tracks that closely enough to size one by.
  */
 function payloadBytes(task: Task): number {
   try {
@@ -142,6 +152,14 @@ export class Worker {
   ) {
     if (opts.maxRunMs != null && opts.maxRunMs <= 0) {
       throw new Error(`maxRunMs must be > 0, got ${opts.maxRunMs}`);
+    }
+    // 0 would make the budget permanently spent, so the worker would claim
+    // nothing and look hung. Rejected here, as the Python SDK does.
+    if (opts.maxInFlightBytes != null && opts.maxInFlightBytes <= 0) {
+      throw new Error(`maxInFlightBytes must be > 0, got ${opts.maxInFlightBytes}`);
+    }
+    if (opts.maxQueueDepth != null) {
+      store.useBackpressure(opts as BackpressureOptions);
     }
   }
 

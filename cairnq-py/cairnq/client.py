@@ -5,8 +5,7 @@ from typing import Any
 from ._wait import DEFAULT_POLL_MS, poll_wait
 from .backpressure import (
     DEFAULT_MAX_WAIT_MS,
-    INITIAL_POLL_MS,
-    QueueDepthGate,
+    INITIAL_PROBE_INTERVAL_MS,
     QueueDepthLimit,
 )
 from .errors import TaskCanceled, TaskFailed
@@ -14,18 +13,6 @@ from .models import Task, TaskDef, TaskStatus, task_name
 from .store.base import Conflict, TaskStore
 from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
-
-#: Constructor arguments that configure the client rather than its store, so
-#: CairnQ.sqlite/.postgres can forward the rest verbatim.
-_CLIENT_KWARGS = ("max_queue_depth", "max_queue_wait_ms", "queue_poll_interval_ms")
-
-
-def _split_client_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Separate client options from store options. Only names actually passed
-    move across, so an omitted one keeps the constructor's default rather than
-    being pinned here."""
-    client = {k: kwargs.pop(k) for k in _CLIENT_KWARGS if k in kwargs}
-    return client, kwargs
 
 
 class CairnQ:
@@ -38,34 +25,32 @@ class CairnQ:
         *,
         max_queue_depth: QueueDepthLimit | None = None,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
-        queue_poll_interval_ms: int = INITIAL_POLL_MS,
+        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
     ):
         self._store = store
-        # Backpressure is client-side policy, like wait/call polling: the store
-        # keeps offering an ungated submit for callers that want to gate it
-        # themselves (or not at all).
-        self._gate = (
-            None
-            if max_queue_depth is None
-            else QueueDepthGate(
-                store,
+        # Installed on the store, not held here: every submit path goes through
+        # the store, including TaskContext.submit, which this handle never sees.
+        if max_queue_depth is not None:
+            store.use_backpressure(
                 max_queue_depth,
                 max_queue_wait_ms=max_queue_wait_ms,
                 queue_poll_interval_ms=queue_poll_interval_ms,
             )
-        )
+
+    # The factories name the STORE's options explicitly and forward the rest to
+    # __init__ — the same split Worker.sqlite/.postgres uses, so a new client
+    # option needs no registry kept in sync with this file.
+    @classmethod
+    def sqlite(cls, path: str, *, busy_timeout_ms: int = 5_000, **kwargs: Any) -> "CairnQ":
+        return cls(SQLiteStore(path, busy_timeout_ms=busy_timeout_ms), **kwargs)
 
     @classmethod
-    def sqlite(cls, path: str, **kwargs: Any) -> "CairnQ":
-        client, store = _split_client_kwargs(kwargs)
-        return cls(SQLiteStore(path, **store), **client)
-
-    @classmethod
-    def postgres(cls, dsn: str, **kwargs: Any) -> "CairnQ":
+    def postgres(
+        cls, dsn: str, *, min_size: int = 1, max_size: int = 10, **kwargs: Any
+    ) -> "CairnQ":
         """Multi-host backend. `dsn` is a libpq connection string; requires the
         optional asyncpg package (install cairnq[postgres])."""
-        client, store = _split_client_kwargs(kwargs)
-        return cls(PostgresStore(dsn, **store), **client)
+        return cls(PostgresStore(dsn, min_size=min_size, max_size=max_size), **kwargs)
 
     @property
     def store(self) -> TaskStore:
@@ -97,8 +82,6 @@ class CairnQ:
         the target queue is at its limit, and raises QueueFull if it stays there
         for `max_queue_wait_ms` — see QueueDepthGate for why that bound is
         approximate across several producers."""
-        if self._gate is not None:
-            await self._gate.acquire(queue)
         return await self._store.submit(
             name=task_name(name),
             payload=payload,

@@ -24,42 +24,13 @@ afterEach(async () => {
   await client.close();
 });
 
+// The statement's own semantics — headroom, saturation at 0, queued-only,
+// per-queue isolation, delayed tasks counting — live in the conformance scenario
+// (cairnq-protocol/conformance/scenarios/queue_depth.json), which runs in both
+// SDKs against both dialects. Repeating them here would be strictly weaker
+// coverage in a second place to maintain. What stays is SDK-side validation,
+// which the SQL never sees.
 describe("queueDepth", () => {
-  it("reports headroom against the limit, saturating at zero", async () => {
-    expect(await client.queueDepth("default", 3)).toBe(3);
-    await client.submit("job", {});
-    expect(await client.queueDepth("default", 3)).toBe(2);
-    await client.submit("job", {});
-    await client.submit("job", {});
-    expect(await client.queueDepth("default", 3)).toBe(0);
-    // Past the limit it stays at 0 rather than going negative: the LIMIT
-    // subquery is what keeps the scan bounded, and a gate only needs "no room".
-    await client.submit("job", {});
-    expect(await client.queueDepth("default", 3)).toBe(0);
-  });
-
-  it("counts queued only, so a claimed task frees headroom", async () => {
-    await client.submit("job", {});
-    expect(await client.queueDepth("default", 5)).toBe(4);
-
-    // A running task has a worker and is bounded by that worker's concurrency;
-    // the backlog worth pushing back on is work nobody has picked up.
-    await client.store.claim({ queues: ["default"], workerId: "w1", leaseMs: 5_000 });
-    expect(await client.queueDepth("default", 5)).toBe(5);
-  });
-
-  it("counts delayed tasks — they are queued work that will run", async () => {
-    await client.submit("job", {}, { runAtDelayMs: 60_000 });
-    expect(await client.queueDepth("default", 5)).toBe(4);
-  });
-
-  it("is per queue", async () => {
-    await client.submit("job", {}, { queue: "a" });
-    await client.submit("job", {}, { queue: "a" });
-    expect(await client.queueDepth("a", 5)).toBe(3);
-    expect(await client.queueDepth("b", 5)).toBe(5);
-  });
-
   it("rejects a negative limit rather than reading it as unbounded", async () => {
     await expect(client.queueDepth("default", -1)).rejects.toThrow(/non-negative/);
   });
@@ -86,14 +57,18 @@ describe("QueueDepthGate", () => {
       await gated.submit("job", { i: 1 });
 
       let released = false;
-      const blocked = gated.submit("job", { i: 2 }).then(() => (released = true));
+      const blocked = gated.submit("job", { i: 2 });
+      void blocked.then(() => (released = true));
       await sleep(150);
       expect(released).toBe(false); // still waiting on a full queue
 
       worker.task("job", async () => ({ ok: true }));
       const runner = worker.run();
-      await blocked;
-      expect(released).toBe(true);
+      // Not that it resolved — awaiting it already says that — but that the task
+      // the gate held back actually reached the queue once room appeared.
+      const task = await blocked;
+      expect(task.queue).toBe("default");
+      expect(await client.get(task.id)).not.toBeNull();
 
       worker.stop();
       await runner;
@@ -177,6 +152,42 @@ describe("QueueDepthGate", () => {
     }
   });
 
+  it("gates TaskContext.submit too — a handler spawning children is a producer", async () => {
+    // "blocker" has no handler on this worker, so it is never claimed and holds
+    // the queue at its limit for the whole test — no timing luck involved.
+    await client.submit("parent", {});
+    await client.submit("blocker", {});
+
+    const worker = new Worker(new SQLiteStore(dbPath), ["default"], {
+      concurrency: 1,
+      pollIntervalMs: 10,
+      maxQueueDepth: 1,
+      maxQueueWaitMs: 100,
+      queuePollIntervalMs: 20,
+    });
+    let caught: unknown;
+    worker.task("parent", async (ctx) => {
+      try {
+        await ctx.submit("child", {});
+      } catch (err) {
+        caught = err;
+      }
+      return {};
+    });
+    const runner = worker.run();
+    try {
+      await waitFor(() => caught !== undefined, 3_000);
+      expect(caught).toBeInstanceOf(QueueFull);
+      // Gating the client alone would have let this through: a worker process
+      // has no CairnQ handle, so the fan-out path would be the one unbounded one.
+      expect(await client.list({ name: "child" })).toHaveLength(0);
+    } finally {
+      worker.stop();
+      await runner;
+      await worker.close();
+    }
+  });
+
   it("refuses a limit below 1 at construction, not at the first blocked submit", () => {
     const store = new SQLiteStore(dbPath);
     expect(() => new QueueDepthGate(store, { maxQueueDepth: 0 })).toThrow(/>= 1/);
@@ -199,11 +210,14 @@ describe("maxInFlightBytes", () => {
     });
     let peak = 0;
     let inFlight = 0;
-    const release: (() => void)[] = [];
+    // One gate for every handler, so teardown is a single release — stop() plus
+    // run()'s finally drains whatever was still running.
+    let openGate!: () => void;
+    const gate = new Promise<void>((r) => (openGate = r));
     worker.task("job", async () => {
       inFlight++;
       peak = Math.max(peak, inFlight);
-      await new Promise<void>((r) => release.push(r));
+      await gate;
       inFlight--;
       return {};
     });
@@ -215,9 +229,7 @@ describe("maxInFlightBytes", () => {
       expect(peak).toBeLessThanOrEqual(2);
       expect(peak).toBeGreaterThanOrEqual(1);
     } finally {
-      release.forEach((r) => r());
-      await waitFor(() => release.length === 4, 5_000);
-      release.forEach((r) => r());
+      openGate();
       worker.stop();
       await runner;
       await worker.close();
