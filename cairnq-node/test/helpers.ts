@@ -1,3 +1,5 @@
+import { type CairnQ, isTerminal } from "../src/index.js";
+
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,4 +25,17 @@ export async function waitFor(
     if (await cond()) return;
     await sleep(10);
   }
+}
+
+/**
+ * Whether every id has reached a terminal state. The predicate worker tests wait
+ * on, so `waitFor(() => allTerminal(client, ids))` reads as the thing it is
+ * rather than being respelled per file.
+ */
+export async function allTerminal(client: CairnQ, ids: string[]): Promise<boolean> {
+  for (const id of ids) {
+    const task = await client.get(id);
+    if (!task || !isTerminal(task)) return false;
+  }
+  return true;
 }

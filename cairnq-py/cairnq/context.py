@@ -4,25 +4,48 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from ._backoff import DEFAULT_RETRY_BACKOFF_MAX_MS, DEFAULT_RETRY_BACKOFF_MS, fail_delay_ms
 from ._wait import DEFAULT_POLL_MS, poll_wait
-from .errors import LostLease
+from .errors import LostLease, as_envelope
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
 
 
 class TaskContext:
-    """Handed to a task handler. Worker-side capabilities mirror the TS SDK."""
+    """Handed to a task handler. Worker-side capabilities mirror the TS SDK.
 
-    def __init__(self, store: TaskStore, task: Task, worker_id: str, lease_ms: int):
+    One of these per task, whether a handler is delivered one task or a batch: a
+    batch handler receives a `list[TaskContext]`, so a single-task handler's `ctx`
+    is literally the batch-of-one element. Lease, cancellation and settlement are
+    per task, which is why they live here rather than on anything batch-shaped."""
+
+    def __init__(
+        self,
+        store: TaskStore,
+        task: Task,
+        worker_id: str,
+        lease_ms: int,
+        *,
+        retry_backoff_ms: int = DEFAULT_RETRY_BACKOFF_MS,
+        retry_backoff_max_ms: int = DEFAULT_RETRY_BACKOFF_MAX_MS,
+    ):
         self._store = store
         self._task = task
         self._worker_id = worker_id
         self._lease_ms = lease_ms
+        self._retry_backoff_ms = retry_backoff_ms
+        self._retry_backoff_max_ms = retry_backoff_max_ms
         self._lease_lost = asyncio.Event()
         # Cancellation is monotonic: once the DB has told us a cancel was
         # requested it can't be taken back, so canceled() can answer from this
         # without a re-read.
         self._cancel_seen = False
+        # Set once this task reached a terminal state through succeed()/fail().
+        # The worker reads it to know which tasks a batch handler already
+        # decided, so it neither settles them twice nor keeps renewing their
+        # leases — the bookkeeping every ack/nack-style handler otherwise has to
+        # carry itself.
+        self._settled = False
 
     @property
     def task_id(self) -> str:
@@ -61,6 +84,13 @@ class TaskContext:
         return self._task.payload
 
     @property
+    def settled(self) -> bool:
+        """True once succeed() / fail() finalized this task. A batch handler can
+        read it back, but it exists mainly so the worker knows which of a batch's
+        tasks the handler already decided."""
+        return self._settled
+
+    @property
     def lost_lease(self) -> bool:
         """True once this worker has lost the task's lease — it expired and
         another worker reclaimed it. Nothing this handler writes will be recorded
@@ -78,20 +108,44 @@ class TaskContext:
         """Internal: called by the worker when an owned write reports lease loss."""
         self._lease_lost.set()
 
+    def _mark_settled(self) -> None:
+        """Internal: called by the worker when it finalizes this task itself, so
+        `settled` means "this task is settled" rather than the narrower "the
+        handler settled it" — the heartbeat and the settlement paths both read
+        it, and both want the wider reading."""
+        self._settled = True
+
     # Every owned write returns the current row, so cancellation and lease loss
     # ride along on writes the handler was making anyway.
     def _observe(self, task: Task) -> Task:
-        if task.cancel_requested:
-            self._cancel_seen = True
+        self._observe_cancel(task.cancel_requested)
         return task
 
+    def _observe_cancel(self, cancel_requested: bool) -> None:
+        """The same observation from just the flag, for a caller that read it
+        without materializing a Task — the shared heartbeat, whose statement
+        returns only the id and the cancel column precisely so it does not have
+        to drag every payload back on every beat."""
+        if cancel_requested:
+            self._cancel_seen = True
+
     async def _owned(self, write: Callable[[], Awaitable[Task]]) -> Task:
-        # Short-circuit once the lease is known lost: nothing this context
-        # writes may be recorded any more. Locally, not just via the store's
-        # ownership check — after an abandoned (timed-out) attempt the same
-        # worker may re-claim this task under the same worker_id, and a zombie
-        # handler's write would then pass ownership against the NEW attempt.
+        # One gate for every write through this context, so "may I still write?"
+        # is answered in one place rather than at each call site.
+        #
+        # Lease lost: nothing this context writes may be recorded any more.
+        # Checked locally, not just via the store's ownership check — after an
+        # abandoned (timed-out) attempt the same worker may re-claim this task
+        # under the same worker_id, and a zombie handler's write would then pass
+        # ownership against the NEW attempt.
         if self._lease_lost.is_set():
+            raise LostLease(self._task.id)
+        # Settled: the task is terminal, so the statement would match no row and
+        # come back as a lost lease — telling the handler "another worker took
+        # this" when the truth is "you already finished it", and flipping
+        # `lost_lease` on the way. Refuse here instead, without the round trip
+        # and without corrupting the lease state.
+        if self._settled:
             raise LostLease(self._task.id)
         try:
             return self._observe(await write())
@@ -124,6 +178,58 @@ class TaskContext:
         if task.cancel_requested:
             self._cancel_seen = True
         return self._cancel_seen or task.status == "canceled"
+
+    # ------------------------------------------------------------- settlement
+    # Finalizing a task is normally the worker's job, decided by whether the
+    # handler returned or raised. These two let a handler decide one task itself,
+    # which is what a batch needs: four of 256 tasks failing for four different
+    # reasons is the ordinary case, not the edge one, and it cannot be expressed
+    # by a single return value or a single raise.
+    #
+    # Settling twice is a no-op rather than an error. Handlers built on ack/nack
+    # queues all end up carrying a `finalized_ids` set to guarantee exactly that;
+    # holding it here instead is the point.
+
+    async def succeed(self, result: Any = None) -> Task | None:
+        """Finalize this task as succeeded, now, without waiting for the handler
+        to return. `complete` semantics: a cancel requested while it ran wins and
+        the task finalizes as canceled instead, its result discarded."""
+        if self._settled:
+            return None
+        task = await self._owned(
+            lambda: self._store.complete(
+                task_id=self._task.id, worker_id=self._worker_id, result=result
+            )
+        )
+        self._mark_settled()
+        return task
+
+    async def fail(
+        self, error: Any = "task failed", *, retryable: bool = True
+    ) -> Task | None:
+        """Finalize this task as failed, now. `error` may be a string reason, an
+        exception, a TaskError (which carries its own retryability), or a ready
+        envelope. Retryable failures get the worker's backoff and are re-queued
+        while attempts remain, exactly as a raised exception would be."""
+        if self._settled:
+            return None
+        envelope, retryable = as_envelope(error, retryable)
+        task = await self._owned(
+            lambda: self._store.fail(
+                task_id=self._task.id,
+                worker_id=self._worker_id,
+                error=envelope,
+                retryable=retryable,
+                delay_ms=fail_delay_ms(
+                    self._task.attempt,
+                    retryable=retryable,
+                    base_ms=self._retry_backoff_ms,
+                    max_ms=self._retry_backoff_max_ms,
+                ),
+            )
+        )
+        self._mark_settled()
+        return task
 
     async def submit(
         self, name: str | TaskDef[Any, Any], payload: dict[str, Any] | None = None, **kwargs: Any

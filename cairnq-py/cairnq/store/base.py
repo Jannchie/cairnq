@@ -409,6 +409,28 @@ class TaskStore(ABC):
             "heartbeat", task_id, {"id": task_id, "worker_id": worker_id, "lease_ms": lease_ms}
         )
 
+    async def heartbeat_batch(
+        self, *, task_ids: list[str], worker_id: str, lease_ms: int = 30_000
+    ) -> dict[str, bool]:
+        """Renew several leases in one statement. Returns `{task_id: cancel
+        requested}` for the tasks this worker still holds.
+
+        Deliberately not an `_owned_write`: ownership is per task here, so there
+        is no single answer to "did it work". A task **absent** from the result
+        lost its lease, and the caller decides what that means for that one task
+        rather than failing the whole beat.
+
+        It returns flags rather than `Task`s because nothing downstream needs a
+        task: the caller renews leases and observes cancellation, and whole rows
+        would drag every payload back on every beat for the life of the call."""
+        if not task_ids:
+            return {}
+        rows = await self._fetch(
+            "heartbeat_batch",
+            {"ids": list(task_ids), "worker_id": worker_id, "lease_ms": lease_ms},
+        )
+        return {r["id"]: r["cancel_requested_at_ms"] is not None for r in rows}
+
     async def progress(
         self, *, task_id: str, worker_id: str, progress: float | None, message: str | None
     ) -> Task:

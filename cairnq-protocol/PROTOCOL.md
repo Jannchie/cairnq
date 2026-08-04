@@ -156,6 +156,16 @@ A worker **leases** a task rather than popping it:
   `handler_timeout` failure through the ordinary `fail` statement — backoff,
   `max_attempts` and cancel-wins apply unchanged. Protocol-invisible: only
   `fail` crosses the wire.
+- `heartbeat_batch` extends several leases in one statement — what a worker's
+  beat actually runs, for one task or many. It is **not** ownership-checked in
+  the all-or-nothing sense the singular writes are: ownership is per row, so the
+  statement returns the rows this worker still holds and the caller reads the
+  loss off the *absences* rather than off an error. A worker holding 256 leases
+  would otherwise write 256 rows every heartbeat interval — on SQLite, 256 turns
+  of the single write lock for work nobody is waiting on. It returns only `id`
+  and `cancel_requested_at_ms`, not whole rows: per-task cancellation still rides
+  along on the write, but pulling every payload back on every beat would cost a
+  megabyte a beat on a 256-task batch to learn 256 booleans.
 - `recover_leases` (run just before `claim`, same transaction) reclaims expired
   running tasks: cancel requested → `canceled`; else `attempt < max_attempts` →
   back to `queued`; else → `failed` with a lease-expired error envelope.
@@ -203,7 +213,7 @@ statement snapshots). Pinned by `key_reuse_after_purge`.
 Client-side (API role): `submit`, `get`, `get_by_key`, `list`, `stats`,
 `queue_depth`, `cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus
 SDK-orchestrated `wait` / `call`. Worker-side: `claim`, `heartbeat`,
-`progress`, `complete`, `succeed`, `fail`.
+`heartbeat_batch`, `progress`, `complete`, `succeed`, `fail`.
 
 `stats` is the one aggregate read: task counts grouped by queue and status
 (`stats.sql`). SDKs zero-fill the statuses a queue has no rows in; a queue with
@@ -241,6 +251,60 @@ operation, read-only. `call = submit + wait`; on timeout it raises
 last task snapshot the poll observed, and its message says what state the task
 was stuck in (never claimed / queued / still running) — diagnostic text each SDK
 composes for itself, not part of the contract.
+
+## Batch delivery
+
+A task name may be registered for **batch delivery** (`batch=N` / `{ batch: N }`),
+where the handler is called once with a list of up to N contexts instead of once
+per task. It is an SDK-side delivery decision — nothing about a task row says it
+was delivered in a batch — but both SDKs must implement it identically, so the
+contract is here.
+
+The rule is one sentence: **when the handler returns, every task it did not
+settle itself is settled by how the call ended.**
+
+| handler | leftover tasks |
+| --- | --- |
+| returns | `succeeded` |
+| throws / raises anything | retryable `fail`, each with its own backoff |
+| throws / raises `TaskError(retryable=false)` | permanent `fail` |
+
+A returned map of `task_id -> result` fills in results for the leftovers; anything
+else returned is ignored, and unmentioned tasks succeed with no result.
+
+Why the escape hatch exists: a batch of 256 routinely ends with several distinct
+outcomes at once — some tasks succeed, some fail permanently for their own reason,
+some are worth retrying — and neither a single return value nor a single raise can
+say that. So a handler may finalize one task at a time (`ctx.succeed(...)` /
+`ctx.fail(...)`, also available in single-task delivery, where they mean "settle
+early"). **Settling twice is a no-op, not an error** — the SDK owns that
+bookkeeping so a handler never has to carry a `finalized_ids` set of its own.
+
+Everything else stays per task, because these are ordinary tasks that happened to
+arrive together: each has its own lease, `attempt`, backoff, cancel flag and error
+record. Consequences worth stating:
+
+- The **heartbeat is one loop for both modes** — a single-task handler is the
+  one-element case — and it renews only tasks still in play. A settled task is
+  terminal, so re-leasing it would write against a row nobody owns; that is also
+  why an absence only counts as lease loss after re-checking `settled`, since the
+  handler may have finalized the task while the beat was in flight, which takes
+  the row out of `running` and out of the reply. A task genuinely missing lost
+  its lease, and only *that* context is flagged — its neighbours run on.
+- `max_run_ms` / `maxRunMs` bounds **the whole call**, and on expiry every context
+  in it is flagged lease-lost before the leftovers are failed, so a handler that
+  survives cancellation cannot settle any of them behind the worker's back.
+- A worker's **`concurrency` counts tasks, not calls**: a batch call holding 8
+  tasks holds 8 of the budget. So `concurrency` is also the ceiling on batch
+  size — a claim never asks for more than the free budget, and `batch=256` on a
+  worker with `concurrency=8` delivers 8 at a time. Size the worker for the batch
+  you want. Scaling the claim by the batch size instead is unsound: a claim is
+  filtered by queue and name set, *not* by delivery mode, so one `batch=256`
+  registration would let a queue holding unbatched work start 256 handler calls
+  on a worker configured for one.
+- A batch is **never padded**: a chunk goes to the handler at whatever size the
+  claim produced. Waiting to fill one would trade latency for a batch size the
+  backlog will supply on its own when it is large enough to matter.
 
 ## Push wakeups (Postgres only)
 

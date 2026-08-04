@@ -357,7 +357,10 @@ export class SQLiteStore extends TaskStore {
           bound[name] = now - (params.older_than_ms as number);
           break;
         case "queues":
-          bound[name] = JSON.stringify(params.queues);
+        case "ids":
+          // json_each needs a JSON array. Postgres binds the array itself as
+          // text[], so only this dialect encodes.
+          bound[name] = JSON.stringify(params[name]);
           break;
         case "names":
           // json_each needs a JSON array; null stays null so the SQL's

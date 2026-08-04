@@ -327,8 +327,10 @@ class SQLiteStore(TaskStore):
                 bound[name] = now + params["delay_ms"]
             elif name == "before_ms":
                 bound[name] = now - params["older_than_ms"]
-            elif name == "queues":
-                bound[name] = json.dumps(list(params["queues"]))
+            elif name in ("queues", "ids"):
+                # json_each needs a JSON array. Postgres binds the list itself as
+                # text[], so only this dialect encodes.
+                bound[name] = json.dumps(list(params[name]))
             elif name == "names":
                 # json_each needs a JSON array; null stays null so the SQL's
                 # `:names is null` arm means "no filter".

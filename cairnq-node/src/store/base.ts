@@ -456,6 +456,33 @@ export abstract class TaskStore {
     });
   }
 
+  /**
+   * Renew several leases in one statement. Returns `taskId -> cancel requested`
+   * for the tasks this worker still holds.
+   *
+   * Deliberately not an ownedWrite: ownership is per task here, so there is no
+   * single answer to "did it work". A task **absent** from the result lost its
+   * lease, and the caller decides what that means for that one task rather than
+   * failing the whole beat.
+   *
+   * It returns flags rather than Tasks because nothing downstream needs a task:
+   * the caller renews leases and observes cancellation, and whole rows would drag
+   * every payload back on every beat for the life of the call.
+   */
+  async heartbeatBatch(input: {
+    taskIds: string[];
+    workerId: string;
+    leaseMs?: number;
+  }): Promise<Map<string, boolean>> {
+    if (!input.taskIds.length) return new Map();
+    const rows = await this.fetch("heartbeat_batch", {
+      ids: input.taskIds,
+      worker_id: input.workerId,
+      lease_ms: input.leaseMs ?? 30_000,
+    });
+    return new Map(rows.map((r) => [r.id as string, r.cancel_requested_at_ms != null]));
+  }
+
   async progress(input: {
     taskId: string;
     workerId: string;

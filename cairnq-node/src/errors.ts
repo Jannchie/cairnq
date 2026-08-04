@@ -20,6 +20,24 @@ export function errorEnvelope(e: {
   };
 }
 
+/**
+ * How an arbitrary thrown value becomes an envelope. Split out from `asEnvelope`
+ * below because the worker also reaches it directly, for a thrown plain object —
+ * which `asEnvelope` reads as a ready envelope, the right call for `ctx.fail` and
+ * the wrong one for something that was thrown. Both must agree on `code` and on
+ * deriving `type` from the error's name, or the same error reads differently
+ * depending on which way it was recorded.
+ */
+export function exceptionEnvelope(err: unknown, retryable = true): Record<string, unknown> {
+  const e = err as { name?: string; message?: string };
+  return errorEnvelope({
+    type: e?.name ?? "Error",
+    code: "handler_error",
+    message: String(e?.message ?? err),
+    retryable,
+  });
+}
+
 export class CairnQError extends Error {
   constructor(message?: string) {
     super(message);
@@ -182,4 +200,34 @@ export class TaskError extends CairnQError {
       details: this.details,
     });
   }
+}
+
+/** What a handler may pass to `ctx.fail`. */
+export type FailReason = string | Error | TaskError | Record<string, unknown>;
+
+/**
+ * Normalize anything that can end a task into [envelope, retryable].
+ *
+ * Shared by both ways a failure is recorded — a handler passing a reason to
+ * `ctx.fail`, and the worker classifying an error that ended an attempt — so the
+ * two cannot disagree about what a given error means. It lives here, beside the
+ * envelope constructors it dispatches to, rather than in the module that happens
+ * to expose it to handlers.
+ *
+ * A handler failing one task of a batch has a reason, not an exception object:
+ * `item.fail("no source records", { retryable: false })` is the shape the real
+ * code wants. A TaskError carries its own retryability and wins over the option;
+ * everything else takes the caller's. A ready envelope passes through, which is
+ * how the worker hands in the ones it composes itself.
+ */
+export function asEnvelope(
+  error: FailReason,
+  retryable: boolean,
+): [Record<string, unknown>, boolean] {
+  if (error instanceof TaskError) return [error.envelope(), error.retryable];
+  if (error instanceof Error) return [exceptionEnvelope(error, retryable), retryable];
+  if (typeof error === "object" && error !== null) return [error, retryable];
+  // A bare reason is a TaskError in everything but the throwing, so let
+  // TaskError own its own type/code defaults rather than restating them.
+  return [new TaskError(String(error), { retryable }).envelope(), retryable];
 }

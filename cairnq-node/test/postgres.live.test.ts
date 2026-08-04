@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 
 import { CairnQ, LostLease, PostgresStore, Worker } from "../src/index.js";
-import { sleep } from "./helpers.js";
+import { allTerminal, sleep, waitFor } from "./helpers.js";
 
 // Live Postgres smoke. Skipped unless CAIRNQ_TEST_PG_DSN is set — CI provides a
 // `postgres` service; locally you can point it at any throwaway database. It runs
@@ -150,4 +150,52 @@ suite("postgres live", () => {
     );
     expect(result).toEqual({ sum: 5 });
   });
+
+  it("delivers a batch end-to-end over postgres", async () => {
+    // Exercises heartbeat_batch.sql's Postgres form — `= any(:ids::text[])` with
+    // a real array bind, which no SQLite run can prove out — and the
+    // settle-the-rest contract over the DB clock rather than a supplied nowMs.
+    const worker = Worker.postgres(LIVE_DSN, {
+      queues: ["default"],
+      pollIntervalMs: 50,
+      concurrency: 8,
+      leaseMs: 400,
+      heartbeatIntervalMs: 60,
+      retryBackoffMs: 0,
+    });
+    const seen: number[] = [];
+
+    worker.task("embed", { batch: 8 }, async (items) => {
+      seen.push(items.length);
+      // Outlive the lease, so the batch heartbeat is what keeps these claimed.
+      await sleep(700);
+      for (const item of items) {
+        if (item.payload.n === 1) await item.fail("odd one out", { retryable: false });
+      }
+      return Object.fromEntries(items.map((i) => [i.taskId, { n: i.payload.n }]));
+    });
+
+    const ids: string[] = [];
+    for (let n = 0; n < 4; n++) {
+      ids.push((await client.submit("embed", { n }, { maxAttempts: 1 })).id);
+    }
+
+    await worker.background(async () => {
+      await waitFor(() => allTerminal(client, ids), 10_000);
+    });
+
+    const tasks = new Map(
+      (await Promise.all(ids.map((id) => client.get(id)))).map((t) => [(t!.payload as any).n, t!]),
+    );
+    expect(seen).toEqual([4]);
+    expect(tasks.get(1)!.status).toBe("failed");
+    expect((tasks.get(1)!.error as any).message).toBe("odd one out");
+    expect([0, 2, 3].map((n) => tasks.get(n)!.status)).toEqual([
+      "succeeded",
+      "succeeded",
+      "succeeded",
+    ]);
+    // Never redelivered despite outliving the lease: one attempt each.
+    expect([...tasks.values()].every((t) => t.attempt === 1)).toBe(true);
+  }, 20_000);
 });

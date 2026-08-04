@@ -13,6 +13,8 @@ import pytest
 from cairnq import CairnQ, PostgresStore, Worker
 from cairnq.errors import LostLease
 
+from .helpers import all_terminal, wait_for
+
 DSN = os.environ.get("CAIRNQ_TEST_PG_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="set CAIRNQ_TEST_PG_DSN to run live PG tests")
 
@@ -150,3 +152,35 @@ async def test_worker_end_to_end(pg_client):
     async with worker.background():
         result = await pg_client.call("sum", {"a": 2, "b": 3}, wait_timeout_ms=10_000, poll_ms=50)
     assert result == {"sum": 5}
+
+
+async def test_batch_delivery_end_to_end(pg_client):
+    """Exercises heartbeat_batch.sql's Postgres form — `= any(:ids::text[])` with
+    a real asyncpg array bind, which no SQLite run can prove out — and the
+    settle-the-rest contract over the DB clock rather than a supplied now_ms."""
+    worker = Worker.postgres(
+        DSN, queues=["default"], poll_interval_ms=50, concurrency=8, lease_ms=400,
+        heartbeat_interval_ms=60, retry_backoff_ms=0,
+    )
+    seen: list[int] = []
+
+    @worker.task("embed", batch=8)
+    async def embed(items):
+        seen.append(len(items))
+        # Outlive the lease, so the batch heartbeat is what keeps these claimed.
+        await asyncio.sleep(0.7)
+        for item in items:
+            if item.payload["n"] == 1:
+                await item.fail("odd one out", retryable=False)
+        return {item.task_id: {"n": item.payload["n"]} for item in items}
+
+    ids = [(await pg_client.submit("embed", {"n": n}, max_attempts=1)).id for n in range(4)]
+    async with worker.background():
+        await wait_for(lambda: all_terminal(pg_client, ids), timeout_s=10.0)
+
+    tasks = {t.payload["n"]: t for t in [await pg_client.get(i) for i in ids]}
+    assert seen == [4]
+    assert tasks[1].status == "failed" and tasks[1].error["message"] == "odd one out"
+    assert [tasks[n].status for n in (0, 2, 3)] == ["succeeded"] * 3
+    # Never redelivered despite outliving the lease: one attempt each.
+    assert all(t.attempt == 1 for t in tasks.values())

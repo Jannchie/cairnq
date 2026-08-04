@@ -3,8 +3,9 @@ export type { CallOptions, ClientOptions, SubmitOptions } from "./client.js";
 export { QueueDepthGate } from "./backpressure.js";
 export type { BackpressureOptions, QueueDepthLimit } from "./backpressure.js";
 export { Worker } from "./worker.js";
-export type { Handler, TypedHandler, WorkerOptions } from "./worker.js";
+export type { BatchHandler, Handler, TypedHandler, WorkerOptions } from "./worker.js";
 export { TaskContext } from "./context.js";
+export type { TaskContextOptions } from "./context.js";
 export { defineTask } from "./task.js";
 export type { TaskDef } from "./task.js";
 export { SQLiteStore } from "./store/sqlite.js";
@@ -34,3 +35,4 @@ export {
   ProtocolVersionMismatch,
   SerializationError,
 } from "./errors.js";
+export type { FailReason } from "./errors.js";

@@ -5,8 +5,17 @@ import contextlib
 import inspect
 import json
 import signal
+from collections import defaultdict
+from collections.abc import Awaitable
+from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from ._backoff import (
+    DEFAULT_RETRY_BACKOFF_MAX_MS,
+    DEFAULT_RETRY_BACKOFF_MS,
+    fail_delay_ms,
+    retry_delay_ms,
+)
 from ._ids import new_id
 from .backpressure import (
     DEFAULT_MAX_WAIT_MS,
@@ -14,7 +23,7 @@ from .backpressure import (
     QueueDepthLimit,
 )
 from .context import TaskContext
-from .errors import LostLease, SerializationError, TaskError, error_envelope
+from .errors import LostLease, SerializationError, as_envelope, error_envelope
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
 from .store.postgres import PostgresStore
@@ -25,23 +34,13 @@ Handler = Callable[..., Any]
 ErrorPhase = Literal["claim", "execute"]
 OnError = Callable[[BaseException, dict[str, Any]], None]
 
-DEFAULT_RETRY_BACKOFF_MS = 1_000
-DEFAULT_RETRY_BACKOFF_MAX_MS = 30_000
+# retry_delay_ms and the two backoff defaults are imported above rather than
+# defined here: they moved to _backoff so TaskContext.fail could share them
+# without context.py importing the module that imports it. They stay importable
+# from this module, which is where they used to live.
+
 # Wait after a failed claim, so a broken database is not polled in a tight loop.
 CLAIM_ERROR_BACKOFF_S = 0.25
-
-
-def retry_delay_ms(attempt: int, *, base_ms: int, max_ms: int) -> int:
-    """Exponential backoff for the next attempt of a task that just failed."""
-    if base_ms <= 0:
-        return 0
-    return min(max_ms, base_ms * 2 ** max(0, attempt - 1))
-
-
-def _exception_envelope(exc: BaseException) -> dict[str, Any]:
-    return error_envelope(
-        type=type(exc).__name__, code="handler_error", message=str(exc), retryable=True
-    )
 
 
 class _AttemptTimeout(Exception):
@@ -119,16 +118,31 @@ def _required_name(fn: Handler) -> str:
     return name
 
 
-async def _invoke(
-    handler: Handler, wants_payload: bool, ctx: TaskContext, payload: dict[str, Any]
-) -> Any:
-    """One convention, shared with the TS SDK: a handler receives `(ctx, payload)`,
-    where `payload` is the whole dict — destructure it yourself. A handler that
-    declares only `ctx` is called with `ctx` alone (`wants_payload` is False)."""
-    result = handler(ctx, payload) if wants_payload else handler(ctx)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
+async def _call(handler: Handler, *args: Any) -> Any:
+    """Call a handler and await it if it returned an awaitable — the one place
+    that decides sync handlers are as welcome as async ones.
+
+    The argument list is the calling convention, and there are three: a
+    single-task handler receives `(ctx, payload)` (the whole payload dict —
+    destructure it yourself), or `(ctx)` alone when it declares no payload
+    parameter, and a batch handler receives one argument, the list of contexts.
+    There is no payload shortcut to pair with the batch form: payloads are per
+    task, so they are read off the items (`item.payload`), which is also what a
+    handler must hold to settle one of them."""
+    result = handler(*args)
+    return await result if inspect.isawaitable(result) else result
+
+
+@dataclass(frozen=True)
+class _Registration:
+    """What `worker.task` recorded for one task name."""
+
+    fn: Handler
+    #: Whether a single-task handler declared a payload parameter, decided once
+    #: from the signature so the hot path never re-inspects it.
+    wants_payload: bool
+    #: Tasks per handler call, or None for one-at-a-time delivery.
+    batch: int | None = None
 
 
 class Worker:
@@ -195,14 +209,20 @@ class Worker:
         # with it.
         self._max_in_flight_bytes = max_in_flight_bytes
         self._in_flight_bytes = 0
+        # Tasks charged to running handler calls. A counter rather than a sum
+        # over `running` each turn: the loop re-reads it on every poll tick *and*
+        # every time a slot frees while saturated, and it is charged and refunded
+        # in exactly the same places as _in_flight_bytes.
+        self._in_flight_tasks = 0
         # Called for errors the worker survived — a claim that threw, a store
         # write that failed while finalizing a task. Without it these are silent:
         # the run loop carries on either way, so this is the only place an
         # operator learns a worker is limping.
         self._on_error = on_error
-        # name -> (handler, wants_payload); the payload-arity decision is cached
-        # here at registration so the worker hot path never re-inspects signatures.
-        self._handlers: dict[str, tuple[Handler, bool]] = {}
+        # name -> registration; the payload-arity decision and the batch size are
+        # settled here at registration so the worker hot path never re-inspects
+        # signatures.
+        self._handlers: dict[str, _Registration] = {}
         self._worker_id = new_id("worker")
         self._stop = asyncio.Event()
         # True only when this worker created its own store (via .sqlite); an
@@ -258,25 +278,35 @@ class Worker:
     def worker_id(self) -> str:
         return self._worker_id
 
-    def task(self, name: str | TaskDef[Any, Any] | Handler | None = None) -> Any:
+    def task(
+        self, name: str | TaskDef[Any, Any] | Handler | None = None, *, batch: int | None = None
+    ) -> Any:
         """Register a handler. Usable bare (`@worker.task` — registered under the
         function's name), with an explicit name (`@worker.task("summary.create")`)
         for dotted/namespaced or cross-language matching, or with a TaskDef
-        (`@worker.task(my_task)`) so the name is shared with the submit side."""
+        (`@worker.task(my_task)`) so the name is shared with the submit side.
+
+        `batch=N` switches this name to batch delivery: the handler takes one
+        argument, a `list[TaskContext]` of up to N tasks, instead of
+        `(ctx, payload)`. Use it when the work itself is batched — one embedding
+        call over 256 texts rather than 256 calls — and size N by what the
+        downstream API wants, not by the queue."""
         if callable(name):  # used bare: @worker.task
-            self.register(_required_name(name), name)
+            self.register(_required_name(name), name, batch=batch)
             return name
 
         resolved = None if name is None else task_name(name)
 
         def decorator(fn: Handler) -> Handler:
-            self.register(resolved or _required_name(fn), fn)
+            self.register(resolved or _required_name(fn), fn, batch=batch)
             return fn
 
         return decorator
 
-    def register(self, name: str, fn: Handler) -> None:
-        self._handlers[name] = (fn, _wants_payload(fn))
+    def register(self, name: str, fn: Handler, *, batch: int | None = None) -> None:
+        if batch is not None and batch < 1:
+            raise ValueError(f"batch must be >= 1, got {batch}")
+        self._handlers[name] = _Registration(fn, _wants_payload(fn), batch)
 
     def stop(self) -> None:
         self._stop.set()
@@ -328,12 +358,18 @@ class Worker:
         # the worker and silently apply to the next run(). Clamped: at 0 the
         # loop would await asyncio.wait(set()), which raises.
         concurrency = max(1, concurrency or self._concurrency)
-        batch = self._batch or concurrency
         await self._store.connect()
+        # The calls in flight. How many *tasks* they hold is counted separately,
+        # in _in_flight_tasks: `concurrency` bounds tasks, not calls, so a batch
+        # call holding 8 tasks holds 8 of the budget and a worker cannot
+        # accumulate batches until it is running far more tasks than it was
+        # configured for. It also makes `concurrency` the ceiling on batch size,
+        # since a claim can never exceed the free budget.
         running: set[asyncio.Task] = set()
+        claim_ceiling = self._batch or concurrency
         try:
             while not self._stop.is_set():
-                free = concurrency - len(running)
+                free = concurrency - self._in_flight_tasks
                 # Two ceilings, either of which stops the claim: task count and
                 # resident payload bytes. The byte arm is guarded on `running`
                 # being non-empty because it must never be the reason we wait on
@@ -345,7 +381,7 @@ class Worker:
                     and self._in_flight_bytes >= self._max_in_flight_bytes
                 )
                 if running and (free <= 0 or over_budget):
-                    # Wait for a slot rather than polling for one. _execute never
+                    # Wait for a slot rather than polling for one. _run_call never
                     # raises, so waiting on it cannot surface an exception here.
                     await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
                     continue
@@ -360,7 +396,17 @@ class Worker:
                         names=list(self._handlers),
                         worker_id=self._worker_id,
                         lease_ms=self._lease_ms,
-                        limit=min(batch, free),
+                        # `concurrency` bounds tasks in flight, batched or not, so
+                        # a claim never exceeds it. Scaling this by the widest
+                        # registered batch would let one poll return `concurrency
+                        # * batch` rows — and a claim is filtered by queue and
+                        # name set, not by delivery mode, so a queue holding
+                        # unbatched work would turn every one of those rows into
+                        # its own handler call. One `batch=256` registration would
+                        # then run 256 unrelated handlers on a worker configured
+                        # for one. So the batch a handler sees is bounded by
+                        # `concurrency` too: size it for the batch you want.
+                        limit=min(claim_ceiling, free),
                     )
                 except Exception as exc:
                     # A claim can fail transiently (lock contention, a dropped
@@ -372,144 +418,319 @@ class Worker:
                 if not claimed:
                     await self._idle(self._poll)
                     continue
-                for task in claimed:
+                for reg, group in self._deliveries(claimed):
                     # Charged before the handler starts and refunded when it
-                    # settles, so the budget covers exactly the span the payload
-                    # is pinned in memory.
-                    charged = 0 if self._max_in_flight_bytes is None else _payload_bytes(task)
+                    # settles, so the budgets cover exactly the span the tasks are
+                    # held and their payloads pinned in memory.
+                    charged = (
+                        0
+                        if self._max_in_flight_bytes is None
+                        else sum(_payload_bytes(t) for t in group)
+                    )
                     self._in_flight_bytes += charged
+                    self._in_flight_tasks += len(group)
 
-                    def settled(fut: asyncio.Task, size: int = charged) -> None:
+                    def settled(
+                        fut: asyncio.Task, size: int = charged, count: int = len(group)
+                    ) -> None:
                         running.discard(fut)
                         self._in_flight_bytes -= size
+                        self._in_flight_tasks -= count
 
-                    fut = asyncio.create_task(self._execute(task))
+                    # An unregistered name has nothing to run, so it never starts
+                    # a handler or a heartbeat; everything else is one call,
+                    # batched or not.
+                    coro = (
+                        self._fail_no_handler(group[0])
+                        if reg is None
+                        else self._run_call(reg, group)
+                    )
+                    fut = asyncio.create_task(coro)
                     running.add(fut)
                     fut.add_done_callback(settled)
         finally:
             if running:
                 await asyncio.gather(*running, return_exceptions=True)
 
-    async def _execute(self, task: Task) -> None:
-        """Run one task to completion. Never raises: a task-level failure is
-        reported through on_error and the loop moves on."""
-        ctx = TaskContext(self._store, task, self._worker_id, self._lease_ms)
-        hb = asyncio.create_task(self._heartbeat_loop(ctx))
+    def _deliveries(
+        self, claimed: list[Task]
+    ) -> list[tuple[_Registration | None, list[Task]]]:
+        """Split one claim into handler calls, each with the registration to run it.
+
+        A claim is filtered by queue and by the names this worker handles, so it
+        comes back mixed; batch size is per name (one embedding call wants 256
+        texts, one Docling parse wants exactly 1). So group by name, then chunk
+        each group by that name's size. Names registered without `batch` come back
+        as one-task calls, as do names not registered at all — reachable only if a
+        handler is unregistered mid-run, and dispatched to `_fail_no_handler`.
+
+        The registration rides along because this is where it was resolved;
+        looking it up again at the call site would put "is this name batched" in
+        two places.
+        """
+        by_name: dict[str, list[Task]] = defaultdict(list)
+        for task in claimed:
+            by_name[task.name].append(task)
+        out: list[tuple[_Registration | None, list[Task]]] = []
+        for name, group in by_name.items():
+            reg = self._handlers.get(name)
+            size = (reg.batch if reg else None) or 1
+            out.extend((reg, group[i : i + size]) for i in range(0, len(group), size))
+        return out
+
+    def _context(self, task: Task) -> TaskContext:
+        return TaskContext(
+            self._store,
+            task,
+            self._worker_id,
+            self._lease_ms,
+            retry_backoff_ms=self._retry_backoff_ms,
+            retry_backoff_max_ms=self._retry_backoff_max_ms,
+        )
+
+    async def _fail_no_handler(self, task: Task) -> None:
+        """Record a claimed task this worker cannot run. Reachable only if a name
+        is unregistered mid-run — the claim filters on the registered names — so
+        it does not start a handler or a heartbeat for a task it will not run."""
+        with contextlib.suppress(Exception):
+            await self._safe_fail(
+                self._context(task),
+                error_envelope(
+                    type="NoHandler",
+                    code="no_handler",
+                    message=f"no handler registered for {task.name!r}",
+                    retryable=False,
+                ),
+                retryable=False,
+            )
+
+    async def _run_call(self, reg: _Registration, tasks: list[Task]) -> None:
+        """Run one handler call to completion — one task, or a whole batch. Never
+        raises: a task-level failure is reported through on_error and the loop
+        moves on.
+
+        One lifecycle for both delivery modes, because a single-task handler *is*
+        the one-element case: the same heartbeat covers the call, the same
+        classifier reads its exception, and the same rule settles what is left.
+        Only two things vary — how the handler is called, and where a leftover
+        task's result comes from — so those are the only two branches below.
+
+        The contract is single: **when the handler returns, every task it did not
+        settle itself is settled by how the call ended.** Returning succeeds them,
+        raising fails them (retryably, or as the raised TaskError says). That is
+        what keeps the ordinary cases free of bookkeeping — a handler that just
+        returns has finished 256 tasks — while still letting it pick individual
+        tasks off with `item.succeed()` / `item.fail()` as it goes.
+
+        For a batch, a returned mapping of task id -> result fills in results for
+        the tasks left over; anything else returned is ignored, and unmentioned
+        tasks succeed with no result (the common shape, where the handler's output
+        went to a database rather than into the task row). For a single task the
+        return value simply is the result.
+        """
+        ctxs = [self._context(t) for t in tasks]
+        batched = reg.batch is not None
+        if batched:
+            args: tuple[Any, ...] = (ctxs,)
+        else:
+            args = (ctxs[0], tasks[0].payload) if reg.wants_payload else (ctxs[0],)
+        hb = asyncio.create_task(self._heartbeat_loop(ctxs))
         try:
-            entry = self._handlers.get(task.name)
-            if entry is None:
-                await self._safe_fail(
-                    task,
-                    error_envelope(
-                        type="NoHandler",
-                        code="no_handler",
-                        message=f"no handler registered for {task.name!r}",
-                        retryable=False,
-                    ),
-                    retryable=False,
-                )
-                return
-            handler, wants_payload = entry
             try:
-                result = await self._attempt(handler, wants_payload, ctx, task)
-            except LostLease:
+                result = await self._attempt(lambda: _call(reg.fn, *args), ctxs)
+            except Exception as exc:
+                outcome = self._outcome_of(exc, tasks[0].name)
+                if outcome is not None:
+                    await self._settle_each(
+                        ctxs, lambda c: self._safe_fail(c, outcome[0], retryable=outcome[1])
+                    )
                 return
-            except _AttemptTimeout:
-                # Recorded as a retryable failure, so backoff / max_attempts /
-                # cancel-wins all apply exactly as for a raised exception.
-                await self._safe_fail(
-                    task, _timeout_envelope(task.name, self._max_run_ms), retryable=True
-                )
-                return
-            except TaskError as exc:  # handler chose how to fail
-                await self._safe_fail(task, exc.envelope(), retryable=exc.retryable)
-                return
-            except Exception as exc:  # any other handler error is retryable
-                await self._safe_fail(task, _exception_envelope(exc), retryable=True)
-                return
-            try:
-                # complete (not succeed): finalizes as canceled if a cancel was
-                # requested while the handler ran, else succeeded.
-                await self._store.complete(
-                    task_id=task.id, worker_id=self._worker_id, result=result
-                )
-            except LostLease:
-                ctx._mark_lease_lost()
-                return
-            except SerializationError as exc:
-                # The handler succeeded but its return value can't cross the JSON
-                # protocol. Deterministic, so fail fast and permanently — the
-                # alternative is sitting `running` until lease expiry redelivers
-                # a task that fails the same way every attempt.
-                await self._safe_fail(
-                    task,
-                    error_envelope(
-                        type="SerializationError",
-                        code="unserializable_result",
-                        message=f"handler result is not JSON-serializable: {exc}",
-                        retryable=False,
-                    ),
-                    retryable=False,
-                )
-                return
+            # A batch handler's return maps task id -> result; a single-task
+            # handler's return *is* the result. Anything else a batch returns is
+            # ignored, so its leftovers succeed with no result — hence the empty
+            # mapping rather than falling through to `result`.
+            results = (result if isinstance(result, dict) else {}) if batched else None
+            await self._settle_each(
+                ctxs,
+                lambda c: self._succeed_one(
+                    c, results.get(c.task_id) if results is not None else result
+                ),
+            )
         except Exception as exc:
-            self._report(exc, phase="execute", task_id=task.id)
+            self._report(exc, phase="execute", task_id=tasks[0].id)
         finally:
             hb.cancel()
             with contextlib.suppress(BaseException):
                 await hb
 
+    def _outcome_of(
+        self, exc: BaseException, name: str
+    ) -> tuple[dict[str, Any], bool] | None:
+        """How an attempt that ended badly is recorded: (envelope, retryable), or
+        None when there is nothing to record.
+
+        One classifier for both delivery modes, so a handler error cannot mean
+        different things depending on how its task happened to be delivered. That
+        includes `LostLease`, which is not an outcome at all: it means a write
+        through this context was already rejected, so recording anything more
+        would be rejected too. Both modes then leave the task alone — the
+        single-task one has nothing else to do, and a batch lets its remaining
+        tasks fall to lease expiry and redelivery rather than stamping them with
+        a failure the handler never reported."""
+        if isinstance(exc, LostLease):
+            return None
+        if isinstance(exc, _AttemptTimeout):
+            # Retryable, so backoff / max_attempts / cancel-wins all apply
+            # exactly as for a raised exception.
+            return _timeout_envelope(name, self._max_run_ms), True
+        # Everything else is what a handler could equally have passed to
+        # ctx.fail(), so it goes through the same normalizer — a TaskError keeps
+        # its own retryability, anything else is retryable.
+        return as_envelope(exc, True)
+
+    # Both settlement paths write through the store rather than through the
+    # context. `TaskContext._owned` short-circuits once a lease is known lost,
+    # which is there to stop a *zombie handler* writing after its attempt was
+    # abandoned — but these run after the handler is done, on the worker's own
+    # authority. Ownership is still enforced by each statement, so a task whose
+    # lease really was lost writes nothing either way.
+
+    async def _succeed_one(self, ctx: TaskContext, result: Any) -> None:
+        """Finalize one task the handler left for the worker to decide — the tail
+        of both delivery modes.
+
+        Includes the unserializable-result rule: the handler succeeded but its
+        value cannot cross the JSON protocol, which is deterministic, so it fails
+        permanently rather than being redelivered to fail the same way every
+        attempt."""
+        if ctx.settled:
+            return
+        try:
+            # complete (not succeed): finalizes as canceled if a cancel was
+            # requested while the handler ran, else succeeded.
+            await self._store.complete(
+                task_id=ctx.task_id, worker_id=self._worker_id, result=result
+            )
+            ctx._mark_settled()
+        except LostLease:
+            ctx._mark_lease_lost()
+        except SerializationError as exc:
+            await self._safe_fail(
+                ctx,
+                error_envelope(
+                    type="SerializationError",
+                    code="unserializable_result",
+                    message=f"handler result is not JSON-serializable: {exc}",
+                    retryable=False,
+                ),
+                retryable=False,
+            )
+
+    async def _settle_each(
+        self,
+        ctxs: list[TaskContext],
+        settle: Callable[[TaskContext], Awaitable[None]],
+    ) -> None:
+        """Settle every task the handler did not settle itself, concurrently,
+        reporting rather than raising. Each task keeps its own attempt count and
+        backoff — they are separate tasks that happened to be delivered together.
+
+        return_exceptions, because one task's write failing must not abandon the
+        rest of the batch mid-settlement — the others still hold leases and would
+        sit `running` until expiry. Each outcome is reported against the task it
+        belongs to; without that, an operator learns a settlement failed somewhere
+        in a batch of 256."""
+        left = [c for c in ctxs if not c.settled]
+        if not left:
+            return
+        outcomes = await asyncio.gather(
+            *(settle(c) for c in left), return_exceptions=True
+        )
+        for ctx, outcome in zip(left, outcomes):
+            if isinstance(outcome, BaseException):
+                self._report(outcome, phase="execute", task_id=ctx.task_id)
+
     async def _attempt(
-        self, handler: Handler, wants_payload: bool, ctx: TaskContext, task: Task
+        self, invoke: Callable[[], Awaitable[Any]], ctxs: list[TaskContext]
     ) -> Any:
-        """Run one attempt, bounded by max_run_ms when set. On timeout the
-        attempt is abandoned: the context is flagged lease-lost first (so a
-        handler that survives cancellation can never write again — see
-        TaskContext._owned), then the handler task is cancelled and left to
-        die at its next await. The caller records the handler_timeout failure;
-        lease recovery is NOT involved, so redelivery is immediate."""
+        """Run one attempt — of one task or of a whole batch — bounded by
+        max_run_ms when set.
+
+        On timeout the attempt is abandoned: every context it covers is flagged
+        lease-lost first (so a handler that survives cancellation can never write
+        again, nor settle anything behind the worker's back — see
+        TaskContext._owned), then the handler task is cancelled and left to die at
+        its next await. The caller records the handler_timeout failure; lease
+        recovery is NOT involved, so redelivery is immediate."""
         if self._max_run_ms is None:
-            return await _invoke(handler, wants_payload, ctx, task.payload)
-        runner = asyncio.create_task(_invoke(handler, wants_payload, ctx, task.payload))
+            return await invoke()
+        runner = asyncio.create_task(invoke())
         done, _ = await asyncio.wait({runner}, timeout=self._max_run_ms / 1000)
         if done:
             return runner.result()  # or re-raises what the handler raised
-        ctx._mark_lease_lost()
+        for ctx in ctxs:
+            ctx._mark_lease_lost()
         runner.cancel()
         # Not awaited: a handler that shields itself from cancellation would
         # otherwise hold this slot for exactly the hang the ceiling exists for.
         runner.add_done_callback(_consume_result)
         raise _AttemptTimeout
 
-    async def _heartbeat_loop(self, ctx: TaskContext) -> None:
+    async def _heartbeat_loop(self, ctxs: list[TaskContext]) -> None:
+        """One statement per beat, however many tasks the call covers — a
+        single-task handler is just the one-element case.
+
+        Only tasks still in play are renewed. A task the handler already settled
+        is terminal, and re-leasing it would be a write against a row nobody owns;
+        that is also why an absence is only read as lease loss after re-checking
+        `settled`, since the handler may have finalized the task while this beat
+        was in flight, which takes the row out of `running` and out of the reply.
+        A task genuinely missing lost its lease (another worker recovered it), so
+        its context is flagged and the handler stops being able to write through
+        it — only that one, never its neighbours.
+        """
         try:
             while True:
                 await asyncio.sleep(self._hb_interval / 1000)
-                try:
-                    await ctx.heartbeat()
-                except LostLease:
-                    # ctx.heartbeat() already flagged the lease for the handler.
+                live = [c for c in ctxs if not c.settled and not c.lost_lease]
+                if not live:
                     return
+                try:
+                    renewed = await self._store.heartbeat_batch(
+                        task_ids=[c.task_id for c in live],
+                        worker_id=self._worker_id,
+                        lease_ms=self._lease_ms,
+                    )
                 except Exception as exc:
-                    self._report(exc, phase="execute", task_id=ctx.task_id)
+                    self._report(exc, phase="execute", task_id=live[0].task_id)
+                    continue
+                for ctx in live:
+                    if ctx.task_id in renewed:
+                        # Cancellation rides along on the write we were making
+                        # anyway, so ctx.canceled() stays free here too.
+                        ctx._observe_cancel(renewed[ctx.task_id])
+                    elif not ctx.settled:
+                        ctx._mark_lease_lost()
         except asyncio.CancelledError:
             return
 
-    async def _safe_fail(self, task: Task, envelope: dict[str, Any], *, retryable: bool) -> None:
-        delay_ms = (
-            retry_delay_ms(
-                task.attempt,
-                base_ms=self._retry_backoff_ms,
-                max_ms=self._retry_backoff_max_ms,
-            )
-            if retryable
-            else 0
-        )
+    async def _safe_fail(
+        self, ctx: TaskContext, envelope: dict[str, Any], *, retryable: bool
+    ) -> None:
         try:
             await self._store.fail(
-                task_id=task.id, worker_id=self._worker_id, error=envelope,
-                retryable=retryable, delay_ms=delay_ms,
+                task_id=ctx.task_id,
+                worker_id=self._worker_id,
+                error=envelope,
+                retryable=retryable,
+                delay_ms=fail_delay_ms(
+                    ctx.attempt,
+                    retryable=retryable,
+                    base_ms=self._retry_backoff_ms,
+                    max_ms=self._retry_backoff_max_ms,
+                ),
             )
+            ctx._mark_settled()
         except LostLease:
             pass
 

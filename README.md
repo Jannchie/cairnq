@@ -94,6 +94,51 @@ result = await tasks.call(summarize, {"text": text})
 It's purely opt-in: every API still takes a plain name string, and a cross-language
 caller keeps using the string (only the name crosses the database).
 
+### Batch delivery (optional)
+
+When the work itself is batched — one embedding call over 256 texts rather than
+256 calls — register the name with a batch size and the handler is called once
+with a list of contexts:
+
+```python
+@worker.task("embed", batch=256)
+async def embed(items):                        # list[TaskContext]
+    vectors = await model.embed([i.payload["text"] for i in items])
+    return {item.task_id: {"vec": v} for item, v in zip(items, vectors)}
+```
+
+```ts
+worker.task("embed", { batch: 256 }, async (items) => {
+  const vectors = await model.embed(items.map((i) => i.payload.text));
+  return Object.fromEntries(items.map((i, n) => [i.taskId, { vec: vectors[n] }]));
+});
+```
+
+One rule: **when the handler returns, every task it did not settle itself is
+settled by how the call ended** — returning succeeds them, throwing fails them
+retryably, throwing a non-retryable `TaskError` fails them permanently. So the
+common cases need no bookkeeping at all.
+
+When a batch ends several ways at once — which is the norm, not the exception —
+finalize the odd ones out as you go and let the rest ride on the return:
+
+```python
+for item in items:
+    if not await source_exists(item.payload["item_id"]):
+        await item.fail("no source record", retryable=False)
+```
+
+Settling twice is a no-op, so there is no `finalized_ids` set to keep. Everything
+else stays per task: each has its own lease, `attempt`, backoff and cancel flag,
+and one shared heartbeat renews only the ones still in play.
+
+**Size `concurrency` for the batch you want.** It counts tasks, not handler
+calls, so it is also the ceiling on batch size: `batch=256` on a worker left at
+the default `concurrency=1` delivers one task at a time. It is also the only
+thing that limits how many run at once — `batch=1` means "call me with a list of
+one", not "run one at a time". For work that saturates the machine, set
+`concurrency=1`. Give a batch worker its own queue and size both.
+
 The worker and the API can be in **either language** — a TypeScript API can drive
 a Python worker and vice-versa, because the only thing they share is the database
 and a JSON protocol.

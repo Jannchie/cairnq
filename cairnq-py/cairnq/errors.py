@@ -30,6 +30,17 @@ def error_envelope(
     }
 
 
+def exception_envelope(exc: BaseException, *, retryable: bool = True) -> dict[str, Any]:
+    """How an arbitrary exception becomes an envelope. Split out from
+    `as_envelope` below so the exception arm is nameable on its own; everything
+    that records a raised handler error reaches it through that one classifier,
+    which is what keeps `code` and the `type`-from-class-name rule from drifting
+    between the ways a failure can be recorded."""
+    return error_envelope(
+        type=type(exc).__name__, code="handler_error", message=str(exc), retryable=retryable
+    )
+
+
 class CairnQError(Exception):
     """Base for all CairnQ SDK errors."""
 
@@ -174,3 +185,29 @@ class TaskError(CairnQError):
             retryable=self.retryable,
             details=self.details,
         )
+
+
+def as_envelope(error: Any, retryable: bool) -> tuple[dict[str, Any], bool]:
+    """Normalize anything that can end a task into (envelope, retryable).
+
+    Shared by both ways a failure is recorded — a handler passing a reason to
+    `ctx.fail`, and the worker classifying an exception that ended an attempt —
+    so the two cannot disagree about what a given error means. It lives here,
+    beside the envelope constructors it dispatches to, rather than in the module
+    that happens to expose it to handlers.
+
+    A handler failing one task of a batch has a reason, not an exception object:
+    `item.fail("no source records", retryable=False)` is the shape the real code
+    wants. A TaskError carries its own retryability and wins over the argument;
+    everything else takes the caller's. A ready envelope passes through, which is
+    how the worker hands in the ones it composes itself.
+    """
+    if isinstance(error, TaskError):
+        return error.envelope(), error.retryable
+    if isinstance(error, BaseException):
+        return exception_envelope(error, retryable=retryable), retryable
+    if isinstance(error, dict):
+        return error, retryable
+    # A bare reason is a TaskError in everything but the raising, so let
+    # TaskError own its own `type`/`code` defaults rather than restating them.
+    return TaskError(str(error), retryable=retryable).envelope(), retryable

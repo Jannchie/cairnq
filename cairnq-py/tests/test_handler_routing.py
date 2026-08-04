@@ -12,7 +12,7 @@ import asyncio
 
 from cairnq import CairnQ, Worker
 
-from .helpers import wait_for
+from .helpers import all_terminal, wait_for
 
 
 async def test_a_worker_leaves_tasks_it_cannot_run_for_the_worker_that_can(db_path):
@@ -29,7 +29,7 @@ async def test_a_worker_leaves_tasks_it_cannot_run_for_the_worker_that_can(db_pa
             # plausible explanation for them all succeeding.
             tasks = [await client.submit("beta", {"i": i}) for i in range(20)]
             await wait_for(
-                lambda: _all_terminal(client, [t.id for t in tasks]), timeout_s=10.0
+                lambda: all_terminal(client, [t.id for t in tasks]), timeout_s=10.0
             )
             final = [await client.get(t.id) for t in tasks]
     finally:
@@ -57,11 +57,3 @@ async def test_a_worker_with_no_handlers_claims_nothing(db_path):
 
     assert current.queued, f"an empty worker took the task: {current.status}"
     assert current.attempt == 0
-
-
-async def _all_terminal(client: CairnQ, ids: list[str]) -> bool:
-    for task_id in ids:
-        task = await client.get(task_id)
-        if task is None or not task.is_terminal:
-            return False
-    return True

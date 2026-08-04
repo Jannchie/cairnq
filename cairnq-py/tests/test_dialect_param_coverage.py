@@ -57,6 +57,11 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     assert len(claimed) >= 3, f"need three running tasks, claimed {len(claimed)}"
 
     await store.heartbeat(task_id=claimed[0].id, worker_id=worker, lease_ms=5_000)
+    # The batch-delivery heartbeat, while every claimed task is still running —
+    # it renews only rows this worker holds a live lease on.
+    await store.heartbeat_batch(
+        task_ids=[t.id for t in claimed], worker_id=worker, lease_ms=5_000
+    )
     await store.progress(task_id=claimed[0].id, worker_id=worker, progress=0.5, message="x")
     await store.fail(
         task_id=claimed[0].id, worker_id=worker, error={"m": 1}, retryable=True, delay_ms=10

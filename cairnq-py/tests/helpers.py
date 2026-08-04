@@ -20,3 +20,14 @@ async def wait_for(
         if result:
             return
         await asyncio.sleep(0.01)
+
+
+async def all_terminal(client, ids) -> bool:
+    """Whether every id has reached a terminal state. The predicate worker tests
+    wait on, so `wait_for(lambda: all_terminal(client, ids))` reads as the thing
+    it is rather than being respelled per file."""
+    for task_id in ids:
+        task = await client.get(task_id)
+        if task is None or not task.is_terminal:
+            return False
+    return True
