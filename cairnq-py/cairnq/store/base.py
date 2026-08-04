@@ -113,6 +113,10 @@ def statement_params(sql: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
+#: One draw inside a `claim_session`: (names, limit) -> the rows it took.
+ClaimDraw = Callable[[list[str] | None, int], Awaitable[list[Task]]]
+
+
 class TaskStore(ABC):
     #: Set by use_backpressure; None means submit is ungated.
     _gate: QueueDepthGate | None = None
@@ -379,30 +383,96 @@ class TaskStore(ABC):
         handlers. Queues alone do not partition work, so without it a worker
         claims a task it cannot run and fails it permanently. None means no
         filter; an empty list claims nothing."""
-        # One queue is the common case and gets its own statement: a list-valued
-        # queue filter cannot be read in claim order, so the planner sorts every
-        # claimable row to take LIMIT of them, and claim's cost grows with the
-        # queued backlog while it holds the claim transaction. See
-        # claim_one_queue.sql.
+        name_list = None if names is None else list(names)
+        claimed = await self.claim_session(
+            queues=queues,
+            worker_id=worker_id,
+            lease_ms=lease_ms,
+            names=name_list,
+            plan=lambda claim: claim(name_list, limit),
+        )
+        return claimed if claimed is not None else []
+
+    async def claim_session(
+        self,
+        *,
+        queues: list[str],
+        worker_id: str,
+        lease_ms: int = 30_000,
+        names: list[str] | None,
+        plan: Callable[[ClaimDraw], Awaitable[Any]],
+    ) -> Any:
+        """Open one claim transaction and let the caller draw from it repeatedly.
+
+        The transaction is what has to live here: the read-only probe that keeps
+        an idle worker off SQLite's single write lock, the `recover_leases` whose
+        reclaimed leases must be visible to the claims that follow and to nobody
+        in between, and the write lock itself. *What* gets claimed under it is the
+        caller's business — a worker drawing a separate quota per task name is
+        scheduling policy, and this layer has no vocabulary for the "handler call"
+        that policy is denominated in. It knows queues, names, limits and rows.
+
+        `plan` is handed a `claim(names, limit)` it may await any number of times,
+        each a separate statement under the same lock and the same recovery, and
+        each free to size itself from what the previous one returned. That
+        feedback is the reason this is a callback rather than a list of quotas: a
+        caller dividing a budget up front has to guess, and every share handed to
+        a name with nothing queued is a slot left idle until the next poll.
+
+        `plan` runs with the write lock held, so it must await nothing but that
+        callback.
+
+        `names` is the union `plan` might ask for — the probe and the recovery are
+        filtered by it. Returns None when the probe finds nothing claimable, in
+        which case `plan` never runs and no transaction is opened."""
+        # A list-valued filter cannot be read in claim order, so the planner sorts
+        # every claimable row to take LIMIT of them and the claim's cost grows
+        # with the backlog while it holds the transaction. Both filters therefore
+        # have an equality form, picked per draw: one queue is the common
+        # deployment, and one name is every per-name quota. See
+        # claim_one_queue.sql and claim_one_name.sql.
         queue_list = list(queues)
         one_queue = len(queue_list) == 1
-        params = {
+        base = {
             "queues": queue_list,
             "queue": queue_list[0] if one_queue else None,
-            "names": None if names is None else list(names),
+            "names": names,
+            "name": None,
             "worker_id": worker_id,
             "lease_ms": lease_ms,
-            "limit": limit,
+            "limit": 1,
             "lease_expired_error": LEASE_EXPIRED_ERROR_JSON,
         }
-        if not await self._has_claimable_work(params):
-            return []
+        if not await self._has_claimable_work(base):
+            return None
         # Recovery must share the claim's transaction: a lease reclaimed here has
-        # to be visible to the claim that follows, and to nobody in between.
+        # to be visible to the claims that follow, and to nobody in between.
         async with self._transaction() as fetch:
-            await fetch("recover_leases", params)
-            rows = await fetch("claim_one_queue" if one_queue else "claim", params)
-            return [Task.from_row(r) for r in rows]
+            await fetch("recover_leases", base)
+
+            async def claim(draw_names: list[str] | None, limit: int) -> list[Task]:
+                # A draw asking for nothing, or filtered to no names, claims
+                # nothing — answer it here rather than spending a statement to
+                # learn that.
+                if limit <= 0 or draw_names == []:
+                    return []
+                one_name = draw_names is not None and len(draw_names) == 1
+                if one_name:
+                    statement = "claim_one_queue_one_name" if one_queue else "claim_one_name"
+                else:
+                    statement = "claim_one_queue" if one_queue else "claim"
+                rows = await fetch(
+                    statement,
+                    {
+                        **base,
+                        "names": draw_names,
+                        "name": draw_names[0] if one_name else None,
+                        "limit": limit,
+                    },
+                )
+                return [Task.from_row(r) for r in rows]
+
+            return await plan(claim)
 
     async def heartbeat(self, *, task_id: str, worker_id: str, lease_ms: int = 30_000) -> Task:
         return await self._owned_write(

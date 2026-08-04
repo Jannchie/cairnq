@@ -425,26 +425,82 @@ export abstract class TaskStore {
     limit?: number;
     names?: string[];
   }): Promise<Task[]> {
-    // One queue is the common case and gets its own statement: a list-valued queue
-    // filter cannot be read in claim order, so the planner sorts every claimable
-    // row to take LIMIT of them, and claim's cost grows with the queued backlog
-    // while it holds the claim transaction. See claim_one_queue.sql.
+    const names = input.names ?? null;
+    const claimed = await this.claimSession(
+      { queues: input.queues, workerId: input.workerId, leaseMs: input.leaseMs, names },
+      (claim) => claim(names, input.limit ?? 1),
+    );
+    return claimed ?? [];
+  }
+
+  /**
+   * Open one claim transaction and let the caller draw from it repeatedly.
+   *
+   * The transaction is what has to live here: the read-only probe that keeps an
+   * idle worker off SQLite's single write lock, the `recover_leases` whose
+   * reclaimed leases must be visible to the claims that follow and to nobody in
+   * between, and the write lock itself. *What* gets claimed under it is the
+   * caller's business — a worker drawing a separate quota per task name is
+   * scheduling policy, and this layer has no vocabulary for the "handler call"
+   * that policy is denominated in. It knows queues, names, limits and rows.
+   *
+   * `plan` is handed a `claim(names, limit)` it may call any number of times,
+   * each a separate statement under the same lock and the same recovery, and
+   * each free to size itself from what the previous one returned. That feedback
+   * is the reason this is a callback rather than a list of quotas: a caller
+   * dividing a budget up front has to guess, and every share handed to a name
+   * with nothing queued is a slot left idle until the next poll.
+   *
+   * `plan` runs with the write lock held, so it must await nothing but that
+   * callback.
+   *
+   * `names` is the union `plan` might ask for — the probe and the recovery are
+   * filtered by it. Returns undefined when the probe finds nothing claimable, in
+   * which case `plan` never runs and no transaction is opened.
+   */
+  async claimSession<T>(
+    input: { queues: string[]; workerId: string; leaseMs?: number; names: string[] | null },
+    plan: (claim: (names: string[] | null, limit: number) => Promise<Task[]>) => Promise<T>,
+  ): Promise<T | undefined> {
+    // A list-valued filter cannot be read in claim order, so the planner sorts
+    // every claimable row to take LIMIT of them and the claim's cost grows with
+    // the backlog while it holds the transaction. Both filters therefore have an
+    // equality form, picked per draw: one queue is the common deployment, and one
+    // name is every per-name quota. See claim_one_queue.sql and claim_one_name.sql.
     const oneQueue = input.queues.length === 1;
-    const params: Params = {
+    const base: Params = {
       queues: input.queues,
       queue: oneQueue ? input.queues[0] : null,
-      names: input.names ?? null,
+      names: input.names,
+      name: null,
       worker_id: input.workerId,
       lease_ms: input.leaseMs ?? 30_000,
-      limit: input.limit ?? 1,
+      limit: 1,
       lease_expired_error: LEASE_EXPIRED_ERROR_JSON,
     };
-    if (!(await this.hasClaimableWork(params))) return [];
-    // Recovery must share the claim's transaction: a lease reclaimed here has to
-    // be visible to the claim that follows, and to nobody in between.
+    if (!(await this.hasClaimableWork(base))) return undefined;
     return this.tx(async (fetch) => {
-      await fetch("recover_leases", params);
-      return (await fetch(oneQueue ? "claim_one_queue" : "claim", params)).map(rowToTask);
+      await fetch("recover_leases", base);
+      return plan(async (names, limit) => {
+        // A draw asking for nothing, or filtered to no names, claims nothing —
+        // answer it here rather than spending a statement to learn that.
+        if (limit <= 0 || names?.length === 0) return [];
+        const oneName = names?.length === 1;
+        const statement = oneName
+          ? oneQueue
+            ? "claim_one_queue_one_name"
+            : "claim_one_name"
+          : oneQueue
+            ? "claim_one_queue"
+            : "claim";
+        const rows = await fetch(statement, {
+          ...base,
+          names,
+          name: oneName ? names![0] : null,
+          limit,
+        });
+        return rows.map(rowToTask);
+      });
     });
   }
 

@@ -360,11 +360,11 @@ async def test_a_single_task_handler_can_fail_itself_permanently(client, db_path
     assert tasks[ids[0]].attempt == 1  # permanent, despite max_attempts=5
 
 
-async def test_concurrency_bounds_tasks_not_calls(client, db_path):
-    """Regression: sizing the claim by the widest registered batch let one
-    `batch=64` registration run 64 unrelated single-task handlers at once on a
-    worker configured for one. A claim is filtered by queue and name set, not by
-    delivery mode, so every one of those rows became its own call."""
+async def test_a_batched_name_does_not_start_calls_for_an_unbatched_one(client, db_path):
+    """Regression: the claim used to be one statement over every registered name,
+    so sizing it for the widest batch let a `batch=64` registration pull 64 rows
+    of unrelated work and turn each into its own call on a worker configured for
+    one. Each name now draws its own quota."""
     worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=1)
     live = 0
     peak = 0
@@ -388,26 +388,115 @@ async def test_concurrency_bounds_tasks_not_calls(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_a_batch_never_exceeds_the_task_budget(client, db_path):
-    """The other half of the same rule: a batch call holds one budget slot per
-    task, so batches cannot accumulate past `concurrency` either."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=4)
-    in_flight = 0
-    peak = 0
+async def test_concurrency_bounds_calls_not_tasks(client, db_path):
+    """concurrency counts handler calls: a call holding 4 tasks is one of them.
+    Counting tasks instead is what used to weld batch size to concurrency — a
+    full batch was unreachable unless concurrency was raised to match it."""
+    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=2)
+    calls = 0
+    peak_calls = 0
+    widest = 0
 
     @worker.task("embed", batch=4)
     async def embed(items):
-        nonlocal in_flight, peak
-        in_flight += len(items)
-        peak = max(peak, in_flight)
+        nonlocal calls, peak_calls, widest
+        calls += 1
+        peak_calls = max(peak_calls, calls)
+        widest = max(widest, len(items))
         await asyncio.sleep(0.03)
-        in_flight -= len(items)
+        calls -= 1
 
     ids = [(await client.submit("embed", {})).id for _ in range(20)]
     tasks = await _drain(client, ids, worker)
 
-    assert peak <= 4, f"concurrency=4 but {peak} tasks were in flight"
+    assert peak_calls <= 2, f"concurrency=2 but {peak_calls} calls ran at once"
+    # A full batch is reachable at concurrency 2 — 8 tasks in flight, 2 calls.
+    assert widest == 4
     assert all(t.status == "succeeded" for t in tasks.values())
+
+
+async def test_a_batch_fills_at_the_default_concurrency(client, db_path):
+    """The headline of the change: batch size is no longer capped by concurrency,
+    so `batch=8` on a default worker delivers 8 rather than 1."""
+    worker = Worker.sqlite(db_path, poll_interval_ms=20)
+    sizes: list[int] = []
+
+    @worker.task("embed", batch=8)
+    async def embed(items):
+        sizes.append(len(items))
+
+    ids = [(await client.submit("embed", {"n": n})).id for n in range(8)]
+    tasks = await _drain(client, ids, worker)
+
+    assert sizes == [8]
+    assert all(t.status == "succeeded" for t in tasks.values())
+
+
+async def test_per_name_concurrency_caps_calls_for_that_name(client, db_path):
+    """The worker budget allows 6 calls; `embed` may only ever run 2 of them, so
+    one expensive name cannot take the whole worker."""
+    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=6)
+    live = 0
+    peak = 0
+
+    @worker.task("embed", batch=2, concurrency=2)
+    async def embed(items):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        await asyncio.sleep(0.03)
+        live -= 1
+
+    ids = [(await client.submit("embed", {})).id for _ in range(20)]
+    tasks = await _drain(client, ids, worker)
+
+    assert peak <= 2, f"per-name concurrency=2 but {peak} calls ran at once"
+    assert all(t.status == "succeeded" for t in tasks.values())
+
+
+async def test_per_name_concurrency_without_batching(client, db_path):
+    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=8)
+    live = 0
+    peak = 0
+
+    @worker.task("slow", concurrency=1)
+    async def slow(ctx, payload):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        await asyncio.sleep(0.02)
+        live -= 1
+
+    ids = [(await client.submit("slow", {})).id for _ in range(10)]
+    tasks = await _drain(client, ids, worker)
+
+    assert peak == 1, f"per-name concurrency=1 but {peak} handlers ran at once"
+    assert all(t.status == "succeeded" for t in tasks.values())
+
+
+async def test_a_name_is_not_starved_behind_another_names_backlog(client, db_path):
+    """One slot, two backlogs. The claim serves groups in the order given, so
+    without rotating that order `embed` would hold the slot until its 40 tasks
+    were done and `other` would not run at all."""
+    worker = Worker.sqlite(db_path, poll_interval_ms=5, concurrency=1)
+    done = {"embed": 0, "other": 0}
+
+    @worker.task("embed", batch=4)
+    async def embed(items):
+        done["embed"] += len(items)
+
+    @worker.task("other", batch=4)
+    async def other(items):
+        done["other"] += len(items)
+
+    ids = [(await client.submit("embed", {})).id for _ in range(40)]
+    ids += [(await client.submit("other", {})).id for _ in range(8)]
+    await _drain(client, ids, worker)
+
+    assert done["embed"] == 40
+    # The real assertion is that this finished at all — a starved name would
+    # leave _drain to time out.
+    assert done["other"] == 8
 
 
 async def test_settling_during_a_beat_is_not_read_as_lease_loss(client, db_path):

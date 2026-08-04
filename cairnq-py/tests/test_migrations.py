@@ -11,6 +11,15 @@ from cairnq._ids import now_ms
 from cairnq._sql import load_migrations
 
 
+#: Indexes added by migrations after 0001, so a database that only ran the first
+#: one is missing all of them until it is upgraded.
+_EXPECTED_INDEXES = {
+    "cairnq_tasks_completed_idx",
+    "cairnq_tasks_lease_idx",
+    "cairnq_tasks_claim_name_idx",
+}
+
+
 def _index_names(db_path: str) -> set[str]:
     conn = sqlite3.connect(db_path)
     try:
@@ -40,8 +49,8 @@ async def test_applies_every_migration_to_a_fresh_database(db_path):
         conn.close()
 
     assert applied == {name for name, _ in load_migrations("sqlite")}
-    assert {"cairnq_tasks_completed_idx", "cairnq_tasks_lease_idx"} <= _index_names(db_path)
-    assert _meta(db_path, "schema_version") == "5"
+    assert _EXPECTED_INDEXES <= _index_names(db_path)
+    assert _meta(db_path, "schema_version") == "6"
 
 
 async def test_upgrades_a_database_left_at_an_older_migration(db_path):
@@ -69,8 +78,8 @@ async def test_upgrades_a_database_left_at_an_older_migration(db_path):
     await client.connect()
     try:
         # The later migrations ran, and the store is usable afterwards.
-        assert {"cairnq_tasks_completed_idx", "cairnq_tasks_lease_idx"} <= _index_names(db_path)
-        assert _meta(db_path, "schema_version") == "5"
+        assert _EXPECTED_INDEXES <= _index_names(db_path)
+        assert _meta(db_path, "schema_version") == "6"
         task = await client.submit("job", {"v": 1})
         assert (await client.get(task.id)).payload == {"v": 1}
     finally:

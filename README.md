@@ -132,12 +132,22 @@ Settling twice is a no-op, so there is no `finalized_ids` set to keep. Everythin
 else stays per task: each has its own lease, `attempt`, backoff and cancel flag,
 and one shared heartbeat renews only the ones still in play.
 
-**Size `concurrency` for the batch you want.** It counts tasks, not handler
-calls, so it is also the ceiling on batch size: `batch=256` on a worker left at
-the default `concurrency=1` delivers one task at a time. It is also the only
-thing that limits how many run at once — `batch=1` means "call me with a list of
-one", not "run one at a time". For work that saturates the machine, set
-`concurrency=1`. Give a batch worker its own queue and size both.
+**`concurrency` counts handler calls, not tasks**, so it is independent of batch
+size: a call carrying 256 tasks is one of them, and `batch=256` fills at the
+default `concurrency=1`. Size `concurrency` for how much work you want running at
+once and `batch` for what the downstream API wants — they no longer trade against
+each other, and `maxInFlightBytes` / `max_in_flight_bytes` is what bounds memory.
+
+Cap a single name with its own `concurrency`, so one expensive name cannot take
+the whole worker:
+
+```python
+@worker.task("embed", batch=256, concurrency=2)   # at most 2 calls at a time
+```
+
+Each name draws its own quota from one claim, so a big `batch` on one name never
+starts extra calls for another, and a name with a deep backlog cannot starve the
+others.
 
 The worker and the API can be in **either language** — a TypeScript API can drive
 a Python worker and vice-versa, because the only thing they share is the database

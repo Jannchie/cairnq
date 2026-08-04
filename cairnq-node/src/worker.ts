@@ -43,6 +43,36 @@ interface Registration {
   fn: Handler | BatchHandler;
   /** Tasks per handler call, or undefined for one-at-a-time delivery. */
   batch?: number;
+  /** Concurrent handler calls allowed for this name, or undefined for no limit
+   * beyond the worker's own. */
+  concurrency?: number;
+}
+
+/**
+ * One draw's worth of quota: a set of names and how many handler calls they may
+ * start. A name that limits itself — by `batch` or by its own `concurrency` —
+ * gets a source to itself, because its quota cannot be expressed in a draw shared
+ * with names that count differently. Everything else shares one, where a task is
+ * a call and the worker's own budget is the only ceiling.
+ */
+interface ClaimSource {
+  /**
+   * Counts calls in flight, and set only when this source caps its own
+   * concurrency — nothing else reads the count, so nothing else pays for it.
+   * Such a source always holds exactly one name, so this is that name.
+   */
+  key?: string;
+  names: string[];
+  /** Tasks per call — 1 for the shared source. */
+  batch: number;
+  /** Calls allowed for this source, or undefined for the worker budget alone. */
+  concurrency?: number;
+}
+
+/** What one poll's claim draws from, and the names the probe spans. */
+interface Schedule {
+  sources: ClaimSource[];
+  names: string[];
 }
 
 /** Where an error the worker recovered from came from. */
@@ -54,6 +84,12 @@ export type ErrorPhase = "claim" | "execute";
  * there is usually no CairnQ handle to have configured the store.
  */
 export interface WorkerOptions extends Partial<BackpressureOptions> {
+  /**
+   * Handler calls allowed to run at once. A batch call counts as one, however
+   * many tasks it carries — size it for how much work you want in flight, not
+   * for how many tasks that comes to. Per-name limits refine it; `maxInFlightBytes`
+   * bounds memory, which task counts never did.
+   */
   concurrency?: number;
   leaseMs?: number;
   heartbeatIntervalMs?: number;
@@ -82,10 +118,12 @@ export interface WorkerOptions extends Partial<BackpressureOptions> {
    * between megabytes and gigabytes resident. Once the budget is spent the
    * worker stops claiming until running handlers give it back.
    *
-   * The bound is on tasks already executing. A claim commits to a whole batch
-   * before any size is known, so one batch can overshoot by up to `claimBatch`
-   * payloads; lower `claimBatch` to tighten that. A single payload larger than
-   * the entire budget still runs — alone, rather than deadlocking the worker.
+   * The bound is on tasks already executing: it is read between claims, never
+   * during one, and a claim commits to its rows before any size is known. One
+   * poll can therefore overshoot by up to `claimBatch` rows per registered name
+   * (or one whole `batch`, whichever is larger). Lower `claimBatch`, or the batch
+   * sizes, to tighten that. A single payload larger than the entire budget still
+   * runs — alone, rather than deadlocking the worker.
    *
    * Costs one JSON serialization per task to measure, so it is only computed
    * when set. Unset disables the budget.
@@ -150,13 +188,12 @@ export class Worker {
   private readonly workerId = newId("worker");
   /** Payload bytes charged to running handlers — see maxInFlightBytes. */
   private inFlightBytes = 0;
-  /**
-   * Tasks charged to running handler calls. Kept as a counter rather than summed
-   * off `running` each turn: the loop re-reads it on every poll tick *and* every
-   * time a slot frees while saturated, and it is charged and refunded in exactly
-   * the same places as inFlightBytes.
-   */
-  private inFlightTasks = 0;
+  /** Calls in flight, for the names that cap their own concurrency. */
+  private readonly callsInFlight = new Map<string, number>();
+  /** Rotates which source is offered the free budget first — see loop(). */
+  private claimCursor = 0;
+  /** Invalidated by task(); see schedule(). */
+  private scheduleCache: Schedule | null = null;
   /**
    * Retry backoff, resolved once. Both settlement paths read these — the
    * worker's own `safeFail` and the TaskContext it hands a handler — so
@@ -227,22 +264,41 @@ export class Worker {
    * `batch` tasks, instead of `(ctx, payload)`. Use it when the work itself is
    * batched — one embedding call over 256 texts rather than 256 calls — and size
    * it by what the downstream API wants, not by the queue.
+   *
+   * `concurrency` caps the calls this name may run at once, under the worker's
+   * own. Use it to keep one expensive name from taking the whole worker.
    */
-  task(name: string | TaskDef, opts: { batch: number }, handler: BatchHandler): this;
+  task(
+    name: string | TaskDef,
+    opts: { batch: number; concurrency?: number },
+    handler: BatchHandler,
+  ): this;
+  /** Per-name concurrency without batching: the handler still takes `(ctx, payload)`. */
+  task(name: string | TaskDef, opts: { concurrency: number }, handler: Handler): this;
   task(
     arg: string | Handler | TaskDef,
-    second?: Handler | { batch: number },
-    third?: BatchHandler,
+    second?: Handler | { batch?: number; concurrency?: number },
+    third?: Handler | BatchHandler,
   ): this {
-    // Batch form: (name | def, { batch }, handler). Peel the option off and fall
-    // through, so name resolution and registration stay single-sited.
+    // Option form: (name | def, { batch?, concurrency? }, handler). Peel the
+    // options off and fall through, so name resolution and registration stay
+    // single-sited.
     let batch: number | undefined;
+    let concurrency: number | undefined;
     let handler = second as Handler | BatchHandler | undefined;
-    if (second != null && typeof second === "object" && "batch" in second) {
-      if (!Number.isInteger(second.batch) || second.batch < 1) {
-        throw new Error(`batch must be an integer >= 1, got ${second.batch}`);
+    if (second != null && typeof second === "object") {
+      if (second.batch != null) {
+        if (!Number.isInteger(second.batch) || second.batch < 1) {
+          throw new Error(`batch must be an integer >= 1, got ${second.batch}`);
+        }
+        batch = second.batch;
       }
-      batch = second.batch;
+      if (second.concurrency != null) {
+        if (!Number.isInteger(second.concurrency) || second.concurrency < 1) {
+          throw new Error(`concurrency must be an integer >= 1, got ${second.concurrency}`);
+        }
+        concurrency = second.concurrency;
+      }
       handler = third;
     }
     let name: string;
@@ -264,7 +320,8 @@ export class Worker {
       name = taskName(arg);
       fn = handler!;
     }
-    this.handlers.set(name, { fn, batch });
+    this.handlers.set(name, { fn, batch, concurrency });
+    this.scheduleCache = null;
     return this;
   }
 
@@ -299,12 +356,8 @@ export class Worker {
     const concurrency = Math.max(1, opts.concurrency ?? this.opts.concurrency ?? 1);
     const leaseMs = this.opts.leaseMs ?? 30_000;
     await this.store.connect();
-    // The calls in flight. How many *tasks* they hold is counted separately, in
-    // inFlightTasks: `concurrency` bounds tasks, not calls, so a batch call
-    // holding 8 tasks holds 8 of the budget and a worker cannot accumulate
-    // batches until it is running far more tasks than it was configured for. It
-    // also makes `concurrency` the ceiling on batch size, since a claim can never
-    // exceed the free budget.
+    // The calls in flight — `concurrency` counts these, so the set's size is the
+    // budget. How many tasks they carry is `maxInFlightBytes`'s business.
     const running = new Set<Promise<void>>();
     try {
       await this.loop(concurrency, leaseMs, running);
@@ -353,6 +406,57 @@ export class Worker {
     });
   }
 
+  /**
+   * How this poll's claim is split into per-name quotas, plus the union of names
+   * the probe spans.
+   *
+   * Cached and invalidated by `task()`, rather than rebuilt each poll: handlers
+   * may be registered after run() started, but only there, and this otherwise
+   * allocates a source per name on every tick for a worker's whole lifetime.
+   *
+   * A name that limits itself — by `batch` or by its own `concurrency` — needs a
+   * quota the shared draw cannot express, so it gets a source of its own; every
+   * other name shares one, where a task is a call.
+   */
+  private schedule(): Schedule {
+    if (this.scheduleCache) return this.scheduleCache;
+    const sources: ClaimSource[] = [];
+    const shared: string[] = [];
+    for (const [name, reg] of this.handlers) {
+      if (reg.batch != null || reg.concurrency != null) {
+        sources.push({
+          key: reg.concurrency == null ? undefined : name,
+          names: [name],
+          batch: reg.batch ?? 1,
+          concurrency: reg.concurrency,
+        });
+      } else shared.push(name);
+    }
+    if (shared.length) sources.push({ names: shared, batch: 1 });
+    return (this.scheduleCache = { sources, names: [...this.handlers.keys()] });
+  }
+
+  /**
+   * A source's own call ceiling for one poll, or undefined when only the
+   * worker-wide budget applies.
+   *
+   * Two independent ceilings: the name's own concurrency, less what it is already
+   * running, and `claimBatch`. The latter is a ceiling on *rows* per poll, so it
+   * converts at this source's batch size — and never below one call, or a
+   * `claimBatch` under some name's batch would stall that name outright.
+   */
+  private sourceCalls(src: ClaimSource): number | undefined {
+    const rows = this.opts.claimBatch;
+    const byRows = rows == null ? undefined : Math.max(1, Math.floor(rows / src.batch));
+    const byName =
+      src.concurrency == null
+        ? undefined
+        : Math.max(0, src.concurrency - (this.callsInFlight.get(src.key!) ?? 0));
+    if (byRows == null) return byName;
+    if (byName == null) return byRows;
+    return Math.min(byRows, byName);
+  }
+
   private async loop(
     concurrency: number,
     leaseMs: number,
@@ -360,14 +464,15 @@ export class Worker {
   ): Promise<void> {
     const pollMs = this.opts.pollIntervalMs ?? 500;
     const byteBudget = this.opts.maxInFlightBytes;
-    const claimCeiling = this.opts.claimBatch ?? concurrency;
     while (!this.stopped) {
-      const free = concurrency - this.inFlightTasks;
-      // Two ceilings, either of which stops the claim: task count and resident
-      // payload bytes. The byte arm is guarded on running.size because it must
-      // never be the reason we race an empty set — Promise.race([]) is pending
-      // forever, past even stop(). With nothing running, nothing is resident, so
-      // the budget cannot be the thing holding us back anyway.
+      // `concurrency` counts calls, so the calls in flight *are* the running
+      // promises — a batch holding 256 tasks is one of them.
+      const free = concurrency - running.size;
+      // Two ceilings, either of which stops the claim: calls in flight and
+      // resident payload bytes. The byte arm is guarded on running.size because
+      // it must never be the reason we race an empty set — Promise.race([]) is
+      // pending forever, past even stop(). With nothing running, nothing is
+      // resident, so the budget cannot be the thing holding us back anyway.
       const overBudget = byteBudget != null && this.inFlightBytes >= byteBudget;
       if (running.size > 0 && (free <= 0 || overBudget)) {
         // Wait for a slot rather than spinning. runCall() never rejects, so
@@ -375,28 +480,45 @@ export class Worker {
         await Promise.race([...running]);
         continue;
       }
-      let claimed: Task[];
+      const { sources, names } = this.schedule();
+      if (!sources.length) {
+        await this.idle(pollMs);
+        continue;
+      }
+      // Round-robin the starting point. The draws are served in order, so without
+      // rotating it the first source would take every free slot and the rest
+      // would starve behind its backlog.
+      const cursor = this.claimCursor % sources.length;
+      const order = [...sources.slice(cursor), ...sources.slice(0, cursor)];
+      this.claimCursor = (cursor + 1) % sources.length;
+      let claimed: { src: ClaimSource; calls: [Registration | undefined, Task[]][] }[] | undefined;
       try {
-        claimed = await this.store.claim({
-          queues: this.queues,
+        claimed = await this.store.claimSession(
           // Only what this worker can run. Queues do not partition work by task
           // name, so another worker's tasks would otherwise be claimed here and
-          // failed for want of a handler. Read each poll: handlers may be
-          // registered after run() started.
-          names: [...this.handlers.keys()],
-          workerId: this.workerId,
-          leaseMs,
-          // `concurrency` bounds tasks in flight, batched or not, so a claim
-          // never exceeds it. Scaling this by the widest registered batch would
-          // let one poll return `concurrency * batch` rows — and a claim is
-          // filtered by queue and name set, not by delivery mode, so a queue
-          // holding unbatched work would turn every one of those rows into its
-          // own handler call. One `batch: 256` registration would then run 256
-          // unrelated handlers on a worker configured for one. So the batch a
-          // handler sees is bounded by `concurrency` too: size it for the batch
-          // you want.
-          limit: Math.min(claimCeiling, free),
-        });
+          // failed for want of a handler.
+          { queues: this.queues, workerId: this.workerId, leaseMs, names },
+          async (claim) => {
+            const drawn: { src: ClaimSource; calls: [Registration | undefined, Task[]][] }[] = [];
+            let left = free;
+            for (const src of order) {
+              if (left <= 0) break;
+              const quota = Math.min(this.sourceCalls(src) ?? left, left);
+              if (quota <= 0) continue;
+              const rows = await claim(src.names, src.batch * quota);
+              if (!rows.length) continue;
+              // deliveries() is what actually turns rows into handler calls, so
+              // spending the budget against its result is the only way the two
+              // cannot disagree. A source with nothing queued costs nothing,
+              // which is why the budget is spent here, draw by draw, rather than
+              // divided up before the claim.
+              const calls = this.deliveries(rows);
+              drawn.push({ src, calls });
+              left -= calls.length;
+            }
+            return drawn;
+          },
+        );
       } catch (err) {
         // A claim can fail transiently (lock contention, a dropped connection).
         // Report it and keep polling — one bad poll must not end the worker.
@@ -404,28 +526,35 @@ export class Worker {
         await this.sleepOrStop(CLAIM_ERROR_BACKOFF_MS);
         continue;
       }
-      if (claimed.length === 0) {
+      if (!claimed?.length) {
         await this.idle(pollMs);
         continue;
       }
-      for (const [reg, group] of this.deliveries(claimed)) {
-        // Charged before the handler starts and refunded when it settles, so the
-        // budgets cover exactly the span the tasks are held and their payloads
-        // pinned in memory.
-        const bytes =
-          byteBudget == null ? 0 : group.reduce((sum, t) => sum + payloadBytes(t), 0);
-        this.inFlightBytes += bytes;
-        this.inFlightTasks += group.length;
-        // An unregistered name has nothing to run, so it never starts a handler
-        // or a heartbeat; everything else is one call, batched or not.
-        const call =
-          reg == null ? this.failNoHandler(group[0], leaseMs) : this.runCall(reg, group, leaseMs);
-        const p = call.finally(() => {
-          this.inFlightBytes -= bytes;
-          this.inFlightTasks -= group.length;
-          running.delete(p);
-        });
-        running.add(p);
+      for (const { src, calls } of claimed) {
+        for (const [reg, group] of calls) {
+          // Charged before the handler starts and refunded when it settles, so
+          // the budgets cover exactly the span the call holds its slot and its
+          // payloads stay pinned in memory.
+          const bytes =
+            byteBudget == null ? 0 : group.reduce((sum, t) => sum + payloadBytes(t), 0);
+          this.inFlightBytes += bytes;
+          const key = src.key;
+          if (key != null) this.callsInFlight.set(key, (this.callsInFlight.get(key) ?? 0) + 1);
+          // An unregistered name has nothing to run, so it never starts a handler
+          // or a heartbeat; everything else is one call, batched or not.
+          const call =
+            reg == null ? this.failNoHandler(group[0], leaseMs) : this.runCall(reg, group, leaseMs);
+          const p = call.finally(() => {
+            this.inFlightBytes -= bytes;
+            if (key != null) {
+              const rest = (this.callsInFlight.get(key) ?? 1) - 1;
+              if (rest > 0) this.callsInFlight.set(key, rest);
+              else this.callsInFlight.delete(key);
+            }
+            running.delete(p);
+          });
+          running.add(p);
+        }
       }
     }
   }

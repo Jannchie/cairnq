@@ -49,7 +49,7 @@ async def test_store_error_while_finalizing_is_reported_not_swallowed(client, db
 async def test_keeps_polling_after_a_transient_claim_error(client, db_path):
     store = SQLiteStore(db_path)
     await store.connect()
-    real_claim = store.claim
+    real_claim = store.claim_session
     calls = 0
 
     async def flaky_claim(**kwargs):
@@ -59,7 +59,7 @@ async def test_keeps_polling_after_a_transient_claim_error(client, db_path):
             raise sqlite3.OperationalError("database is locked")
         return await real_claim(**kwargs)
 
-    store.claim = flaky_claim
+    store.claim_session =flaky_claim
     errors: list[BaseException] = []
     worker = Worker(
         store, ["default"], poll_interval_ms=10, on_error=lambda exc, info: errors.append(exc)
@@ -133,7 +133,7 @@ async def test_run_drains_in_flight_tasks_however_it_exits(db_path, client):
     hold on each rather than assumed from one."""
     store = SQLiteStore(db_path)
     await store.connect()
-    real_claim = store.claim
+    real_claim = store.claim_session
     calls = {"n": 0}
 
     async def broken_claim(**kwargs):
@@ -142,7 +142,7 @@ async def test_run_drains_in_flight_tasks_however_it_exits(db_path, client):
             return await real_claim(**kwargs)
         return object()  # a store that breaks its own contract: truthy, not a list
 
-    store.claim = broken_claim
+    store.claim_session =broken_claim
     finished = {"flag": False}
     # Two slots, so the loop comes back around to the broken claim while the first
     # task is still running.

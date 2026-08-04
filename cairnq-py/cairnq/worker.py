@@ -143,6 +143,38 @@ class _Registration:
     wants_payload: bool
     #: Tasks per handler call, or None for one-at-a-time delivery.
     batch: int | None = None
+    #: Concurrent handler calls allowed for this name, or None for no limit
+    #: beyond the worker's own.
+    concurrency: int | None = None
+
+
+@dataclass(frozen=True)
+class _ClaimSource:
+    """One draw's worth of quota: a set of names and how many handler calls they
+    may start.
+
+    A name that limits itself — by `batch` or by its own `concurrency` — gets a
+    source to itself, because its quota cannot be expressed in a draw shared with
+    names that count differently. Everything else shares one, where a task is a
+    call."""
+
+    #: Counts calls in flight, and set only when this source caps its own
+    #: concurrency — nothing else reads the count, so nothing else pays for it.
+    #: Such a source always holds exactly one name, so this is that name.
+    key: str | None
+    names: tuple[str, ...]
+    #: Tasks per call — 1 for the shared source.
+    batch: int
+    #: Calls allowed for this source, or None for the worker budget alone.
+    concurrency: int | None
+
+
+@dataclass(frozen=True)
+class _Schedule:
+    """What one poll's claim draws from, and the names the probe spans."""
+
+    sources: tuple[_ClaimSource, ...]
+    names: list[str]
 
 
 class Worker:
@@ -201,19 +233,22 @@ class Worker:
         # difference between megabytes and gigabytes resident. Once spent, the
         # worker stops claiming until running handlers give it back.
         #
-        # The bound is on tasks already executing: a claim commits to a whole
-        # batch before any size is known, so one batch can overshoot by up to
-        # `claim_batch` payloads (lower it to tighten that), and a single payload
+        # The bound is on tasks already executing: it is read between claims,
+        # never during one, and a claim commits to its rows before any size is
+        # known. One poll can therefore overshoot by up to `claim_batch` rows per
+        # registered name (or one whole `batch`, whichever is larger); lower
+        # `claim_batch`, or the batch sizes, to tighten that. A single payload
         # larger than the whole budget still runs — alone, rather than
         # deadlocking the worker. None disables the budget, and the measurement
         # with it.
         self._max_in_flight_bytes = max_in_flight_bytes
         self._in_flight_bytes = 0
-        # Tasks charged to running handler calls. A counter rather than a sum
-        # over `running` each turn: the loop re-reads it on every poll tick *and*
-        # every time a slot frees while saturated, and it is charged and refunded
-        # in exactly the same places as _in_flight_bytes.
-        self._in_flight_tasks = 0
+        # Calls in flight, for the names that cap their own concurrency.
+        self._calls_in_flight: dict[str, int] = {}
+        # Rotates which source is offered the free budget first — see run().
+        self._claim_cursor = 0
+        # Invalidated by register(); see _schedule().
+        self._schedule_cache: _Schedule | None = None
         # Called for errors the worker survived — a claim that threw, a store
         # write that failed while finalizing a task. Without it these are silent:
         # the run loop carries on either way, so this is the only place an
@@ -279,7 +314,11 @@ class Worker:
         return self._worker_id
 
     def task(
-        self, name: str | TaskDef[Any, Any] | Handler | None = None, *, batch: int | None = None
+        self,
+        name: str | TaskDef[Any, Any] | Handler | None = None,
+        *,
+        batch: int | None = None,
+        concurrency: int | None = None,
     ) -> Any:
         """Register a handler. Usable bare (`@worker.task` — registered under the
         function's name), with an explicit name (`@worker.task("summary.create")`)
@@ -290,23 +329,39 @@ class Worker:
         argument, a `list[TaskContext]` of up to N tasks, instead of
         `(ctx, payload)`. Use it when the work itself is batched — one embedding
         call over 256 texts rather than 256 calls — and size N by what the
-        downstream API wants, not by the queue."""
+        downstream API wants, not by the queue.
+
+        `concurrency=N` caps the calls this name may run at once, under the
+        worker's own. Use it to keep one expensive name from taking the whole
+        worker; it applies to batched and unbatched names alike."""
         if callable(name):  # used bare: @worker.task
-            self.register(_required_name(name), name, batch=batch)
+            self.register(_required_name(name), name, batch=batch, concurrency=concurrency)
             return name
 
         resolved = None if name is None else task_name(name)
 
         def decorator(fn: Handler) -> Handler:
-            self.register(resolved or _required_name(fn), fn, batch=batch)
+            self.register(
+                resolved or _required_name(fn), fn, batch=batch, concurrency=concurrency
+            )
             return fn
 
         return decorator
 
-    def register(self, name: str, fn: Handler, *, batch: int | None = None) -> None:
+    def register(
+        self,
+        name: str,
+        fn: Handler,
+        *,
+        batch: int | None = None,
+        concurrency: int | None = None,
+    ) -> None:
         if batch is not None and batch < 1:
             raise ValueError(f"batch must be >= 1, got {batch}")
-        self._handlers[name] = _Registration(fn, _wants_payload(fn), batch)
+        if concurrency is not None and concurrency < 1:
+            raise ValueError(f"concurrency must be >= 1, got {concurrency}")
+        self._handlers[name] = _Registration(fn, _wants_payload(fn), batch, concurrency)
+        self._schedule_cache = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -359,23 +414,20 @@ class Worker:
         # loop would await asyncio.wait(set()), which raises.
         concurrency = max(1, concurrency or self._concurrency)
         await self._store.connect()
-        # The calls in flight. How many *tasks* they hold is counted separately,
-        # in _in_flight_tasks: `concurrency` bounds tasks, not calls, so a batch
-        # call holding 8 tasks holds 8 of the budget and a worker cannot
-        # accumulate batches until it is running far more tasks than it was
-        # configured for. It also makes `concurrency` the ceiling on batch size,
-        # since a claim can never exceed the free budget.
+        # The calls in flight — `concurrency` counts these, so the set's size is
+        # the budget. How many tasks they carry is max_in_flight_bytes's business.
         running: set[asyncio.Task] = set()
-        claim_ceiling = self._batch or concurrency
         try:
             while not self._stop.is_set():
-                free = concurrency - self._in_flight_tasks
-                # Two ceilings, either of which stops the claim: task count and
-                # resident payload bytes. The byte arm is guarded on `running`
-                # being non-empty because it must never be the reason we wait on
-                # an empty set — asyncio.wait(set()) raises. With nothing
-                # running, nothing is resident, so the budget cannot be what is
-                # holding us back anyway.
+                # `concurrency` counts calls, so the calls in flight *are* the
+                # running tasks — a batch holding 256 tasks is one of them.
+                free = concurrency - len(running)
+                # Two ceilings, either of which stops the claim: calls in flight
+                # and resident payload bytes. The byte arm is guarded on
+                # `running` being non-empty because it must never be the reason
+                # we wait on an empty set — asyncio.wait(set()) raises. With
+                # nothing running, nothing is resident, so the budget cannot be
+                # what is holding us back anyway.
                 over_budget = (
                     self._max_in_flight_bytes is not None
                     and self._in_flight_bytes >= self._max_in_flight_bytes
@@ -385,28 +437,53 @@ class Worker:
                     # raises, so waiting on it cannot surface an exception here.
                     await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
                     continue
+                schedule = self._schedule()
+                if not schedule.sources:
+                    await self._idle(self._poll)
+                    continue
+                # Round-robin the starting point. The draws are served in order,
+                # so without rotating it the first source would take every free
+                # slot and the rest would starve behind its backlog.
+                sources = schedule.sources
+                cursor = self._claim_cursor % len(sources)
+                order = sources[cursor:] + sources[:cursor]
+                self._claim_cursor = (cursor + 1) % len(sources)
+
+                async def plan(claim, order=order, free=free):
+                    drawn: list[tuple[_ClaimSource, list[Any]]] = []
+                    left = free
+                    for src in order:
+                        if left <= 0:
+                            break
+                        own = self._source_calls(src)
+                        quota = left if own is None else min(own, left)
+                        if quota <= 0:
+                            continue
+                        rows = await claim(list(src.names), src.batch * quota)
+                        if not rows:
+                            continue
+                        # _deliveries is what actually turns rows into handler
+                        # calls, so spending the budget against its result is the
+                        # only way the two cannot disagree. A source with nothing
+                        # queued costs nothing, which is why the budget is spent
+                        # here, draw by draw, rather than divided up before the
+                        # claim.
+                        calls = self._deliveries(rows)
+                        drawn.append((src, calls))
+                        left -= len(calls)
+                    return drawn
+
                 try:
-                    claimed = await self._store.claim(
+                    claimed = await self._store.claim_session(
                         queues=self._queues,
+                        worker_id=self._worker_id,
+                        lease_ms=self._lease_ms,
                         # Only what this worker can run. Queues do not partition
                         # work by task name, so another worker's tasks would
                         # otherwise be claimed here and failed for want of a
-                        # handler. Read each poll: handlers may be registered
-                        # after run() started.
-                        names=list(self._handlers),
-                        worker_id=self._worker_id,
-                        lease_ms=self._lease_ms,
-                        # `concurrency` bounds tasks in flight, batched or not, so
-                        # a claim never exceeds it. Scaling this by the widest
-                        # registered batch would let one poll return `concurrency
-                        # * batch` rows — and a claim is filtered by queue and
-                        # name set, not by delivery mode, so a queue holding
-                        # unbatched work would turn every one of those rows into
-                        # its own handler call. One `batch=256` registration would
-                        # then run 256 unrelated handlers on a worker configured
-                        # for one. So the batch a handler sees is bounded by
-                        # `concurrency` too: size it for the batch you want.
-                        limit=min(claim_ceiling, free),
+                        # handler.
+                        names=schedule.names,
+                        plan=plan,
                     )
                 except Exception as exc:
                     # A claim can fail transiently (lock contention, a dropped
@@ -418,39 +495,99 @@ class Worker:
                 if not claimed:
                     await self._idle(self._poll)
                     continue
-                for reg, group in self._deliveries(claimed):
-                    # Charged before the handler starts and refunded when it
-                    # settles, so the budgets cover exactly the span the tasks are
-                    # held and their payloads pinned in memory.
-                    charged = (
-                        0
-                        if self._max_in_flight_bytes is None
-                        else sum(_payload_bytes(t) for t in group)
-                    )
-                    self._in_flight_bytes += charged
-                    self._in_flight_tasks += len(group)
+                for src, calls in claimed:
+                    for reg, group in calls:
+                        # Charged before the handler starts and refunded when it
+                        # settles, so the budgets cover exactly the span the call
+                        # holds its slot and its payloads stay pinned in memory.
+                        charged = (
+                            0
+                            if self._max_in_flight_bytes is None
+                            else sum(_payload_bytes(t) for t in group)
+                        )
+                        self._in_flight_bytes += charged
+                        if src.key is not None:
+                            self._calls_in_flight[src.key] = (
+                                self._calls_in_flight.get(src.key, 0) + 1
+                            )
 
-                    def settled(
-                        fut: asyncio.Task, size: int = charged, count: int = len(group)
-                    ) -> None:
-                        running.discard(fut)
-                        self._in_flight_bytes -= size
-                        self._in_flight_tasks -= count
+                        def settled(
+                            fut: asyncio.Task,
+                            size: int = charged,
+                            key: str | None = src.key,
+                        ) -> None:
+                            running.discard(fut)
+                            self._in_flight_bytes -= size
+                            if key is None:
+                                return
+                            rest = self._calls_in_flight.get(key, 1) - 1
+                            if rest > 0:
+                                self._calls_in_flight[key] = rest
+                            else:
+                                self._calls_in_flight.pop(key, None)
 
-                    # An unregistered name has nothing to run, so it never starts
-                    # a handler or a heartbeat; everything else is one call,
-                    # batched or not.
-                    coro = (
-                        self._fail_no_handler(group[0])
-                        if reg is None
-                        else self._run_call(reg, group)
-                    )
-                    fut = asyncio.create_task(coro)
-                    running.add(fut)
-                    fut.add_done_callback(settled)
+                        # An unregistered name has nothing to run, so it never
+                        # starts a handler or a heartbeat; everything else is one
+                        # call, batched or not.
+                        coro = (
+                            self._fail_no_handler(group[0])
+                            if reg is None
+                            else self._run_call(reg, group)
+                        )
+                        fut = asyncio.create_task(coro)
+                        running.add(fut)
+                        fut.add_done_callback(settled)
         finally:
             if running:
                 await asyncio.gather(*running, return_exceptions=True)
+
+    def _schedule(self) -> _Schedule:
+        """How this poll's claim is split into per-name quotas, plus the union of
+        names the probe spans.
+
+        Cached and invalidated by `register()`, rather than rebuilt each poll:
+        handlers may be registered after run() started, but only there, and this
+        otherwise allocates a source per name on every tick for a worker's whole
+        lifetime.
+
+        A name that limits itself — by `batch` or by its own `concurrency` — needs
+        a quota the shared draw cannot express, so it gets a source of its own;
+        every other name shares one, where a task is a call."""
+        if self._schedule_cache is not None:
+            return self._schedule_cache
+        sources: list[_ClaimSource] = []
+        shared: list[str] = []
+        for name, reg in self._handlers.items():
+            if reg.batch is not None or reg.concurrency is not None:
+                key = name if reg.concurrency is not None else None
+                sources.append(_ClaimSource(key, (name,), reg.batch or 1, reg.concurrency))
+            else:
+                shared.append(name)
+        if shared:
+            sources.append(_ClaimSource(None, tuple(shared), 1, None))
+        self._schedule_cache = _Schedule(tuple(sources), list(self._handlers))
+        return self._schedule_cache
+
+    def _source_calls(self, src: _ClaimSource) -> int | None:
+        """A source's own call ceiling for one poll, or None when only the
+        worker-wide budget applies.
+
+        Two independent ceilings: the name's own concurrency, less what it is
+        already running, and `claim_batch`. The latter is a ceiling on *rows* per
+        poll, so it converts at this source's batch size — and never below one
+        call, or a `claim_batch` under some name's batch would stall that name
+        outright."""
+        by_rows = None if self._batch is None else max(1, self._batch // src.batch)
+        by_name = (
+            None
+            if src.concurrency is None
+            else max(0, src.concurrency - self._calls_in_flight.get(src.key, 0))
+        )
+        if by_rows is None:
+            return by_name
+        if by_name is None:
+            return by_rows
+        return min(by_rows, by_name)
 
     def _deliveries(
         self, claimed: list[Task]

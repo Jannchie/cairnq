@@ -54,12 +54,12 @@ describe("worker resilience", () => {
   it("keeps polling after a transient claim error", async () => {
     const store = new SQLiteStore(dbPath);
     await store.connect();
-    const realClaim = store.claim.bind(store);
+    const realClaim = store.claimSession.bind(store);
     let calls = 0;
-    store.claim = async (input) => {
+    store.claimSession = async (input, plan) => {
       calls += 1;
       if (calls <= 2) throw new Error("database is locked");
-      return realClaim(input);
+      return realClaim(input, plan);
     };
     const errors: unknown[] = [];
     const worker = new Worker(store, ["default"], {
@@ -100,12 +100,15 @@ describe("worker resilience", () => {
     // throw out of the loop body used to skip it and abandon the in-flight work.
     const store = new SQLiteStore(dbPath);
     await store.connect();
-    const realClaim = store.claim.bind(store);
+    const realClaim = store.claimSession.bind(store);
     let calls = 0;
-    store.claim = async (input) => {
+    // A store that breaks its own contract: non-empty by `.length`, so the loop
+    // goes on to dispatch it, but not iterable — so dispatch throws.
+    const notAnArray = { length: 1 } as never;
+    store.claimSession = async (input, plan) => {
       calls += 1;
-      if (calls === 1) return realClaim(input);
-      return undefined as never; // a store that breaks its own contract
+      if (calls === 1) return realClaim(input, plan);
+      return notAnArray;
     };
     let finished = false;
     // Two slots, so the loop comes back around to the broken claim while the

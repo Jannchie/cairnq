@@ -212,8 +212,10 @@ statement snapshots). Pinned by `key_reuse_after_purge`.
 
 Client-side (API role): `submit`, `get`, `get_by_key`, `list`, `stats`,
 `queue_depth`, `cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus
-SDK-orchestrated `wait` / `call`. Worker-side: `claim`, `heartbeat`,
-`heartbeat_batch`, `progress`, `complete`, `succeed`, `fail`.
+SDK-orchestrated `wait` / `call`. Worker-side: `claim` (and its
+`claim_one_queue` / `claim_one_name` / `claim_one_queue_one_name`
+specializations), `heartbeat`, `heartbeat_batch`, `progress`, `complete`,
+`succeed`, `fail`.
 
 `stats` is the one aggregate read: task counts grouped by queue and status
 (`stats.sql`). SDKs zero-fill the statuses a queue has no rows in; a queue with
@@ -236,6 +238,28 @@ work does it open the `BEGIN IMMEDIATE` write transaction (recover expired lease
 claim). This keeps idle workers off SQLite's single write lock. Postgres skips the
 probe: its readers don't block writers, and `FOR UPDATE SKIP LOCKED` makes
 concurrent claims non-contending.
+
+The write transaction may run a claim statement **more than once**, each with its
+own name filter and `limit` — that is how a worker gives each task name its own
+quota (see "Batch delivery"). One probe and one `recover_leases` still cover them
+all; what varies is how many draws follow and under which filter.
+
+`claim` has three specializations, picked per draw, each swapping a list-valued
+predicate for an equality: `claim_one_queue`, `claim_one_name`, and
+`claim_one_queue_one_name`. They exist because a list-valued filter cannot be read
+in claim order — the planner sorts every claimable row to take `LIMIT` of them, so
+the draw's cost grows with the backlog while it holds the transaction. The name
+variants are what let `cairnq_tasks_claim_name_idx` (migration `0006`) be used at
+all: an `IN`/`= any` name filter does not reach it even for a single-element list,
+so without them a draw for a name with **nothing** queued walks the entire
+claimable backlog. Measured on SQLite at a 20k backlog: 1116us for that draw
+against the old index, 1446us via `json_each` against the new one, **8.8us** via
+the equality. A draw with no name filter or a list-valued one still reads
+`cairnq_tasks_claim_idx` and is unaffected.
+
+The four are byte-for-byte derivable from `claim.sql` — a drift-guard test asserts
+each differs only on the predicates it specializes, so `claim.sql` stays the
+source and the rest are re-derived when it changes.
 
 `purge` is the only operation that deletes. Nothing else ever removes a row, so a
 long-lived database grows without bound unless the application calls it on a
@@ -294,14 +318,32 @@ record. Consequences worth stating:
 - `max_run_ms` / `maxRunMs` bounds **the whole call**, and on expiry every context
   in it is flagged lease-lost before the leftovers are failed, so a handler that
   survives cancellation cannot settle any of them behind the worker's back.
-- A worker's **`concurrency` counts tasks, not calls**: a batch call holding 8
-  tasks holds 8 of the budget. So `concurrency` is also the ceiling on batch
-  size — a claim never asks for more than the free budget, and `batch=256` on a
-  worker with `concurrency=8` delivers 8 at a time. Size the worker for the batch
-  you want. Scaling the claim by the batch size instead is unsound: a claim is
-  filtered by queue and name set, *not* by delivery mode, so one `batch=256`
-  registration would let a queue holding unbatched work start 256 handler calls
-  on a worker configured for one.
+- A worker's **`concurrency` counts calls, not tasks**: a call carrying 256 tasks
+  is one of them, so batch size is independent of it and `batch=256` fills at
+  `concurrency=1`. Counting tasks instead welds the two together — a full batch
+  becomes unreachable unless `concurrency` is raised to match, which also
+  authorizes that many concurrent calls for every *other* name on the worker.
+- **A claim draws a separate quota per name.** One `limit` over the whole name set
+  cannot express "up to 256 embed, up to 4 of everything else": a claim is
+  filtered by queue and name set, *not* by delivery mode, so a single limit sized
+  for the widest batch lets a queue holding unbatched work start that many calls.
+  Which names get their own draw is the part both SDKs must agree on, because a
+  user comparing them can observe it: **a name draws separately if it sets
+  `batch` or a per-name `concurrency`; every other name shares one draw.** The
+  draws run **in one transaction**, after a single `recover_leases`, so the split
+  costs one statement per draw, not one transaction per draw, and the read-only
+  probe still keeps an idle worker out of a write transaction entirely.
+- The **call budget is spent against what each draw actually claimed**, inside
+  that transaction — which is why the store exposes the transaction and the
+  worker spends the budget, rather than the store being told a quota per name. A
+  budget divided up in advance would hand shares to names with nothing queued and
+  leave those slots idle until the next poll.
+
+  Draw order is an SDK scheduling choice, not a contract — it leaves no trace in
+  the database and conformance cannot observe it. Worth stating anyway: an SDK
+  serving draws in a fixed order lets the first name take the whole budget every
+  poll and starves the rest behind its backlog, so both SDKs here rotate the
+  starting point between polls.
 - A batch is **never padded**: a chunk goes to the handler at whatever size the
   claim produced. Waiting to fill one would trade latency for a batch size the
   backlog will supply on its own when it is large enough to matter.
@@ -455,10 +497,13 @@ CairnQ targets same-host coordination. Know the edges:
   whole purpose is approximate. Size the limit for the pushback you want, not as
   a capacity assertion.
 - **A worker's byte budget bounds what is already executing.** `max_in_flight_bytes`
-  is consulted between claims, and a claim commits to a whole batch before any
-  payload's size is known, so one batch can overshoot by up to `claim_batch`
-  payloads; lower `claim_batch` to tighten it. A single payload larger than the
-  entire budget still runs — alone, rather than deadlocking the worker.
+  is consulted between claims, never during one, and a claim commits to its rows
+  before any payload's size is known. So one poll can overshoot it: each draw
+  takes at most `claim_batch` rows (or one whole `batch`, whichever is larger —
+  a `claim_batch` below a name's batch size would otherwise stall that name), and
+  a poll may make one draw per name. Lower `claim_batch`, or the batch sizes, to
+  tighten it. A single payload larger than the entire budget still runs — alone,
+  rather than deadlocking the worker.
 - **No in-database authorization.** Unlike a Postgres role model, any process that
   can open the SQLite file has full read/write access and executes SQL directly.
   Protect the file with OS permissions; treat DB access as full trust.
@@ -478,7 +523,7 @@ contract that an existing SDK could get wrong.
 
 Ordinals are **one sequence shared by both dialects**, so a dialect may have no
 file at an ordinal — `0003` is the Postgres-only LISTEN/NOTIFY trigger, and SQLite
-goes 0001, 0002, 0004, 0005. A migration that closes an ordinal sets
+goes 0001, 0002, 0004, 0005, 0006. A migration that closes an ordinal sets
 `schema_version` to it in *every* dialect it ships in, so the two never report
 different numbers for the same schema. (`0003` predates this rule and sets nothing, which is why both dialects
 read 2 until 0004 takes them to 4.)

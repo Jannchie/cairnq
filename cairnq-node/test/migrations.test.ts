@@ -52,7 +52,8 @@ describe("migrations", () => {
     const names = indexNames(path);
     expect(names.has("cairnq_tasks_completed_idx")).toBe(true);
     expect(names.has("cairnq_tasks_lease_idx")).toBe(true);
-    expect(meta(path, "schema_version")).toBe("5");
+    expect(names.has("cairnq_tasks_claim_name_idx")).toBe(true);
+    expect(meta(path, "schema_version")).toBe("6");
   });
 
   it("upgrades a database left at an older migration", async () => {
@@ -78,7 +79,8 @@ describe("migrations", () => {
     try {
       expect(indexNames(path).has("cairnq_tasks_completed_idx")).toBe(true);
       expect(indexNames(path).has("cairnq_tasks_lease_idx")).toBe(true);
-      expect(meta(path, "schema_version")).toBe("5");
+      expect(indexNames(path).has("cairnq_tasks_claim_name_idx")).toBe(true);
+      expect(meta(path, "schema_version")).toBe("6");
       const task = await client.submit("job", { v: 1 });
       expect((await client.get(task.id))?.payload).toEqual({ v: 1 });
     } finally {

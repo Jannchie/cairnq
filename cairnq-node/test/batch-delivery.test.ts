@@ -323,11 +323,11 @@ describe("batch delivery", () => {
     );
   });
 
-  it("bounds concurrency by tasks, not by calls", async () => {
-    // Regression: sizing the claim by the widest registered batch let one
-    // `batch: 64` registration run 64 unrelated single-task handlers at once on a
-    // worker configured for one. A claim is filtered by queue and name set, not
-    // by delivery mode, so every one of those rows became its own call.
+  it("does not let a batched name start calls for an unbatched one", async () => {
+    // Regression: the claim used to be one statement over every registered name,
+    // so sizing it for the widest batch let a `batch: 64` registration pull 64
+    // rows of unrelated work and turn each into its own call on a worker
+    // configured for one. Each name now draws its own quota.
     const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 1 });
     let live = 0;
     let peak = 0;
@@ -347,25 +347,114 @@ describe("batch delivery", () => {
     expect([...tasks.values()].map((t) => t.status)).toEqual(Array(20).fill("succeeded"));
   });
 
-  it("never lets a batch exceed the task budget", async () => {
-    // The other half of the same rule: a batch call holds one budget slot per
-    // task, so batches cannot accumulate past `concurrency` either.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 4 });
-    let inFlight = 0;
-    let peak = 0;
+  it("bounds concurrency by calls, not by tasks", async () => {
+    // concurrency counts handler calls: a call holding 4 tasks is one of them.
+    // Counting tasks instead is what used to weld batch size to concurrency —
+    // a full batch was unreachable unless concurrency was raised to match it.
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 2 });
+    let calls = 0;
+    let peakCalls = 0;
+    let widest = 0;
 
     worker.task("embed", { batch: 4 }, async (items) => {
-      inFlight += items.length;
-      peak = Math.max(peak, inFlight);
+      calls++;
+      peakCalls = Math.max(peakCalls, calls);
+      widest = Math.max(widest, items.length);
       await sleep(30);
-      inFlight -= items.length;
+      calls--;
     });
 
     const ids = await submitMany("embed", 20, () => ({}));
     const tasks = await drain(ids, worker);
 
-    expect(peak).toBeLessThanOrEqual(4);
+    expect(peakCalls).toBeLessThanOrEqual(2);
+    // A full batch is reachable at concurrency 2 — 8 tasks in flight, 2 calls.
+    expect(widest).toBe(4);
     expect([...tasks.values()].map((t) => t.status)).toEqual(Array(20).fill("succeeded"));
+  });
+
+  it("fills a batch on a worker left at the default concurrency", async () => {
+    // The headline of the change: batch size is no longer capped by concurrency,
+    // so `batch: 8` on a default worker delivers 8 rather than 1.
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20 });
+    const sizes: number[] = [];
+
+    worker.task("embed", { batch: 8 }, async (items) => {
+      sizes.push(items.length);
+    });
+
+    const ids = await submitMany("embed", 8, (n) => ({ n }));
+    const tasks = await drain(ids, worker);
+
+    expect(sizes).toEqual([8]);
+    expect([...tasks.values()].map((t) => t.status)).toEqual(Array(8).fill("succeeded"));
+  });
+
+  it("caps calls per name with a per-name concurrency", async () => {
+    // The worker budget allows 6 calls; `embed` may only ever run 2 of them, so
+    // one expensive name cannot take the whole worker.
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 6 });
+    let live = 0;
+    let peak = 0;
+
+    worker.task("embed", { batch: 2, concurrency: 2 }, async () => {
+      live++;
+      peak = Math.max(peak, live);
+      await sleep(30);
+      live--;
+    });
+
+    const ids = await submitMany("embed", 20, () => ({}));
+    const tasks = await drain(ids, worker);
+
+    expect(peak).toBeLessThanOrEqual(2);
+    expect([...tasks.values()].map((t) => t.status)).toEqual(Array(20).fill("succeeded"));
+  });
+
+  it("applies a per-name concurrency without batching", async () => {
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 8 });
+    let live = 0;
+    let peak = 0;
+
+    worker.task("slow", { concurrency: 1 }, async () => {
+      live++;
+      peak = Math.max(peak, live);
+      await sleep(20);
+      live--;
+    });
+
+    const ids = await submitMany("slow", 10, () => ({}));
+    const tasks = await drain(ids, worker);
+
+    expect(peak).toBe(1);
+    expect([...tasks.values()].map((t) => t.status)).toEqual(Array(10).fill("succeeded"));
+  });
+
+  it("does not starve a name behind another name's backlog", async () => {
+    // One slot, two backlogs. The claim serves groups in the order given, so
+    // without rotating that order `embed` would hold the slot until its 40 tasks
+    // were done and `other` would not run at all.
+    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 5, concurrency: 1 });
+    let embedDone = 0;
+    let otherDone = 0;
+
+    worker.task("embed", { batch: 4 }, async (items) => {
+      embedDone += items.length;
+    });
+    worker.task("other", { batch: 4 }, async (items) => {
+      otherDone += items.length;
+    });
+
+    const ids = [
+      ...(await submitMany("embed", 40, () => ({}))),
+      ...(await submitMany("other", 8, () => ({}))),
+    ];
+    await drain(ids, worker);
+
+    expect(embedDone).toBe(40);
+    // The real assertion is that this finished at all — a starved name would
+    // leave drain() to time out.
+    expect(otherDone).toBe(8);
   });
 
   it("does not read settling during a beat as lease loss", async () => {
