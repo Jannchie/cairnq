@@ -143,6 +143,7 @@ the whole worker:
 
 ```python
 @worker.task("embed", batch=256, concurrency=2)   # at most 2 calls at a time
+async def embed(items): ...
 ```
 
 Each name draws its own quota from one claim, so a big `batch` on one name never
@@ -158,10 +159,17 @@ once, on the worker, and the names join it:
 ```python
 worker = Worker.sqlite("tasks.db", resources={"gpu": 1, "index": 1})
 
-@worker.task("render", resource="gpu")       # render and compare share one GPU:
-@worker.task("compare", resource="gpu")      # at capacity 1, never both at once
+@worker.task("render", resource="gpu")             # render and compare share one
+async def render(ctx, payload): ...                # GPU: at capacity 1, never
+                                                   # both at once
+@worker.task("compare", resource="gpu")
+async def compare(ctx, payload): ...
+
 @worker.task("embed", batch=256, resource="gpu")   # composes with batching
-@worker.task("reindex", resource="index")
+async def embed(items): ...
+
+@worker.task("reindex", resource="index")          # a different scarce thing
+async def reindex(ctx, payload): ...
 ```
 
 ```ts
@@ -182,6 +190,13 @@ lease, a concurrency slot and a heartbeat, so making it wait its turn *inside* t
 handler pays for the exclusion with the very resources the limit exists to
 protect. Work blocked on a saturated resource stays `queued` and claimable by
 another worker.
+
+**A capacity is per worker process, not per machine or per cluster.** Two replicas
+each declaring `{"gpu": 1}` will run two calls against that GPU at once — the
+ceiling moved the constraint out of your deployment topology and into the code,
+but it did not become distributed. For one GPU, run one worker process (give it
+the concurrency it needs for everything else) rather than two replicas that each
+believe they own it.
 
 The worker and the API can be in **either language** — a TypeScript API can drive
 a Python worker and vice-versa, because the only thing they share is the database

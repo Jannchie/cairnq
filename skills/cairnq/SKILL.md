@@ -103,6 +103,34 @@ Each name draws its own claim quota, so `batch` and `concurrency` are independen
 `batch=256` fills at the default `concurrency=1`, and a per-name `concurrency`
 (with or without `batch`) stops one expensive name from taking the whole worker.
 
+### Shared resources (optional)
+
+`concurrency` caps a name against itself. When *different* handlers contend for
+one scarce thing — a GPU, a single-writer index — declare its capacity once on the
+worker and let the names join it:
+
+```python
+worker = Worker.sqlite("tasks.db", resources={"gpu": 1})
+
+@worker.task("render", resource="gpu")
+async def render(ctx, payload): ...
+
+@worker.task("embed", batch=256, resource="gpu")   # composes with batching
+async def embed(items): ...
+```
+
+TS: `Worker.sqlite(path, { resources: { gpu: 1 } })` +
+`worker.task("render", { resource: "gpu" }, fn)`.
+
+Capacity is a count, so two GPUs are `{"gpu": 2}`; at 1 it is mutual exclusion
+across those names. A name may also cap itself (`concurrency=1, resource="gpu"`)
+and the tighter binds. An undeclared resource raises at registration rather than
+reading as unlimited. The gate is at claim, so blocked work stays `queued` and
+claimable by another worker — it never sits on a lease waiting its turn.
+
+**Per worker process, not per cluster.** Two replicas each declaring `{"gpu": 1}`
+run two calls against that GPU. For one GPU, run one worker process.
+
 ## API side
 
 ```ts
