@@ -209,10 +209,12 @@ and a JSON protocol.
   several producers (see PROTOCOL.md).
 
   On the worker side, `max_in_flight_bytes` / `maxInFlightBytes` bounds resident
-  payload bytes rather than task count. `concurrency` alone does not: a worker
-  sized for small payloads holds `concurrency * largest-payload` bytes the moment
-  a batch of big ones arrives, which for payloads carrying media inline is the
-  difference between megabytes and gigabytes.
+  payload bytes, which no other option does. `concurrency` counts handler calls,
+  and a batched call carries up to `batch` tasks, so the bytes a worker can hold
+  are `concurrency * batch * largest-payload` — for payloads carrying media
+  inline, the difference between megabytes and gigabytes. It is read between
+  claims, so a poll can still overshoot it by one draw per name; size batches with
+  that in mind.
 
 ### At-least-once, not exactly-once
 

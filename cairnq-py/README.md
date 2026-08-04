@@ -66,7 +66,7 @@ Opt-in: every API still accepts a plain name string (cross-language callers use 
 ```python
 worker = Worker.sqlite(
     "tasks.db",
-    concurrency=4,
+    concurrency=4,            # handler calls at once; use max_in_flight_bytes to bound memory
     retry_backoff_ms=1_000,   # doubles per attempt, capped by retry_backoff_max_ms (30s); 0 disables
     on_error=lambda exc, info: log.warning("worker survived %s: %s", info, exc),
 )

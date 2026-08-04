@@ -3,12 +3,12 @@ name: cairnq
 description: >-
   Use cairnq, the cross-language durable task runtime that coordinates through a
   shared database (SQLite for one host, Postgres for many). Covers the worker side
-  (register handlers, run them), the API side (submit / call / get / cancel /
-  retry / stats by id or business key), idempotency keys, retries, cooperative
-  cancel, and the at-least-once limits. Trigger when code imports `cairnq` (Python
-  or TypeScript), defines a Worker or handler, calls submit/call/getByKey, or the
-  user mentions cairnq, tasks.db, a durable task queue, or an embedded SQLite job
-  runtime.
+  (register handlers, run them, batch delivery), the API side (submit / call / get
+  / cancel / retry / stats by id or business key), idempotency keys, retries,
+  cooperative cancel, and the at-least-once limits. Trigger when code imports
+  `cairnq` (Python or TypeScript), defines a Worker or handler, calls
+  submit/call/getByKey, batches tasks into one handler call, or the user mentions
+  cairnq, tasks.db, a durable task queue, or an embedded SQLite job runtime.
 ---
 
 # Using cairnq
@@ -54,11 +54,13 @@ TS: `worker.task("summarize", async (ctx, payload) => {…})`, or `worker.task(f
 → name = `fn.name`. For a dotted/namespaced name pass it explicitly:
 `@worker.task("summary.create")`.
 
-**Options:** `queues` (`["default"]`), `concurrency` (1, also `serve(concurrency=…)`),
+**Options:** `queues` (`["default"]`), `concurrency` (1, also `serve(concurrency=…)`
+— it counts **handler calls**, so a batch call carrying 256 tasks is one of them),
 `lease_ms` (30s), `poll_interval_ms` (500ms), `retry_backoff_ms` /
-`retry_backoff_max_ms` (1s doubling to 30s), `max_run_ms`, `on_error`. `serve()`
-owns the process and its signals; `run()` / `background()` embed the worker in an
-event loop you manage.
+`retry_backoff_max_ms` (1s doubling to 30s), `max_run_ms`, `max_in_flight_bytes`
+(bounds resident payload bytes — `concurrency` bounds calls, not memory),
+`on_error`. `serve()` owns the process and its signals; `run()` / `background()`
+embed the worker in an event loop you manage.
 
 **`ctx`:** `payload`, `attempt`, `taskId`, `name`, `queue`, `metadata`, `rootId`,
 `correlationId`; `await ctx.progress(value, msg)` (null = leave that field alone);
@@ -70,6 +72,35 @@ event loop you manage.
 after this lease expired: nothing written after that is recorded, so a handler with
 real side effects should check it and return. For cancellable I/O, TS exposes
 `ctx.signal` (`AbortSignal`), Python `ctx.lease_lost` (`asyncio.Event`).
+
+### Batch delivery (optional)
+
+Register with a size and the handler is called **once with a list of contexts**
+instead of `(ctx, payload)`. Use it when the work itself is batched — one
+embedding call over 256 texts rather than 256 calls — and size it by what the
+downstream API wants.
+
+```python
+@worker.task("embed", batch=256, concurrency=2)   # concurrency here = per-name
+async def embed(items):                           # list[TaskContext]
+    vectors = await model.embed([i.payload["text"] for i in items])
+    return {item.task_id: {"vec": v} for item, v in zip(items, vectors)}
+```
+
+TS: `worker.task("embed", { batch: 256 }, async (items) => {…})`.
+
+One rule: **when the handler returns, every task it did not settle itself is
+settled by how the call ended** — returning succeeds them, throwing fails them
+retryably, a non-retryable `TaskError` fails them permanently. A returned
+`{task_id: result}` map fills in results. To end some differently, settle them as
+you go with `await item.succeed(result)` / `await item.fail(reason,
+retryable=False)`; settling twice is a no-op, so keep no bookkeeping of your own.
+Everything stays per task — own lease, `attempt`, backoff, cancel flag — and one
+heartbeat covers the batch.
+
+Each name draws its own claim quota, so `batch` and `concurrency` are independent:
+`batch=256` fills at the default `concurrency=1`, and a per-name `concurrency`
+(with or without `batch`) stops one expensive name from taking the whole worker.
 
 ## API side
 
