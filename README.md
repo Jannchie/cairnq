@@ -149,6 +149,40 @@ Each name draws its own quota from one claim, so a big `batch` on one name never
 starts extra calls for another, and a name with a deep backlog cannot starve the
 others.
 
+**A `resource` is that same ceiling shared by several names.** `concurrency` caps
+a name against itself, which cannot say what usually binds a worker doing heavy
+local work: different handlers contending for one scarce thing — a GPU, an index
+that tolerates a single writer. The limit belongs to the thing, so it is declared
+once, on the worker, and the names join it:
+
+```python
+worker = Worker.sqlite("tasks.db", resources={"gpu": 1, "index": 1})
+
+@worker.task("render", resource="gpu")       # render and compare share one GPU:
+@worker.task("compare", resource="gpu")      # at capacity 1, never both at once
+@worker.task("embed", batch=256, resource="gpu")   # composes with batching
+@worker.task("reindex", resource="index")
+```
+
+```ts
+const worker = Worker.sqlite("tasks.db", { resources: { gpu: 1 } });
+worker.task("render", { resource: "gpu" }, render);
+worker.task("compare", { resource: "gpu" }, compare);
+```
+
+Capacity is a count, not a flag, so two GPUs are `{"gpu": 2}`; at 1 it is mutual
+exclusion across those names. A name may also cap itself under the shared limit
+(`concurrency=1, resource="gpu"`), and the tighter of the two binds. A resource
+that no `Worker(resources=...)` declares is rejected at registration rather than
+read as unlimited — a typo would otherwise silently remove the ceiling.
+
+The gate sits at claim, which is the point of putting it here rather than
+wrapping the handler in a semaphore: a task that has been claimed already holds a
+lease, a concurrency slot and a heartbeat, so making it wait its turn *inside* the
+handler pays for the exclusion with the very resources the limit exists to
+protect. Work blocked on a saturated resource stays `queued` and claimable by
+another worker.
+
 The worker and the API can be in **either language** — a TypeScript API can drive
 a Python worker and vice-versa, because the only thing they share is the database
 and a JSON protocol.

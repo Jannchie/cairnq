@@ -46,14 +46,18 @@ interface Registration {
   /** Concurrent handler calls allowed for this name, or undefined for no limit
    * beyond the worker's own. */
   concurrency?: number;
+  /** Resource this name's calls draw from, or undefined to draw from nothing
+   * but the worker budget. Declared in `WorkerOptions.resources`. */
+  resource?: string;
 }
 
 /**
  * One draw's worth of quota: a set of names and how many handler calls they may
- * start. A name that limits itself — by `batch` or by its own `concurrency` —
- * gets a source to itself, because its quota cannot be expressed in a draw shared
- * with names that count differently. Everything else shares one, where a task is
- * a call and the worker's own budget is the only ceiling.
+ * start. A name that limits itself — by `batch`, by its own `concurrency`, or by
+ * a `resource` it shares with other names — gets a source to itself, because its
+ * quota cannot be expressed in a draw shared with names that count differently.
+ * Everything else shares one, where a task is a call and the worker's own budget
+ * is the only ceiling.
  */
 interface ClaimSource {
   /**
@@ -67,6 +71,12 @@ interface ClaimSource {
   batch: number;
   /** Calls allowed for this source, or undefined for the worker budget alone. */
   concurrency?: number;
+  /**
+   * Resource this source draws from, or undefined. Unlike `concurrency`, the
+   * ceiling it names is shared with the other sources that declare it, which is
+   * what keeps two names off one scarce thing at the same time.
+   */
+  resource?: string;
 }
 
 /** What one poll's claim draws from, and the names the probe spans. */
@@ -130,6 +140,18 @@ export interface WorkerOptions extends Partial<BackpressureOptions> {
    */
   maxInFlightBytes?: number;
   /**
+   * Call ceilings that several names can draw from, by name — `{ gpu: 1 }`.
+   * A handler joins one with `task(name, { resource: "gpu" }, fn)`.
+   *
+   * `concurrency` caps a name against itself, which cannot say what usually
+   * binds a worker doing heavy local work: several *different* handlers
+   * contending for one scarce thing — a GPU, an index that tolerates a single
+   * writer. The limit belongs to that thing rather than to any one name, so it
+   * is declared here, once, and at capacity 1 it is mutual exclusion across the
+   * names that join it.
+   */
+  resources?: Record<string, number>;
+  /**
    * Called for errors the worker survived — a claim that threw, a store write
    * that failed while finalizing a task. Without it these are silent: the run
    * loop carries on either way, so this is the only place an operator learns a
@@ -183,6 +205,19 @@ function payloadBytes(task: Task): number {
   }
 }
 
+/**
+ * Give back one call's unit of a counted budget. Deleting at zero is what keeps
+ * the map to the keys actually in flight, so an idle worker holds no entries at
+ * all — and both budgets (a name's own concurrency, a resource's capacity)
+ * settle the same way, from one place.
+ */
+function release(counts: Map<string, number>, key: string | undefined): void {
+  if (key == null) return;
+  const rest = (counts.get(key) ?? 1) - 1;
+  if (rest > 0) counts.set(key, rest);
+  else counts.delete(key);
+}
+
 export class Worker {
   private readonly handlers = new Map<string, Registration>();
   private readonly workerId = newId("worker");
@@ -190,6 +225,14 @@ export class Worker {
   private inFlightBytes = 0;
   /** Calls in flight, for the names that cap their own concurrency. */
   private readonly callsInFlight = new Map<string, number>();
+  /**
+   * Calls holding units of each declared resource. A resource is the same shape
+   * of budget as a name's own `concurrency` — a ceiling on calls — differing
+   * only in who draws from it: several names rather than one. That is what
+   * expresses "these handlers share one GPU" without inventing a queue per
+   * resource.
+   */
+  private readonly resourceCalls = new Map<string, number>();
   /** Rotates which source is offered the free budget first — see loop(). */
   private claimCursor = 0;
   /** Invalidated by task(); see schedule(). */
@@ -222,6 +265,13 @@ export class Worker {
     // nothing and look hung. Rejected here, as the Python SDK does.
     if (opts.maxInFlightBytes != null && opts.maxInFlightBytes <= 0) {
       throw new Error(`maxInFlightBytes must be > 0, got ${opts.maxInFlightBytes}`);
+    }
+    for (const [resource, capacity] of Object.entries(opts.resources ?? {})) {
+      if (!Number.isInteger(capacity) || capacity < 1) {
+        throw new Error(
+          `resources[${JSON.stringify(resource)}] must be an integer >= 1, got ${capacity}`,
+        );
+      }
     }
     if (opts.maxQueueDepth != null) {
       store.useBackpressure(opts as BackpressureOptions);
@@ -267,24 +317,34 @@ export class Worker {
    *
    * `concurrency` caps the calls this name may run at once, under the worker's
    * own. Use it to keep one expensive name from taking the whole worker.
+   *
+   * `resource` draws each call from a ceiling declared in
+   * `WorkerOptions.resources` and shared with every other name that names it —
+   * at capacity 1, mutual exclusion across those names.
    */
   task(
     name: string | TaskDef,
-    opts: { batch: number; concurrency?: number },
+    opts: { batch: number; concurrency?: number; resource?: string },
     handler: BatchHandler,
   ): this;
-  /** Per-name concurrency without batching: the handler still takes `(ctx, payload)`. */
-  task(name: string | TaskDef, opts: { concurrency: number }, handler: Handler): this;
+  /** Per-name concurrency or a shared resource, without batching: the handler
+   * still takes `(ctx, payload)`. */
+  task(
+    name: string | TaskDef,
+    opts: { concurrency?: number; resource?: string },
+    handler: Handler,
+  ): this;
   task(
     arg: string | Handler | TaskDef,
-    second?: Handler | { batch?: number; concurrency?: number },
+    second?: Handler | { batch?: number; concurrency?: number; resource?: string },
     third?: Handler | BatchHandler,
   ): this {
-    // Option form: (name | def, { batch?, concurrency? }, handler). Peel the
-    // options off and fall through, so name resolution and registration stay
-    // single-sited.
+    // Option form: (name | def, { batch?, concurrency?, resource? }, handler).
+    // Peel the options off and fall through, so name resolution and registration
+    // stay single-sited.
     let batch: number | undefined;
     let concurrency: number | undefined;
+    let resource: string | undefined;
     let handler = second as Handler | BatchHandler | undefined;
     if (second != null && typeof second === "object") {
       if (second.batch != null) {
@@ -299,6 +359,7 @@ export class Worker {
         }
         concurrency = second.concurrency;
       }
+      resource = second.resource;
       handler = third;
     }
     let name: string;
@@ -320,7 +381,17 @@ export class Worker {
       name = taskName(arg);
       fn = handler!;
     }
-    this.handlers.set(name, { fn, batch, concurrency });
+    // Loudly, at registration: an undeclared resource would otherwise read as
+    // an unbounded one, so a typo would silently remove the ceiling the caller
+    // asked for — the failure this option exists to prevent.
+    if (resource != null && this.opts.resources?.[resource] == null) {
+      const known = Object.keys(this.opts.resources ?? {}).sort().join(", ") || "none";
+      throw new Error(
+        `task ${JSON.stringify(name)} declares resource ${JSON.stringify(resource)}, ` +
+          `which is not in WorkerOptions.resources; declared: ${known}`,
+      );
+    }
+    this.handlers.set(name, { fn, batch, concurrency, resource });
     this.scheduleCache = null;
     return this;
   }
@@ -414,21 +485,28 @@ export class Worker {
    * may be registered after run() started, but only there, and this otherwise
    * allocates a source per name on every tick for a worker's whole lifetime.
    *
-   * A name that limits itself — by `batch` or by its own `concurrency` — needs a
-   * quota the shared draw cannot express, so it gets a source of its own; every
-   * other name shares one, where a task is a call.
+   * A name that limits itself — by `batch`, by its own `concurrency`, or by a
+   * `resource` — needs a quota the shared draw cannot express, so it gets a
+   * source of its own; every other name shares one, where a task is a call.
+   *
+   * A resource is deliberately *not* one source spanning its names: `batch` is
+   * per name, and a single source carries one batch size, so two members that
+   * batch differently could not share a draw. Keeping a source per name and
+   * letting several of them draw down one shared ceiling composes with batching
+   * instead of excluding it.
    */
   private schedule(): Schedule {
     if (this.scheduleCache) return this.scheduleCache;
     const sources: ClaimSource[] = [];
     const shared: string[] = [];
     for (const [name, reg] of this.handlers) {
-      if (reg.batch != null || reg.concurrency != null) {
+      if (reg.batch != null || reg.concurrency != null || reg.resource != null) {
         sources.push({
           key: reg.concurrency == null ? undefined : name,
           names: [name],
           batch: reg.batch ?? 1,
           concurrency: reg.concurrency,
+          resource: reg.resource,
         });
       } else shared.push(name);
     }
@@ -440,21 +518,31 @@ export class Worker {
    * A source's own call ceiling for one poll, or undefined when only the
    * worker-wide budget applies.
    *
-   * Two independent ceilings: the name's own concurrency, less what it is already
-   * running, and `claimBatch`. The latter is a ceiling on *rows* per poll, so it
-   * converts at this source's batch size — and never below one call, or a
-   * `claimBatch` under some name's batch would stall that name outright.
+   * Three independent ceilings, whichever binds first: the name's own concurrency
+   * less what it is already running; its resource's capacity less what is running
+   * *and* what earlier draws in this same poll already took (`taken`); and
+   * `claimBatch`. The last is a ceiling on *rows* per poll, so it converts at this
+   * source's batch size — and never below one call, or a `claimBatch` under some
+   * name's batch would stall that name outright.
    */
-  private sourceCalls(src: ClaimSource): number | undefined {
+  private sourceCalls(src: ClaimSource, taken: Map<string, number>): number | undefined {
     const rows = this.opts.claimBatch;
     const byRows = rows == null ? undefined : Math.max(1, Math.floor(rows / src.batch));
     const byName =
       src.concurrency == null
         ? undefined
         : Math.max(0, src.concurrency - (this.callsInFlight.get(src.key!) ?? 0));
-    if (byRows == null) return byName;
-    if (byName == null) return byRows;
-    return Math.min(byRows, byName);
+    const byResource =
+      src.resource == null
+        ? undefined
+        : Math.max(
+            0,
+            this.opts.resources![src.resource] -
+              (this.resourceCalls.get(src.resource) ?? 0) -
+              (taken.get(src.resource) ?? 0),
+          );
+    const limits = [byRows, byName, byResource].filter((n): n is number => n != null);
+    return limits.length ? Math.min(...limits) : undefined;
   }
 
   private async loop(
@@ -501,9 +589,15 @@ export class Worker {
           async (claim) => {
             const drawn: { src: ClaimSource; calls: [Registration | undefined, Task[]][] }[] = [];
             let left = free;
+            // Resource units this poll has already drawn. resourceCalls only
+            // moves when a call is dispatched, which happens after this whole
+            // plan returns — so without a local tally two sources sharing a
+            // resource would each see its full ceiling and together overshoot
+            // it. Same shape as `left`, one budget down.
+            const taken = new Map<string, number>();
             for (const src of order) {
               if (left <= 0) break;
-              const quota = Math.min(this.sourceCalls(src) ?? left, left);
+              const quota = Math.min(this.sourceCalls(src, taken) ?? left, left);
               if (quota <= 0) continue;
               const rows = await claim(src.names, src.batch * quota);
               if (!rows.length) continue;
@@ -515,6 +609,9 @@ export class Worker {
               const calls = this.deliveries(rows);
               drawn.push({ src, calls });
               left -= calls.length;
+              if (src.resource != null) {
+                taken.set(src.resource, (taken.get(src.resource) ?? 0) + calls.length);
+              }
             }
             return drawn;
           },
@@ -539,18 +636,19 @@ export class Worker {
             byteBudget == null ? 0 : group.reduce((sum, t) => sum + payloadBytes(t), 0);
           this.inFlightBytes += bytes;
           const key = src.key;
+          const resource = src.resource;
           if (key != null) this.callsInFlight.set(key, (this.callsInFlight.get(key) ?? 0) + 1);
+          if (resource != null) {
+            this.resourceCalls.set(resource, (this.resourceCalls.get(resource) ?? 0) + 1);
+          }
           // An unregistered name has nothing to run, so it never starts a handler
           // or a heartbeat; everything else is one call, batched or not.
           const call =
             reg == null ? this.failNoHandler(group[0], leaseMs) : this.runCall(reg, group, leaseMs);
           const p = call.finally(() => {
             this.inFlightBytes -= bytes;
-            if (key != null) {
-              const rest = (this.callsInFlight.get(key) ?? 1) - 1;
-              if (rest > 0) this.callsInFlight.set(key, rest);
-              else this.callsInFlight.delete(key);
-            }
+            release(this.callsInFlight, key);
+            release(this.resourceCalls, resource);
             running.delete(p);
           });
           running.add(p);
