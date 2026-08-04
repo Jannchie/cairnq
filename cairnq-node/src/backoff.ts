@@ -9,11 +9,31 @@
 export const DEFAULT_RETRY_BACKOFF_MS = 1_000;
 export const DEFAULT_RETRY_BACKOFF_MAX_MS = 30_000;
 
-/** Exponential backoff for the next attempt of a task that just failed. */
-export function retryDelayMs(attempt: number, baseMs: number, maxMs: number): number {
+/**
+ * Exponential backoff with equal jitter: the window doubles per attempt up to
+ * `maxMs`, and the delay lands uniformly in its upper half, `[w/2, w)`.
+ *
+ * The jitter is what keeps a fleet from retrying in lockstep. Failures align
+ * when the downstream fails fast enough that a whole concurrency batch raises
+ * at once (connection refused, DNS gone), and capped exponential backoff then
+ * *preserves* that alignment — once every task sits at `maxMs`, they all retry
+ * on the same beat forever. Spreading over half the window breaks it; keeping
+ * the lower half as a floor means jitter never shortens the wait to less than
+ * half of what plain exponential backoff would have asked for.
+ *
+ * `rand` is injected so tests can pin an exact delay.
+ */
+export function retryDelayMs(
+  attempt: number,
+  baseMs: number,
+  maxMs: number,
+  rand: () => number = Math.random,
+): number {
   if (baseMs <= 0) return 0;
   const exponent = Math.max(0, attempt - 1);
-  return Math.min(maxMs, baseMs * 2 ** exponent);
+  const window = Math.min(maxMs, baseMs * 2 ** exponent);
+  const floor = Math.floor(window / 2);
+  return floor + Math.floor(rand() * (window - floor));
 }
 
 /**
@@ -27,6 +47,7 @@ export function failDelayMs(
   retryable: boolean,
   baseMs: number,
   maxMs: number,
+  rand: () => number = Math.random,
 ): number {
-  return retryable ? retryDelayMs(attempt, baseMs, maxMs) : 0;
+  return retryable ? retryDelayMs(attempt, baseMs, maxMs, rand) : 0;
 }
