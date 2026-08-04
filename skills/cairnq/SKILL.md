@@ -57,7 +57,8 @@ TS: `worker.task("summarize", async (ctx, payload) => {…})`, or `worker.task(f
 **Options:** `queues` (`["default"]`), `concurrency` (1, also `serve(concurrency=…)`
 — it counts **handler calls**, so a batch call carrying 256 tasks is one of them),
 `lease_ms` (30s), `poll_interval_ms` (500ms), `retry_backoff_ms` /
-`retry_backoff_max_ms` (1s doubling to 30s), `max_run_ms`, `max_in_flight_bytes`
+`retry_backoff_max_ms` (1s doubling to 30s, jittered), `max_run_ms`,
+`max_in_flight_bytes`
 (bounds resident payload bytes — `concurrency` bounds calls, not memory),
 `on_error`. `serve()` owns the process and its signals; `run()` / `background()`
 embed the worker in an event loop you manage.

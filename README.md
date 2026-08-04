@@ -161,8 +161,9 @@ and a JSON protocol.
   task is redelivered after its lease expires. A worker only claims tasks it has a
   handler for, so workers with different handler sets share a queue safely — which
   is what makes a Python API and a TypeScript worker on one `default` queue work.
-- **At-least-once execution** (honestly — see below). Retries with exponential
-  backoff (1s doubling to 30s by default), `attempt` / `max_attempts`, queues,
+- **At-least-once execution** (honestly — see below). Retries with jittered
+  exponential backoff (1s doubling to 30s by default), `attempt` /
+  `max_attempts`, queues,
   priority, progress, task chains (`parent_id` / `root_id` / `correlation_id`).
 - **Cooperative cancel**: cancelling a running task sets a flag; when the handler
   returns after checking `ctx.canceled()`, the task finalizes as `canceled` (the

@@ -378,8 +378,12 @@ resolve after the timeout at the latest; the default implementation is a plain
 sleep — polling *is* the wake mechanism. A custom store may override them, but
 nothing may ever *require* a wake to arrive.
 
-Retries carry **exponential backoff**: a failed attempt is requeued at
-`now + base * 2^(attempt-1)`, capped (SDK defaults: 1s base, 30s cap, 0 disables).
+Retries carry **exponential backoff with equal jitter**: the window is
+`min(cap, base * 2^(attempt-1))` and a failed attempt is requeued uniformly in
+its upper half, `now + [w/2, w)` (SDK defaults: 1s base, 30s cap, 0 disables).
+The jitter matters most at the cap: without it, a fleet whose tasks have all
+reached `cap` retries on a single beat forever. The half-window floor keeps
+jitter from ever shortening a retry to less than half the plain backoff.
 The delay is the SDK's decision — the protocol only carries `:delay_ms` on `fail`.
 
 `progress` / `message` describe the attempt in flight, so **every path back to
