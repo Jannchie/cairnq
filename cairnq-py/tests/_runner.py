@@ -120,6 +120,17 @@ class Runner:
             return await s.heartbeat(
                 task_id=a["id"], worker_id=a["worker_id"], lease_ms=a.get("lease_ms", 30_000)
             )
+        if op == "heartbeat_batch":
+            ids = a["ids"]
+            renewed = await s.heartbeat_batch(
+                task_ids=ids, worker_id=a["worker_id"], lease_ms=a.get("lease_ms", 30_000)
+            )
+            # The statement answers with a mapping, which scenarios cannot index
+            # by a saved id. Flatten it to the rows that came back, in the order
+            # the ids were asked for: a task absent from the mapping lost its
+            # lease, so it is absent here too and `length` reads as "how many are
+            # still ours".
+            return [{"id": i, "cancel_requested": renewed[i]} for i in ids if i in renewed]
         if op == "progress":
             return await s.progress(
                 task_id=a["id"], worker_id=a["worker_id"],

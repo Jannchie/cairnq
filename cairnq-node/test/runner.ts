@@ -130,6 +130,21 @@ export class Runner {
         });
       case "heartbeat":
         return s.heartbeat({ taskId: a.id, workerId: a.worker_id, leaseMs: a.lease_ms });
+      case "heartbeat_batch": {
+        const ids: string[] = a.ids;
+        const renewed = await s.heartbeatBatch({
+          taskIds: ids,
+          workerId: a.worker_id,
+          leaseMs: a.lease_ms,
+        });
+        // The statement answers with a map, which scenarios cannot index by a
+        // saved id. Flatten it to the rows that came back, in the order the ids
+        // were asked for: a task absent from the map lost its lease, so it is
+        // absent here too and `length` reads as "how many are still ours".
+        return ids
+          .filter((id) => renewed.has(id))
+          .map((id) => ({ id, cancel_requested: renewed.get(id) }));
+      }
       case "progress":
         return s.progress({
           taskId: a.id,

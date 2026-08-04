@@ -34,12 +34,19 @@ Client-side: `submit`, `get`, `get_by_key`, `list`, `cancel`, `cancel_by_key`,
 `retry`, `retry_by_key`, `purge` (`{ "older_than_ms": n, "limit": n }`; returns an
 array of deleted ids), `stats` (no args; returns `{queue: {status: count}}`,
 zero-filled per queue). Worker-side: `claim` (runs lease recovery then claim, like
-the worker loop; returns an array), `heartbeat`, `progress`, `succeed`,
-`complete`, `fail`. Control: `sleep` (`{ "ms": n }`), `expect`.
+the worker loop; returns an array), `heartbeat`, `heartbeat_batch`, `progress`,
+`succeed`, `complete`, `fail`. Control: `sleep` (`{ "ms": n }`), `expect`.
 
 `args` keys mirror the SDK call (e.g. `submit` takes `name`, `payload`, `key`,
 `queue`, `conflict`, `max_attempts`, `priority`, `correlation_id`; `claim` takes
-`queues`, `worker_id`, `lease_ms`, `limit`).
+`queues`, `worker_id`, `lease_ms`, `limit`, `names`). Omitting `names` is not the
+same as passing `[]`: absent means no name filter, `[]` claims nothing.
+
+`heartbeat_batch` takes `ids`, `worker_id`, `lease_ms`. The statement answers with
+a map, which a scenario cannot index by a saved id, so runners return the rows
+that came back as an array **in the order the ids were asked for** — a task that
+lost its lease is absent from it, making `length` read as "how many are still
+ours".
 
 ### Expected errors
 

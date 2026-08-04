@@ -1,0 +1,33 @@
+{
+  "name": "heartbeat_batch_renews_per_row",
+  "description": "heartbeat_batch renews several leases in one statement, and differs from heartbeat in the three ways a worker depends on: ownership is checked per row rather than all-or-nothing (a task this worker no longer holds is simply absent from the result, not an error), cancellation rides back on the write, and only the rows asked for are touched. The runner flattens the statement's map to the rows that came back, in the order the ids were asked for.",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 1 } }, "save": "a" },
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 2 } }, "save": "b" },
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 3 } }, "save": "c" },
+
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000, "limit": 10 }, "save": "cl", "expect": { "length": 3 } },
+
+    { "op": "sleep", "args": { "ms": 10 } },
+    { "op": "heartbeat_batch", "args": { "ids": ["$a.id", "$b.id"], "worker_id": "w1", "lease_ms": 5000 }, "save": "h1", "expect": { "length": 2 } },
+    { "op": "expect", "target": "$h1.0.id", "equalsRef": "$a.id" },
+    { "op": "expect", "target": "$h1.1.id", "equalsRef": "$b.id" },
+    { "op": "expect", "target": "$h1.0", "equals": { "cancel_requested": false } },
+
+    { "op": "get", "args": { "id": "$a.id" }, "save": "ga" },
+    { "op": "expect", "target": "$ga.lease_until_ms", "greaterThanRef": "$cl.0.lease_until_ms" },
+
+    { "op": "cancel", "args": { "id": "$a.id" } },
+    { "op": "heartbeat_batch", "args": { "ids": ["$a.id", "$b.id"], "worker_id": "w1", "lease_ms": 5000 }, "save": "h2", "expect": { "length": 2 } },
+    { "op": "expect", "target": "$h2.0", "equals": { "cancel_requested": true } },
+    { "op": "expect", "target": "$h2.1", "equals": { "cancel_requested": false } },
+
+    { "op": "heartbeat_batch", "args": { "ids": ["$a.id", "$b.id"], "worker_id": "w_other", "lease_ms": 5000 }, "expect": { "length": 0 } },
+
+    { "op": "heartbeat_batch", "args": { "ids": [], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 0 } },
+
+    { "op": "succeed", "args": { "id": "$c.id", "worker_id": "w1", "result": {} } },
+    { "op": "heartbeat_batch", "args": { "ids": ["$b.id", "$c.id"], "worker_id": "w1", "lease_ms": 5000 }, "save": "h3", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$h3.0.id", "equalsRef": "$b.id" }
+  ]
+}

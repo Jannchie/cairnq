@@ -1,0 +1,32 @@
+{
+  "name": "claim_variants_agree",
+  "description": "claim has three specializations picked from the shape of the call — one queue, one name, or both — so that a list-valued predicate can be swapped for an equality the planner can read in claim order. They must be indistinguishable to a caller. A drift-guard test pins that their SQL text stays derivable from claim.sql; this pins the behavior, which text alone cannot: all four take the head of the same claim order, one task each, and leave the rest alone. Priorities rather than sleeps make that order exact, since same-millisecond submits tie-break on a random id half.",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 1 }, "priority": 4 }, "save": "a" },
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 2 }, "priority": 3 }, "save": "b" },
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 3 }, "priority": 2 }, "save": "c" },
+    { "op": "submit", "args": { "name": "job", "payload": { "n": 4 }, "priority": 1 }, "save": "d" },
+
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000, "limit": 1 }, "save": "c1", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$c1.0.id", "equalsRef": "$a.id" },
+
+    { "op": "claim", "args": { "queues": ["default", "other"], "worker_id": "w2", "lease_ms": 5000, "limit": 1 }, "save": "c2", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$c2.0.id", "equalsRef": "$b.id" },
+
+    { "op": "claim", "args": { "queues": ["default"], "names": ["job"], "worker_id": "w3", "lease_ms": 5000, "limit": 1 }, "save": "c3", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$c3.0.id", "equalsRef": "$c.id" },
+
+    { "op": "claim", "args": { "queues": ["default", "other"], "names": ["job"], "worker_id": "w4", "lease_ms": 5000, "limit": 1 }, "save": "c4", "expect": { "length": 1 } },
+    { "op": "expect", "target": "$c4.0.id", "equalsRef": "$d.id" },
+
+    { "op": "claim", "args": { "queues": ["default"], "names": ["job"], "worker_id": "w5", "lease_ms": 5000, "limit": 10 }, "expect": { "length": 0 } },
+
+    { "op": "get", "args": { "id": "$a.id" }, "expect": { "equals": { "status": "running", "attempt": 1, "worker_id": "w1" } } },
+    { "op": "get", "args": { "id": "$d.id" }, "expect": { "equals": { "status": "running", "attempt": 1, "worker_id": "w4" } } },
+
+    { "op": "submit", "args": { "name": "elsewhere", "payload": {} }, "save": "e" },
+    { "op": "claim", "args": { "queues": ["default"], "names": ["job"], "worker_id": "w6", "lease_ms": 5000, "limit": 10 }, "expect": { "length": 0 } },
+    { "op": "claim", "args": { "queues": ["default", "other"], "names": ["job"], "worker_id": "w7", "lease_ms": 5000, "limit": 10 }, "expect": { "length": 0 } },
+    { "op": "get", "args": { "id": "$e.id" }, "expect": { "equals": { "status": "queued", "attempt": 0 } } }
+  ]
+}
