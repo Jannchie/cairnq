@@ -67,7 +67,8 @@ Opt-in: every API still accepts a plain name string (cross-language callers use 
 ```ts
 const worker = Worker.sqlite("tasks.db", {
   concurrency: 4,          // handler calls at once; use maxInFlightBytes to bound memory
-  retryBackoffMs: 1_000,   // doubles per attempt, capped by retryBackoffMaxMs (30s); 0 disables
+  retryBackoffMs: 1_000,   // window doubles per attempt, capped at retryBackoffMaxMs (30s),
+                           // jittered over its upper half; 0 disables
   onError: (err, info) => log.warn({ err, ...info }), // claims/writes the loop survived
 });
 
