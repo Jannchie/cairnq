@@ -1,6 +1,6 @@
 [project]
 name = "cairnq"
-version = "0.5.0"
+version = "0.6.0"
 description = "SQLite-first, cross-language, storage-centered durable task runtime"
 readme = "README.md"
 requires-python = ">=3.10"
