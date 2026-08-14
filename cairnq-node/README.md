@@ -34,7 +34,9 @@ try {
 } catch (err) {
   if (err instanceof TaskFailed) log(err.code, err.message, err.retryable); // envelope fields
   else if (err instanceof TaskTimeout) {
-    /* err.taskId keeps running */
+    // The task keeps running — resume the wait instead of submitting again.
+    const result = await tasks.wait(err.taskId, { timeoutMs: 60_000 });
+    // …or tasks.waitByKey(key), from a process that never held the id.
   }
 }
 ```
@@ -72,8 +74,11 @@ const worker = Worker.sqlite("tasks.db", {
   onError: (err, info) => log.warn({ err, ...info }), // claims/writes the loop survived
 });
 
-// Nothing else deletes rows. Sweep terminal tasks on a schedule.
-await tasks.purge({ olderThanMs: 7 * 24 * 3600_000 });
+// Nothing else deletes rows, so give the client a retention policy — it sweeps
+// terminal tasks in bounded batches for as long as the handle is open.
+const tasks = CairnQ.sqlite("tasks.db", {
+  retention: { olderThanMs: 7 * 24 * 3600_000 },
+});
 ```
 
 A handler that does real side effects should bail out when it loses its lease —

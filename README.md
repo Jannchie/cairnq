@@ -205,7 +205,11 @@ and a JSON protocol.
 ## What you get
 
 - **`submit / get / wait / call / cancel / retry`**, by `task_id` or business `key`.
-- **Key conflict strategies**: `reuse` (idempotent submit), `reject`, `replace`.
+- **A wait you can resume.** `wait`/`call` time out without stopping the task, and
+  `wait(err.task_id)` — or `wait_by_key(key)` from a process that never held the
+  id — picks the same wait back up instead of running the work again.
+- **Key conflict strategies**: `reuse` (dedupe work in flight), `reuse-succeeded`
+  (also serve a finished result as a cache), `reject`, `replace`.
 - **Lease-based claim** with heartbeat and automatic recovery — a crashed worker's
   task is redelivered after its lease expires. A worker only claims tasks it has a
   handler for, so workers with different handler sets share a queue safely — which
@@ -227,13 +231,25 @@ and a JSON protocol.
   handler; TypeScript aborts `ctx.signal` and cuts the context off from the
   store) and records a retryable `handler_timeout` failure, so backoff,
   `max_attempts` and cancel-wins apply as usual.
-- **Retention**: `purge` deletes terminal tasks past a cutoff — nothing else ever
-  removes rows, so call it on a schedule. A minimal hourly sweep:
+- **Blocking work is handled, not merely warned about.** The heartbeat shares the
+  worker's event loop, so a handler that occupies it stops renewing its own lease
+  — the task is recovered mid-run and a second worker computes it in parallel,
+  with no error anywhere. Python dispatches **sync handlers to a thread**, so the
+  usual shape (`def handler(ctx, payload)` around a GPU call) is safe by
+  construction; when the loop is blocked anyway, both SDKs report
+  `EventLoopBlocked` through `on_error` / `onError` while the lease still holds.
+- **Retention**: nothing else ever removes rows, so a long-lived database needs a
+  sweep — and with payloads that carry real data (an image, a document, a batch of
+  embeddings) "nothing removes rows" is a disk leak measured in gigabytes per
+  backfill. Give the client a retention policy and it sweeps itself, in bounded
+  batches, for as long as the handle is open:
 
   ```python
-  while len(await tasks.purge(older_than_ms=7 * 86_400_000, limit=1_000)) == 1_000:
-      pass  # drain in bounded batches; re-run from your scheduler every hour
+  tasks = CairnQ.sqlite("tasks.db", retention=Retention(older_than_ms=7 * 86_400_000))
   ```
+
+  `purge(older_than_ms=..., limit=...)` remains the manual form, for an external
+  scheduler or a one-off drain.
 
 - **Operational visibility**: `stats()` returns task counts per queue and status
   (zero-filled), so a dashboard or health check reads backlog without listing
@@ -272,11 +288,15 @@ A worker can finish an external side effect and then crash before recording
 success; after the lease expires the task is redelivered. Make side effects
 idempotent using `task_id` or `key`.
 
-### `reuse` is idempotent submit, not "re-run if it failed"
+### `reuse` deduplicates work in flight; reusing a result is opt-in
 
-`conflict: "reuse"` returns the task already recorded under that key — *whatever
-its state*, including a terminal `failed`/`canceled` one. To force a new run use
-`replace` (new task, repoints the key) or `retry` (re-enqueue the same task).
+`conflict: "reuse"` returns the task under that key while it is still
+`queued`/`running` — the double-click, the retried request. Once that task
+*finishes*, the key is free: the next submit starts a new one. Reusing a
+`succeeded` result instead is a cache, correct only when the key encodes the
+whole input, so it is spelled out as `conflict: "reuse-succeeded"`. Nothing ever
+hands back a `failed` task, which would poison the key until `purge`; use `retry`
+to re-run that same task.
 
 ## Storage: SQLite or Postgres
 

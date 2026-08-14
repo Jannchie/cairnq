@@ -148,28 +148,33 @@ Python exposes the same checks as properties: `t.succeeded` / `.failed` /
 `.canceled` / `.running` / `.queued` / `.is_terminal`.
 
 **Full surface**, each by `task_id` or business `key`: `submit`, `get` / `getByKey`,
-`list`, `wait`, `call`, `cancel` / `cancelByKey`, `retry` / `retryByKey`, `purge`,
-`stats`.
+`list`, `wait` / `waitByKey`, `call`, `cancel` / `cancelByKey`, `retry` /
+`retryByKey`, `purge`, `stats`.
 
-- **`submit`:** `key`, `queue` (`"default"`), `conflict` (`reuse` | `reject` |
-  `replace`), `maxAttempts` (3), `priority`, `metadata`, `parentId`,
-  `correlationId`, `runAtDelayMs`.
+- **`submit`:** `key`, `queue` (`"default"`), `conflict` (`reuse` |
+  `reuse-succeeded` | `reject` | `replace`), `maxAttempts` (3), `priority`,
+  `metadata`, `parentId`, `correlationId`, `runAtDelayMs`.
 - **`list`:** `status`, `queue`, `name`, `rootId`, `correlationId`, `limit` (100),
   `offset`.
 - **`retry(id, {resetAttempt: true})`** restarts from attempt 0 rather than
   spending the remaining `maxAttempts` budget.
 - **`stats()`** → zero-filled counts per queue per status;
   `stats()["default"]["queued"]` is a backlog without listing rows.
+- **`retention`** on the client (`Retention(older_than_ms=...)` / `{ olderThanMs }`)
+  sweeps terminal tasks on a schedule for as long as the handle is open. Without
+  it nothing removes rows, ever.
 
 ## The non-obvious rules — where people go wrong
 
 - **At-least-once, not exactly-once.** A worker can finish a side effect and crash
   before recording success; the task is redelivered once the lease expires. Key
   side effects on `ctx.taskId` or the business `key`.
-- **`conflict: "reuse"` is *idempotent submit*, not "re-run if it failed".** It
-  returns whatever task is under that key, *including a terminal `failed`/`canceled`
-  one*. To force a fresh run: `replace` (new task, repoints the key) or `retry`
-  (re-enqueue the same task).
+- **`conflict: "reuse"` dedupes work *in flight*, not finished work.** It returns
+  the task under the key while it is `queued`/`running`; once that task finishes
+  the key is free and the next submit starts a new one. To serve a `succeeded`
+  result as a cache — only safe when the key encodes the whole input — ask for
+  `reuse-succeeded`. Nothing ever hands back a `failed` task; `retry` re-enqueues
+  that same task if that is what you mean.
 - **Failing a task — pick retryable or not.** `TaskError(msg)` fails
   **permanently** (`retryable=False` by default, so deterministic bugs fail fast);
   `TaskError(msg, retryable=True)` retries with backoff up to `max_attempts`. Any
@@ -189,9 +194,17 @@ Python exposes the same checks as properties: `t.succeeded` / `.failed` /
 - **Progress belongs to the attempt.** Anything returning a task to `queued` — a
   retryable failure, `retry`, a crash — clears `progress`/`message`. Terminal tasks
   keep them, so a failed task still shows how far it got.
-- **Nothing is deleted for you.** Terminal tasks stay until `purge(olderThanMs=…)`,
-  which is bounded by `limit` (1000) per call — loop until it returns fewer than
-  `limit`, on a schedule, or the database grows without bound.
+- **Nothing is deleted unless you configure it.** Terminal tasks stay forever
+  otherwise, which with large payloads is a disk leak, not just clutter. Set
+  `retention` on the client and the sweep runs itself; `purge(olderThanMs=…)`
+  stays available for an external scheduler (bounded by `limit`, 1000 per call —
+  loop until it returns fewer than `limit`).
+- **Blocking work must leave the loop.** The heartbeat renews leases on the
+  worker's own event loop, so a handler that blocks it lets its lease expire and
+  its task get recovered *while it is still running*. Python sends **sync
+  handlers to a thread** automatically; blocking inside an `async` handler is the
+  case nothing can save, and both SDKs report `EventLoopBlocked` through
+  `on_error` / `onError` when they see a beat go missing.
 - **Worker errors are silent unless you ask.** `on_error` / `onError` reports what
   the run loop survived (a claim that threw, a store write that failed while
   finalizing). Task *failures* go to the DB; these do not.
@@ -217,8 +230,13 @@ operational.
 
 `call` returns the result on success, otherwise raises/throws `TaskFailed` (read
 `.code` / `.message` / `.retryable` / `.details`; raw envelope on `.error`),
-`TaskCanceled`, or `TaskTimeout` — on which **the task keeps running**, so follow
-up via `.taskId` / `.task_id`.
+`TaskCanceled`, or `TaskTimeout` — on which **the task keeps running**.
+
+A timeout is a wait that ended, not work that was lost. Resume it with
+`wait(err.taskId)`, or `waitByKey(key)` from a process that never held the id —
+never by re-submitting under the key and hoping the conflict strategy hands the
+finished task back. `waitByKey` re-resolves the key on each poll, so it follows a
+`replace` onto the new task.
 
 ## Typed tasks (optional, worth it as task types grow)
 

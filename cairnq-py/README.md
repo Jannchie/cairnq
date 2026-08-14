@@ -34,7 +34,9 @@ try:
 except TaskFailed as e:
     log(e.code, e.message, e.retryable)   # envelope fields, no e.error["code"] digging
 except TaskTimeout as e:
-    ...  # e.task_id keeps running
+    # The task keeps running — resume the wait instead of submitting again.
+    result = await tasks.wait(e.task_id, timeout_ms=60_000)
+    # …or tasks.wait_by_key(key), from a process that never held the id.
 ```
 
 Inspect a task by id/key without memorizing status strings:
@@ -72,8 +74,19 @@ worker = Worker.sqlite(
     on_error=lambda exc, info: log.warning("worker survived %s: %s", info, exc),
 )
 
-# Nothing else deletes rows. Sweep terminal tasks on a schedule.
-await tasks.purge(older_than_ms=7 * 24 * 3600_000)
+# Nothing else deletes rows, so give the client a retention policy — it sweeps
+# terminal tasks in bounded batches for as long as the handle is open.
+tasks = CairnQ.sqlite("tasks.db", retention=Retention(older_than_ms=7 * 24 * 3600_000))
+```
+
+A **sync** handler (`def`, not `async def`) is dispatched to a thread, so the
+usual shape around a blocking GPU or HTTP call keeps the worker's event loop —
+and with it every lease this worker holds — alive:
+
+```python
+@worker.task("score")
+def score(ctx, payload):
+    return {"score": model.forward(payload["image"])}  # blocking, off the loop
 ```
 
 A handler that does real side effects should bail out when it loses its lease —
