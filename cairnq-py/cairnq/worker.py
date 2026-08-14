@@ -16,14 +16,20 @@ from ._backoff import (
     fail_delay_ms,
     retry_delay_ms,
 )
-from ._ids import new_id
+from ._ids import new_id, now_ms
 from .backpressure import (
     DEFAULT_MAX_WAIT_MS,
     INITIAL_PROBE_INTERVAL_MS,
     QueueDepthLimit,
 )
 from .context import TaskContext
-from .errors import LostLease, SerializationError, as_envelope, error_envelope
+from .errors import (
+    EventLoopBlocked,
+    LostLease,
+    SerializationError,
+    as_envelope,
+    error_envelope,
+)
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
 from .store.postgres import PostgresStore
@@ -132,9 +138,35 @@ def _required_name(fn: Handler) -> str:
     return name
 
 
-async def _call(handler: Handler, *args: Any) -> Any:
-    """Call a handler and await it if it returned an awaitable — the one place
-    that decides sync handlers are as welcome as async ones.
+def _is_async_handler(fn: Handler) -> bool:
+    """Whether calling `fn` hands back a coroutine to await, rather than doing the
+    work on the caller's thread. Decided once at registration, since the answer is
+    static and the hot path must not re-derive it."""
+    if inspect.iscoroutinefunction(fn):
+        return True
+    # A callable object is a handler too, and its asyncness lives on __call__.
+    call = getattr(type(fn), "__call__", None)
+    return call is not None and inspect.iscoroutinefunction(call)
+
+
+async def _call(handler: Handler, is_async: bool, *args: Any) -> Any:
+    """Call a handler — the one place that decides sync handlers are as welcome
+    as async ones.
+
+    **A sync handler runs on a worker thread, never on the event loop.** The loop
+    is what renews this task's lease, and a handler that occupies it for seconds
+    at a time — a GPU forward, a hash over a large file, a synchronous HTTP
+    client — starves the heartbeat until the lease expires and another worker
+    picks the task up while this one is still computing it. That failure is
+    invisible from inside the handler, so it is not left to the caller to avoid.
+    The threads come from asyncio's default executor, which bounds how many sync
+    handlers run at once independently of `concurrency`.
+
+    Two consequences worth knowing. A sync handler cannot await `ctx` (its methods
+    are coroutines), which was already true when it ran on the loop. And a thread
+    cannot be cancelled, so `max_run_ms` stops *waiting* for a sync handler
+    without stopping the handler — the attempt is abandoned and the thread runs to
+    completion.
 
     The argument list is the calling convention, and there are three: a
     single-task handler receives `(ctx, payload)` (the whole payload dict —
@@ -143,8 +175,25 @@ async def _call(handler: Handler, *args: Any) -> Any:
     There is no payload shortcut to pair with the batch form: payloads are per
     task, so they are read off the items (`item.payload`), which is also what a
     handler must hold to settle one of them."""
-    result = handler(*args)
+    if is_async:
+        return await handler(*args)
+    result = await asyncio.to_thread(handler, *args)
+    # A sync function may still hand back an awaitable (a partial around a
+    # coroutine function, a callable returning one); await it here, on the loop.
     return await result if inspect.isawaitable(result) else result
+
+
+class _Beat:
+    """When the heartbeat covering one call last ran.
+
+    Shared between the loop and the attempt that owns it, because the loop cannot
+    report its own absence: a handler that blocks for its whole attempt never lets
+    the heartbeat task take a turn at all, so the check has to survive it."""
+
+    __slots__ = ("at_ms",)
+
+    def __init__(self, at_ms: int):
+        self.at_ms = at_ms
 
 
 @dataclass(frozen=True)
@@ -155,6 +204,9 @@ class _Registration:
     #: Whether a single-task handler declared a payload parameter, decided once
     #: from the signature so the hot path never re-inspects it.
     wants_payload: bool
+    #: Whether the handler is a coroutine function. A sync one is dispatched to a
+    #: thread instead of running on the loop — see `_call`.
+    is_async: bool
     #: Tasks per handler call, or None for one-at-a-time delivery.
     batch: int | None = None
     #: Concurrent handler calls allowed for this name, or None for no limit
@@ -417,7 +469,7 @@ class Worker:
                 f"Worker(resources=...); declared: {known}"
             )
         self._handlers[name] = _Registration(
-            fn, _wants_payload(fn), batch, concurrency, resource
+            fn, _wants_payload(fn), _is_async_handler(fn), batch, concurrency, resource
         )
         self._schedule_cache = None
 
@@ -756,10 +808,11 @@ class Worker:
             args: tuple[Any, ...] = (ctxs,)
         else:
             args = (ctxs[0], tasks[0].payload) if reg.wants_payload else (ctxs[0],)
-        hb = asyncio.create_task(self._heartbeat_loop(ctxs))
+        beat = _Beat(now_ms())
+        hb = asyncio.create_task(self._heartbeat_loop(ctxs, beat))
         try:
             try:
-                result = await self._attempt(lambda: _call(reg.fn, *args), ctxs)
+                result = await self._attempt(lambda: _call(reg.fn, reg.is_async, *args), ctxs)
             except Exception as exc:
                 outcome = self._outcome_of(exc, tasks[0].name)
                 if outcome is not None:
@@ -784,6 +837,11 @@ class Worker:
             hb.cancel()
             with contextlib.suppress(BaseException):
                 await hb
+            # After cancelling, not only inside the loop: a handler that blocked
+            # for its whole attempt never let the heartbeat task take a turn, so
+            # the loop had no chance to notice — and that is the worst case, the
+            # one where the lease is already gone.
+            self._check_beat(beat, tasks[0].id)
 
     def _outcome_of(
         self, exc: BaseException, name: str
@@ -898,7 +956,24 @@ class Worker:
         runner.add_done_callback(_consume_result)
         raise _AttemptTimeout
 
-    async def _heartbeat_loop(self, ctxs: list[TaskContext]) -> None:
+    def _check_beat(self, beat: _Beat, task_id: str) -> None:
+        """Report a heartbeat that has not run for more than two intervals.
+
+        Two intervals is a whole beat missed, and at the default interval of
+        lease/3 the next one loses the lease outright — so this fires while the
+        lease still holds. After it expires the only evidence is a task that ran
+        twice, in two workers' logs, with no error in either."""
+        now = now_ms()
+        late_ms = now - beat.at_ms - self._hb_interval
+        if late_ms > self._hb_interval:
+            self._report(
+                EventLoopBlocked(late_ms, self._hb_interval, self._lease_ms),
+                phase="execute",
+                task_id=task_id,
+            )
+        beat.at_ms = now
+
+    async def _heartbeat_loop(self, ctxs: list[TaskContext], beat: _Beat) -> None:
         """One statement per beat, however many tasks the call covers — a
         single-task handler is just the one-element case.
 
@@ -914,6 +989,7 @@ class Worker:
         try:
             while True:
                 await asyncio.sleep(self._hb_interval / 1000)
+                self._check_beat(beat, ctxs[0].task_id)
                 live = [c for c in ctxs if not c.settled and not c.lost_lease]
                 if not live:
                     return

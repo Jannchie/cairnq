@@ -34,6 +34,7 @@ export {
   TaskCanceled,
   TaskError,
   LostLease,
+  EventLoopBlocked,
   ProtocolVersionMismatch,
   SerializationError,
 } from "./errors.js";

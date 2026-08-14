@@ -127,6 +127,34 @@ class TaskTimeout(CairnQError):
         super().__init__(message)
 
 
+class EventLoopBlocked(CairnQError):
+    """A heartbeat beat came back later than its own interval allowed.
+
+    The heartbeat shares the event loop with the handlers whose leases it renews,
+    so a handler that blocks the loop stops the renewal with it: the lease
+    expires, the task is recovered and redelivered, and a second worker starts
+    computing what the first is still computing — one task, billed twice, with no
+    error anywhere. Nothing inside the blocked handler can observe that, which is
+    why it is reported through `on_error` alongside the other things the run loop
+    survived.
+
+    A *sync* handler is dispatched to a thread and cannot cause this, so the usual
+    culprit is blocking work inside an async one: a synchronous HTTP client, a GPU
+    forward, a large hash. Move it to `asyncio.to_thread`.
+    """
+
+    def __init__(self, late_ms: int, interval_ms: int, lease_ms: int):
+        self.late_ms = late_ms
+        self.interval_ms = interval_ms
+        self.lease_ms = lease_ms
+        super().__init__(
+            f"heartbeat beat was {late_ms}ms late (interval {interval_ms}ms, lease "
+            f"{lease_ms}ms): the event loop was blocked long enough to miss a beat. "
+            "Blocking work inside an async handler starves lease renewal — run it "
+            "with asyncio.to_thread."
+        )
+
+
 class TaskFailed(CairnQError):
     """A waited-on task ended in `failed`. The envelope's fields are unpacked onto
     the exception — read `e.code` / `e.message` / `e.retryable` / `e.details` instead

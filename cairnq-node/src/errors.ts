@@ -160,6 +160,36 @@ export class TaskCanceled extends CairnQError {
   }
 }
 
+/**
+ * A heartbeat beat came back later than its own interval allowed.
+ *
+ * The heartbeat shares the event loop with the handlers whose leases it renews,
+ * so a handler that blocks the loop stops the renewal with it: the lease expires,
+ * the task is recovered and redelivered, and a second worker starts computing
+ * what the first is still computing — one task, billed twice, with no error
+ * anywhere. Nothing inside the blocked handler can observe that, which is why it
+ * is reported through `onError` alongside the other things the run loop survived.
+ *
+ * The cause is always synchronous work in a handler: a tight loop, a large
+ * JSON.parse, a `*Sync` filesystem or crypto call. Node has one loop and no way
+ * to preempt it — move the work to a worker thread, a child process, or an async
+ * API that yields.
+ */
+export class EventLoopBlocked extends CairnQError {
+  constructor(
+    readonly lateMs: number,
+    readonly intervalMs: number,
+    readonly leaseMs: number,
+  ) {
+    super(
+      `heartbeat beat was ${lateMs}ms late (interval ${intervalMs}ms, lease ${leaseMs}ms): ` +
+        `the event loop was blocked long enough to miss a beat. Synchronous work in a ` +
+        `handler starves lease renewal — move it off the loop.`,
+    );
+    this.name = "EventLoopBlocked";
+  }
+}
+
 /** A worker write affected 0 rows: the lease expired and was reclaimed. */
 export class LostLease extends CairnQError {
   constructor(public taskId: string) {

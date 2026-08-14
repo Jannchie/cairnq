@@ -11,6 +11,7 @@ from .context import TaskContext
 from .errors import (
     AlreadyExists,
     CairnQError,
+    EventLoopBlocked,
     LostLease,
     ProtocolVersionMismatch,
     QueueFull,
@@ -56,6 +57,7 @@ __all__ = [
     "TaskCanceled",
     "TaskError",
     "LostLease",
+    "EventLoopBlocked",
     "ProtocolVersionMismatch",
     "SerializationError",
 ]

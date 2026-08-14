@@ -4,6 +4,7 @@ import { TaskContext } from "./context.js";
 import {
   asEnvelope,
   errorEnvelope,
+  EventLoopBlocked,
   exceptionEnvelope,
   type FailReason,
   LostLease,
@@ -923,6 +924,28 @@ export class Worker {
     let wake: (() => void) | null = null;
     // lease/3 gives two beats of slack; the floor only matters for sub-150ms leases.
     const interval = this.opts.heartbeatIntervalMs ?? Math.max(50, Math.floor(leaseMs / 3));
+
+    // When this heartbeat last ran. A loop cannot report its own absence — a
+    // handler that blocks for its whole attempt never lets the timer fire at all
+    // — so the check lives outside the loop and cancel() runs it too.
+    let lastBeatAt = Date.now();
+    /** Report a heartbeat that has not run for more than two intervals: a whole
+     * beat missed, which at lease/3 means the next such block loses the lease
+     * outright. Fires while the lease still holds — after it expires the only
+     * evidence is a task that ran twice, in two workers' logs, with no error in
+     * either. */
+    const checkBeat = (): void => {
+      const now = Date.now();
+      const lateMs = now - lastBeatAt - interval;
+      if (lateMs > interval) {
+        this.report(new EventLoopBlocked(lateMs, interval, leaseMs), {
+          phase: "execute",
+          taskId: ctxs[0].taskId,
+        });
+      }
+      lastBeatAt = now;
+    };
+
     const done = (async () => {
       while (active) {
         // Cancellable sleep: cancel() resolves this immediately and clears the
@@ -936,6 +959,7 @@ export class Worker {
         });
         wake = null;
         if (!active) break;
+        checkBeat();
         const live = ctxs.filter((c) => !c.settled && !c.lostLease);
         if (!live.length) break;
         try {
@@ -960,6 +984,10 @@ export class Worker {
       cancel: () => {
         active = false;
         if (wake) wake();
+        // The attempt is over, so this is the last chance to notice that the
+        // heartbeat never got one — the whole-attempt block, which is also the
+        // one where the lease is already gone.
+        checkBeat();
       },
       done,
     };
