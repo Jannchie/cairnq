@@ -118,6 +118,10 @@ class PostgresStore(TaskStore):
             # Warm the LISTEN connection in the background so the first idle
             # sleep is already wakeable. Fire-and-forget: failure means polling.
             self._listener_ready()
+        # Outside the init lock, and after the version check: retention is a
+        # background writer, so it must not start against a store this SDK is
+        # about to refuse to speak to.
+        self._start_retention()
 
     async def _apply_migrations(self, conn: Any) -> None:
         await conn.execute(

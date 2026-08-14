@@ -10,6 +10,7 @@ from .backpressure import (
 )
 from .errors import TaskCanceled, TaskFailed
 from .models import Task, TaskDef, TaskStatus, task_name
+from .retention import Retention, RetentionSweeper
 from .store.base import Conflict, TaskStore
 from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
@@ -26,6 +27,7 @@ class CairnQ:
         max_queue_depth: QueueDepthLimit | None = None,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
         queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
+        retention: Retention | None = None,
     ):
         self._store = store
         # Installed on the store, not held here: every submit path goes through
@@ -36,6 +38,14 @@ class CairnQ:
                 max_queue_wait_ms=max_queue_wait_ms,
                 queue_poll_interval_ms=queue_poll_interval_ms,
             )
+        # Retention goes on the store too, but for a different reason: scheduling
+        # it needs a running event loop, which a handle built at import time does
+        # not have. The store starts it when it connects — the one path no
+        # operation can skip, since `connect()` is optional and everything
+        # connects lazily through it. See TaskStore.use_retention.
+        self._sweeper = RetentionSweeper(store, retention) if retention is not None else None
+        if self._sweeper is not None:
+            store.use_retention(self._sweeper)
 
     # The factories name the STORE's options explicitly and forward the rest to
     # __init__ — the same split Worker.sqlite/.postgres uses, so a new client
@@ -60,6 +70,10 @@ class CairnQ:
         await self._store.connect()
 
     async def close(self) -> None:
+        """Stop retention (waiting for a sweep in flight, so no purge outlives
+        the store) and close the store."""
+        if self._sweeper is not None:
+            await self._sweeper.stop()
         await self._store.close()
 
     async def submit(

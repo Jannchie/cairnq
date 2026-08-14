@@ -1,4 +1,5 @@
 import type { BackpressureOptions } from "./backpressure.js";
+import { type RetentionOptions, RetentionSweeper } from "./retention.js";
 import { TaskCanceled, TaskFailed } from "./errors.js";
 import { isFailed, isSucceeded, type Task, type TaskStatus } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
@@ -15,10 +16,18 @@ export interface CallOptions extends SubmitOptions {
 
 /** Options this handle configures on the store it wraps, rather than the
  * store's own constructor arguments. */
-export type ClientOptions = Partial<BackpressureOptions>;
+export type ClientOptions = Partial<BackpressureOptions> & {
+  /** Delete terminal tasks older than a cutoff, on a schedule, for as long as
+   * this handle is open. Off unless set — and off means rows accumulate forever,
+   * because nothing else in CairnQ removes them. */
+  retention?: RetentionOptions;
+};
 
 /** API-side handle. Thin wrapper over a TaskStore + SDK-orchestrated wait/call. */
 export class CairnQ {
+  /** null unless `retention` was configured. */
+  private readonly sweeper: RetentionSweeper | null;
+
   constructor(
     private readonly _store: TaskStore,
     opts: ClientOptions = {},
@@ -28,6 +37,13 @@ export class CairnQ {
     if (opts.maxQueueDepth != null) {
       _store.useBackpressure(opts as BackpressureOptions);
     }
+    // Retention is the opposite case: it belongs to the handle, because a worker
+    // sharing the store must not also be deleting rows behind the API's back.
+    // Started here rather than in connect(), which is optional — every other
+    // path connects lazily, and retention that silently depends on an optional
+    // call is retention that silently does not happen.
+    this.sweeper = opts.retention ? new RetentionSweeper(_store, opts.retention) : null;
+    this.sweeper?.start();
   }
 
   static sqlite(path: string, opts: { busyTimeoutMs?: number } & ClientOptions = {}): CairnQ {
@@ -50,8 +66,11 @@ export class CairnQ {
     return this._store.connect();
   }
 
-  close(): Promise<void> {
-    return this._store.close();
+  /** Stop retention (waiting for a sweep in flight, so no purge outlives the
+   * store) and close the store. */
+  async close(): Promise<void> {
+    await this.sweeper?.stop();
+    await this._store.close();
   }
 
   /** Enqueue a task. With `maxQueueDepth` configured this blocks while the

@@ -21,6 +21,7 @@ from .errors import (
     TaskTimeout,
 )
 from .models import STATUSES, Task, TaskDef, TaskStatus
+from .retention import Retention, RetentionSweeper
 from .store import Conflict, PostgresStore, SQLiteStore, TaskStore
 from .worker import Worker
 
@@ -45,6 +46,8 @@ __all__ = [
     "PostgresStore",
     "QueueDepthGate",
     "QueueDepthLimit",
+    "Retention",
+    "RetentionSweeper",
     "CairnQError",
     "AlreadyExists",
     "QueueFull",

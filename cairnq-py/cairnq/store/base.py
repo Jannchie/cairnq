@@ -20,7 +20,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from functools import lru_cache
-from typing import Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
+
+if TYPE_CHECKING:  # import cycle: retention builds on the store it sweeps
+    from ..retention import RetentionSweeper
 
 from .._ids import new_id
 from ..backpressure import (
@@ -158,6 +161,26 @@ class TaskStore(ABC):
             max_queue_wait_ms=max_queue_wait_ms,
             queue_poll_interval_ms=queue_poll_interval_ms,
         )
+
+    #: Set by use_retention; None means this store sweeps nothing.
+    _sweeper: RetentionSweeper | None = None
+
+    def use_retention(self, sweeper: RetentionSweeper) -> None:
+        """Attach a retention sweep that begins when this store connects.
+
+        It hangs here for the same reason backpressure does: the store is the one
+        place every path reaches. Scheduling the sweep needs a running event loop,
+        which a handle built at import time does not have, and `connect()` is
+        optional — every operation connects lazily through it. Starting from the
+        store is therefore the only place that cannot be skipped, and retention
+        that silently depends on remembering a call is retention that silently
+        does not happen. Only a CairnQ built with `retention` installs one."""
+        self._sweeper = sweeper
+
+    def _start_retention(self) -> None:
+        """Called by each dialect at the end of connect(), where a loop is live."""
+        if self._sweeper is not None:
+            self._sweeper.start()
 
     # ------------------------------------------------------------ dialect seam
     @abstractmethod

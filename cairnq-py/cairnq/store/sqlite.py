@@ -247,6 +247,10 @@ class SQLiteStore(TaskStore):
             )
             self._conn = conn
             check_protocol_version(await self.protocol_version())
+        # Outside the init lock, and after the version check: retention is a
+        # background writer, so it must not start against a store this SDK is
+        # about to refuse to speak to.
+        self._start_retention()
 
     async def _apply_migrations(self, conn: aiosqlite.Connection) -> None:
         await conn.execute(
