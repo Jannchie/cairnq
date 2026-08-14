@@ -99,6 +99,10 @@ class Runner:
             return await c.get(a["id"])
         if op == "get_by_key":
             return await c.get_by_key(a["key"])
+        if op == "get_status":
+            return await c.get_status(a["id"])
+        if op == "get_status_by_key":
+            return await c.get_status_by_key(a["key"])
         if op == "list":
             return await c.list(**a)
         if op == "cancel":
@@ -147,7 +151,10 @@ class Runner:
             )
         if op == "purge":
             return await c.purge(
-                older_than_ms=a.get("older_than_ms", 0), limit=a.get("limit", 1000)
+                older_than_ms=a.get("older_than_ms", 0),
+                status=a.get("status"),
+                name=a.get("name"),
+                limit=a.get("limit", 1000),
             )
         if op == "stats":
             return await c.stats()

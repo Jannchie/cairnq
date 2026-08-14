@@ -1,0 +1,24 @@
+{
+  "name": "purge_filters",
+  "description": "purge's optional status/name filters bound a sweep to one terminal status or task name — retention needs are tiered, and without them the shortest-lived tier would set the retention for every row",
+  "steps": [
+    { "op": "submit", "args": { "name": "alpha", "payload": {} }, "save": "ok" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "succeed", "args": { "id": "$ok.id", "worker_id": "w1", "result": {} }, "expect": { "equals": { "status": "succeeded" } } },
+    { "op": "submit", "args": { "name": "beta", "payload": {} }, "save": "bad" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$bad.id", "worker_id": "w1", "error": { "type": "E", "code": "e", "message": "boom", "retryable": false }, "retryable": false, "delay_ms": 0 }, "expect": { "equals": { "status": "failed" } } },
+    { "op": "submit", "args": { "name": "alpha", "payload": {} }, "save": "ok2" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "succeed", "args": { "id": "$ok2.id", "worker_id": "w1", "result": {} }, "expect": { "equals": { "status": "succeeded" } } },
+    { "op": "sleep", "args": { "ms": 30 } },
+
+    { "op": "purge", "args": { "older_than_ms": 0, "status": "failed", "limit": 100 }, "expect": { "length": 1 } },
+    { "op": "get", "args": { "id": "$bad.id" }, "expect": { "isNull": ["id"] } },
+    { "op": "get", "args": { "id": "$ok.id" }, "expect": { "equals": { "status": "succeeded" } } },
+
+    { "op": "purge", "args": { "older_than_ms": 0, "name": "alpha", "limit": 100 }, "expect": { "length": 2 } },
+    { "op": "get", "args": { "id": "$ok.id" }, "expect": { "isNull": ["id"] } },
+    { "op": "get", "args": { "id": "$ok2.id" }, "expect": { "isNull": ["id"] } }
+  ]
+}

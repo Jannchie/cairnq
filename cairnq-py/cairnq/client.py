@@ -2,14 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._wait import DEFAULT_POLL_MS, poll_wait, poll_wait_by_key
+from ._wait import (
+    DEFAULT_POLL_MS,
+    DEFAULT_WAIT_TIMEOUT_MS,
+    MAX_POLL_MS,
+    poll_wait,
+    poll_wait_by_key,
+)
 from .backpressure import (
     DEFAULT_MAX_WAIT_MS,
     INITIAL_PROBE_INTERVAL_MS,
     QueueDepthLimit,
 )
 from .errors import TaskCanceled, TaskFailed
-from .models import Task, TaskDef, TaskStatus, task_name
+from .models import Task, TaskDef, TaskRef, TaskStatus, task_name
 from .retention import Retention, RetentionSweeper
 from .store.base import Conflict, TaskStore
 from .store.postgres import PostgresStore
@@ -117,6 +123,15 @@ class CairnQ:
     async def get_by_key(self, key: str) -> Task | None:
         return await self._store.get_by_key(key)
 
+    async def get_status(self, task_id: str) -> TaskRef | None:
+        """The status-only probe wait polls on: id + status, no payload. Public
+        for the same reason it exists — a dashboard or poller that only asks
+        "is it finished yet" should not drag the payload back per ask."""
+        return await self._store.get_status(task_id)
+
+    async def get_status_by_key(self, key: str) -> TaskRef | None:
+        return await self._store.get_status_by_key(key)
+
     async def list(
         self,
         *,
@@ -150,12 +165,25 @@ class CairnQ:
     async def retry_by_key(self, key: str, *, reset_attempt: bool = False) -> Task | None:
         return await self._store.retry_by_key(key, reset_attempt=reset_attempt)
 
-    async def purge(self, *, older_than_ms: int = 0, limit: int = 1_000) -> list[str]:
+    async def purge(
+        self,
+        *,
+        older_than_ms: int = 0,
+        status: TaskStatus | None = None,
+        name: str | None = None,
+        limit: int = 1_000,
+    ) -> list[str]:
         """Delete terminal tasks that finished more than `older_than_ms` ago and
         return their ids. Nothing else in CairnQ removes rows, so a long-lived
         database needs this on a schedule. Each call is bounded by `limit` to keep
-        the write short; loop until it returns fewer than `limit`."""
-        return await self._store.purge(older_than_ms=older_than_ms, limit=limit)
+        the write short; loop until it returns fewer than `limit`.
+
+        `status` / `name` restrict the sweep to one terminal status or task name
+        — retention needs are tiered, and without them the shortest-lived tier
+        sets the retention for every row."""
+        return await self._store.purge(
+            older_than_ms=older_than_ms, status=status, name=name, limit=limit
+        )
 
     async def stats(self) -> dict[str, dict[TaskStatus, int]]:
         """Task counts per queue, keyed by status and zero-filled across all
@@ -171,31 +199,53 @@ class CairnQ:
         return await self._store.queue_depth(queue, max_depth)
 
     async def wait(
-        self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS
+        self,
+        task_id: str,
+        *,
+        timeout_ms: int = DEFAULT_WAIT_TIMEOUT_MS,
+        poll_ms: int = DEFAULT_POLL_MS,
+        max_poll_ms: int = MAX_POLL_MS,
     ) -> Task:
         """Wait for a task to finish. Returns the terminal Task (any status);
         raises TaskTimeout without stopping the task, so `wait(err.task_id)` picks
-        the same wait back up — from another process, or after a longer
-        deadline."""
-        return await poll_wait(self._store, task_id, timeout_ms=timeout_ms, poll_ms=poll_ms)
+        the same wait back up — from another process, or after a longer deadline.
+
+        `poll_ms` is the first poll interval; it backs off towards `max_poll_ms`,
+        which is worth raising for a task known to take minutes (fewer reads) or
+        lowering when completion-detection latency matters."""
+        return await poll_wait(
+            self._store,
+            task_id,
+            timeout_ms=timeout_ms,
+            poll_ms=poll_ms,
+            max_poll_ms=max_poll_ms,
+        )
 
     async def wait_by_key(
-        self, key: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS
+        self,
+        key: str,
+        *,
+        timeout_ms: int = DEFAULT_WAIT_TIMEOUT_MS,
+        poll_ms: int = DEFAULT_POLL_MS,
+        max_poll_ms: int = MAX_POLL_MS,
     ) -> Task:
         """Wait for whatever task the `key` currently points at — the
         cross-process form of picking a wait back up, when the id was never in
         hand or the process that held it is gone. Re-resolves the key on each
         poll, so a `replace` landing mid-wait moves the wait onto the new task,
         and a key with no task yet is waited for rather than rejected."""
-        return await poll_wait_by_key(self._store, key, timeout_ms=timeout_ms, poll_ms=poll_ms)
+        return await poll_wait_by_key(
+            self._store, key, timeout_ms=timeout_ms, poll_ms=poll_ms, max_poll_ms=max_poll_ms
+        )
 
     async def call(
         self,
         name: str | TaskDef[Any, Any],
         payload: dict[str, Any] | None = None,
         *,
-        wait_timeout_ms: int = 30_000,
+        wait_timeout_ms: int = DEFAULT_WAIT_TIMEOUT_MS,
         poll_ms: int = DEFAULT_POLL_MS,
+        max_poll_ms: int = MAX_POLL_MS,
         **submit_kwargs: Any,
     ) -> Any:
         """submit + wait. Returns the result on success; raises TaskFailed /
@@ -206,7 +256,9 @@ class CairnQ:
         on, and `wait(err.task_id)` — or `wait_by_key`, from a process that only
         has the key — resumes the wait rather than starting the work over."""
         task = await self.submit(name, payload, **submit_kwargs)
-        final = await self.wait(task.id, timeout_ms=wait_timeout_ms, poll_ms=poll_ms)
+        final = await self.wait(
+            task.id, timeout_ms=wait_timeout_ms, poll_ms=poll_ms, max_poll_ms=max_poll_ms
+        )
         if final.succeeded:
             return final.result
         if final.failed:

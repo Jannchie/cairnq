@@ -248,7 +248,11 @@ and a JSON protocol.
   tasks = CairnQ.sqlite("tasks.db", retention=Retention(older_than_ms=7 * 86_400_000))
   ```
 
-  `purge(older_than_ms=..., limit=...)` remains the manual form, for an external
+  Retention needs are usually tiered — a succeeded row is spent once its result
+  is consumed, a failed one is worth keeping for diagnosis — so `older_than_ms`
+  also takes a per-status mapping (`{"succeeded": 300_000, "failed":
+  86_400_000}`; a status left out is never swept). `purge(older_than_ms=...,
+  status=..., name=..., limit=...)` remains the manual form, for an external
   scheduler or a one-off drain.
 
 - **Operational visibility**: `stats()` returns task counts per queue and status

@@ -1,9 +1,9 @@
 export { CairnQ } from "./client.js";
-export type { CallOptions, ClientOptions, SubmitOptions } from "./client.js";
+export type { CallOptions, ClientOptions, SubmitOptions, WaitOptions } from "./client.js";
 export { QueueDepthGate } from "./backpressure.js";
 export type { BackpressureOptions, QueueDepthLimit } from "./backpressure.js";
 export { RetentionSweeper } from "./retention.js";
-export type { RetentionOptions } from "./retention.js";
+export type { RetentionCutoffs, RetentionOptions } from "./retention.js";
 export { Worker } from "./worker.js";
 export type { BatchHandler, Handler, TypedHandler, WorkerOptions } from "./worker.js";
 export { TaskContext } from "./context.js";
@@ -14,10 +14,11 @@ export { SQLiteStore } from "./store/sqlite.js";
 export { PostgresStore } from "./store/postgres.js";
 export { TaskStore } from "./store/base.js";
 export type { ListInput, PurgeInput, SubmitInput, Conflict } from "./store/base.js";
-export type { Task, TaskStatus } from "./models.js";
+export type { Task, TaskRef, TaskStatus, TerminalStatus } from "./models.js";
 export {
   STATUSES,
   isTerminal,
+  isTerminalStatus,
   cancelRequested,
   isQueued,
   isRunning,

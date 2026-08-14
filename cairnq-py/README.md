@@ -75,8 +75,13 @@ worker = Worker.sqlite(
 )
 
 # Nothing else deletes rows, so give the client a retention policy — it sweeps
-# terminal tasks in bounded batches for as long as the handle is open.
-tasks = CairnQ.sqlite("tasks.db", retention=Retention(older_than_ms=7 * 24 * 3600_000))
+# terminal tasks in bounded batches for as long as the handle is open. A
+# per-status mapping keeps each status on its own clock (statuses left out are
+# never swept): spent results go in minutes, failures stay for diagnosis.
+tasks = CairnQ.sqlite(
+    "tasks.db",
+    retention=Retention(older_than_ms={"succeeded": 300_000, "failed": 7 * 24 * 3600_000}),
+)
 ```
 
 A **sync** handler (`def`, not `async def`) is dispatched to a thread, so the

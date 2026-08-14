@@ -75,9 +75,11 @@ const worker = Worker.sqlite("tasks.db", {
 });
 
 // Nothing else deletes rows, so give the client a retention policy — it sweeps
-// terminal tasks in bounded batches for as long as the handle is open.
+// terminal tasks in bounded batches for as long as the handle is open. A
+// per-status map keeps each status on its own clock (statuses left out are
+// never swept): spent results go in minutes, failures stay for diagnosis.
 const tasks = CairnQ.sqlite("tasks.db", {
-  retention: { olderThanMs: 7 * 24 * 3600_000 },
+  retention: { olderThanMs: { succeeded: 300_000, failed: 7 * 24 * 3600_000 } },
 });
 ```
 

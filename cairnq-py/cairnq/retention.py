@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from .store.base import TaskStore
+from .models import TaskStatus
+from .store.base import TaskStore, validate_purge_input
 
 #: Sweep every hour unless asked otherwise — often enough that a queue with a day
 #: of retention never carries more than an hour of extra rows, rare enough that
@@ -21,24 +22,45 @@ class Retention:
     """How long terminal tasks are kept, and how often that is enforced.
 
     `older_than_ms` is required: there is no safe default for how long someone
-    else's results stay readable. `on_error` is called for a sweep that threw —
-    the next sweep runs on schedule regardless, since a purge that failed because
-    the database was busy is not a reason to stop retaining, so without it a store
-    quietly stops being swept. It must not raise.
+    else's results stay readable. An int keeps every terminal status the same
+    time; retention needs are often tiered — a succeeded row is spent once its
+    result is consumed, while a failed one is worth keeping for diagnosis — so a
+    per-status mapping sets a cutoff per status instead:
+    `{"succeeded": 300_000, "failed": 86_400_000}`. A status left out of the
+    mapping is never swept — granular retention is an explicit statement of what
+    may go, not a default for what wasn't named.
+
+    `on_error` is called for a sweep that threw — the next sweep runs on schedule
+    regardless, since a purge that failed because the database was busy is not a
+    reason to stop retaining, so without it a store quietly stops being swept. It
+    must not raise.
     """
 
-    older_than_ms: int
+    older_than_ms: int | Mapping[TaskStatus, int]
     interval_ms: int = DEFAULT_INTERVAL_MS
     limit: int = DEFAULT_LIMIT
     on_error: Callable[[BaseException], None] | None = None
 
     def __post_init__(self) -> None:
-        if self.older_than_ms < 0:
-            raise ValueError(f"retention older_than_ms must be >= 0, got {self.older_than_ms}")
+        cutoffs = self.cutoffs()
+        # An empty mapping retains nothing and sweeps nothing — almost certainly
+        # a bug upstream, so refuse it rather than silently never purging.
+        if not cutoffs:
+            raise ValueError("retention older_than_ms must name at least one status")
         if self.interval_ms < 1:
             raise ValueError(f"retention interval_ms must be >= 1, got {self.interval_ms}")
-        if self.limit < 1:
-            raise ValueError(f"retention limit must be >= 1, got {self.limit}")
+        # Fail fast on the store's own purge rules (terminal status, cutoff and
+        # limit bounds): the sweep runs an hour from now, and its errors only
+        # surface via on_error.
+        for status, cutoff in cutoffs:
+            validate_purge_input(older_than_ms=cutoff, status=status, limit=self.limit)
+
+    def cutoffs(self) -> list[tuple[TaskStatus | None, int]]:
+        """The (status filter, cutoff) pairs one sweep purges — a lone unfiltered
+        pair for an int, one pair per status for a mapping."""
+        if isinstance(self.older_than_ms, Mapping):
+            return list(self.older_than_ms.items())
+        return [(None, self.older_than_ms)]
 
 
 class RetentionSweeper:
@@ -108,16 +130,20 @@ class RetentionSweeper:
         drain on demand — after a backfill, or from a maintenance command."""
         limit = self._retention.limit
         deleted = 0
-        while True:
-            ids = await self._store.purge(
-                older_than_ms=self._retention.older_than_ms, limit=limit
-            )
-            deleted += len(ids)
-            if len(ids) < limit or self._stop.is_set():
-                return deleted
-            # Hand the loop back between batches: a large drain must not starve
-            # the submits and claims sharing this process.
-            await asyncio.sleep(0)
+        for status, older_than_ms in self._retention.cutoffs():
+            while True:
+                ids = await self._store.purge(
+                    older_than_ms=older_than_ms, status=status, limit=limit
+                )
+                deleted += len(ids)
+                if self._stop.is_set():
+                    return deleted
+                if len(ids) < limit:
+                    break
+                # Hand the loop back between batches: a large drain must not
+                # starve the submits and claims sharing this process.
+                await asyncio.sleep(0)
+        return deleted
 
     async def _sleep(self, ms: int) -> None:
         """Sleep, interruptible by stop() — so closing a handle need not wait out

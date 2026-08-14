@@ -101,6 +101,10 @@ export class Runner {
         return c.get(a.id);
       case "get_by_key":
         return c.getByKey(a.key);
+      case "get_status":
+        return c.getStatus(a.id);
+      case "get_status_by_key":
+        return c.getStatusByKey(a.key);
       case "list":
         return c.list({
           status: a.status,
@@ -165,7 +169,12 @@ export class Runner {
           delayMs: a.delay_ms,
         });
       case "purge":
-        return c.purge({ olderThanMs: a.older_than_ms, limit: a.limit });
+        return c.purge({
+          olderThanMs: a.older_than_ms,
+          status: a.status,
+          name: a.name,
+          limit: a.limit,
+        });
       case "stats":
         return c.stats();
       case "queue_depth":

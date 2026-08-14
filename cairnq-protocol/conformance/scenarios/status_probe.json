@@ -1,0 +1,19 @@
+{
+  "name": "status_probe",
+  "description": "get_status / get_status_by_key return the id + status pair wait polls on — the status-only probe behind wait/call — and the by-key form follows the key's current task across a replace",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": { "big": "payload" }, "key": "A" }, "save": "t1" },
+    { "op": "get_status", "args": { "id": "$t1.id" }, "save": "p1", "expect": { "equals": { "status": "queued" } } },
+    { "op": "expect", "target": "$p1.id", "equalsRef": "$t1.id" },
+    { "op": "get_status_by_key", "args": { "key": "A" }, "save": "p2", "expect": { "equals": { "status": "queued" } } },
+    { "op": "expect", "target": "$p2.id", "equalsRef": "$t1.id" },
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "A", "conflict": "replace" }, "save": "t2" },
+    { "op": "get_status_by_key", "args": { "key": "A" }, "save": "p3", "expect": { "equals": { "status": "queued" } } },
+    { "op": "expect", "target": "$p3.id", "equalsRef": "$t2.id" },
+    { "op": "get_status", "args": { "id": "$t1.id" }, "expect": { "equals": { "status": "canceled" } } },
+
+    { "op": "get_status", "args": { "id": "task_missing" }, "expect": { "isNull": ["id"] } },
+    { "op": "get_status_by_key", "args": { "key": "missing" }, "expect": { "isNull": ["id"] } }
+  ]
+}

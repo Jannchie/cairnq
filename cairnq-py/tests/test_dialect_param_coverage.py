@@ -45,6 +45,8 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     await store.submit(name="job", payload={}, key="k", conflict="replace")
     await store.get(task.id)
     await store.get_by_key("k")
+    await store.get_status(task.id)
+    await store.get_status_by_key("k")
     await store.list(status="queued", queue="default", name="job")
     await store.cancel_by_key("k")
     await store.retry_by_key("k", reset_attempt=True)
@@ -92,7 +94,7 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     await store.retry(task.id, reset_attempt=False)
     await store.stats()
     await store.queue_depth("default", 10)
-    await store.purge(older_than_ms=0, limit=10)
+    await store.purge(older_than_ms=0, status="succeeded", name="job", limit=10)
 
 
 @pytest.fixture

@@ -30,9 +30,12 @@ Any string argument of the form `$alias`, `$alias.field`, or `$alias.0.field`
 
 ## Ops
 
-Client-side: `submit`, `get`, `get_by_key`, `list`, `cancel`, `cancel_by_key`,
-`retry`, `retry_by_key`, `purge` (`{ "older_than_ms": n, "limit": n }`; returns an
-array of deleted ids), `stats` (no args; returns `{queue: {status: count}}`,
+Client-side: `submit`, `get`, `get_by_key`, `get_status`, `get_status_by_key`
+(the wait loop's status-only probes; runners return `{id, status}` or null),
+`list`, `cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`
+(`{ "older_than_ms": n, "status": s, "name": s, "limit": n }`, status/name
+optional; returns an array of deleted ids), `stats` (no args; returns
+`{queue: {status: count}}`,
 zero-filled per queue). Worker-side: `claim` (runs lease recovery then claim, like
 the worker loop; returns an array), `heartbeat`, `heartbeat_batch`, `progress`,
 `succeed`, `complete`, `fail`. Control: `sleep` (`{ "ms": n }`), `expect`.

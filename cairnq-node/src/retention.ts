@@ -1,4 +1,5 @@
-import type { PurgeInput, TaskStore } from "./store/base.js";
+import type { TaskStatus, TerminalStatus } from "./models.js";
+import { validatePurgeInput, type PurgeInput, type TaskStore } from "./store/base.js";
 
 /** Sweep every hour unless asked otherwise — often enough that a queue with a
  * day of retention never carries more than an hour of extra rows, rare enough
@@ -8,12 +9,21 @@ const DEFAULT_INTERVAL_MS = 3_600_000;
  * a backlog drains in few statements, small enough that each is a short write. */
 const DEFAULT_LIMIT = 1_000;
 
+/** Per-status cutoffs. A status left out is never swept — granular retention is
+ * an explicit statement of what may go, not a default for what wasn't named. */
+export type RetentionCutoffs = Partial<Record<TerminalStatus, number>>;
+
 export interface RetentionOptions {
   /**
    * How long a terminal task is kept after it finished. Required: there is no
    * safe default for how long someone else's results stay readable.
+   *
+   * A number keeps every terminal status the same time. Retention needs are
+   * often tiered — a succeeded row is spent once its result is consumed, while
+   * a failed one is worth keeping for diagnosis — so a per-status map sets a
+   * cutoff per status instead: `{ succeeded: 300_000, failed: 86_400_000 }`.
    */
-  olderThanMs: number;
+  olderThanMs: number | RetentionCutoffs;
   /** Time between sweeps. Default 3_600_000 (one hour). */
   intervalMs?: number;
   /** Rows deleted per statement while draining. Default 1_000. */
@@ -50,20 +60,37 @@ export class RetentionSweeper {
   /** The loop itself, awaited by stop() so no purge outlives the store. */
   private loop: Promise<void> | null = null;
   private readonly intervalMs: number;
-  private readonly purgeInput: PurgeInput;
+  /** Rows per purge statement while draining — see DEFAULT_LIMIT. */
+  private readonly limit: number;
+  /** One purge per cutoff: a lone entry for a number, one per status for a map. */
+  private readonly purgeInputs: PurgeInput[];
 
   constructor(
     private readonly store: TaskStore,
     private readonly opts: RetentionOptions,
   ) {
-    if (!Number.isFinite(opts.olderThanMs) || opts.olderThanMs < 0) {
-      throw new Error(`retention.olderThanMs must be >= 0, got ${opts.olderThanMs}`);
-    }
     this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
     if (!Number.isFinite(this.intervalMs) || this.intervalMs < 1) {
       throw new Error(`retention.intervalMs must be >= 1, got ${this.intervalMs}`);
     }
-    this.purgeInput = { olderThanMs: opts.olderThanMs, limit: opts.limit ?? DEFAULT_LIMIT };
+    this.limit = opts.limit ?? DEFAULT_LIMIT;
+    const cutoffs: [TaskStatus | undefined, number][] =
+      typeof opts.olderThanMs === "number"
+        ? [[undefined, opts.olderThanMs]]
+        : (Object.entries(opts.olderThanMs) as [TaskStatus, number][]);
+    // An empty map retains nothing and sweeps nothing — almost certainly a bug
+    // upstream of this call, so refuse it rather than silently never purging.
+    if (!cutoffs.length) {
+      throw new Error("retention.olderThanMs must name at least one status");
+    }
+    this.purgeInputs = cutoffs.map(([status, ms]) => ({
+      olderThanMs: ms,
+      status,
+      limit: this.limit,
+    }));
+    // Fail fast on the store's own purge rules (terminal status, cutoff >= 0):
+    // the sweep runs an hour from now, and its errors only surface via onError.
+    for (const input of this.purgeInputs) validatePurgeInput(input);
   }
 
   start(): void {
@@ -107,16 +134,19 @@ export class RetentionSweeper {
    * demand — after a backfill, or from a maintenance command.
    */
   async sweep(): Promise<number> {
-    const limit = this.purgeInput.limit as number;
     let deleted = 0;
-    for (;;) {
-      const ids = await this.store.purge(this.purgeInput);
-      deleted += ids.length;
-      if (ids.length < limit || this.stopping) return deleted;
-      // Hand the loop back between batches: a large drain must not starve the
-      // submits and claims sharing this process.
-      await this.sleep(0);
+    for (const input of this.purgeInputs) {
+      for (;;) {
+        const ids = await this.store.purge(input);
+        deleted += ids.length;
+        if (this.stopping) return deleted;
+        if (ids.length < this.limit) break;
+        // Hand the loop back between batches: a large drain must not starve the
+        // submits and claims sharing this process.
+        await this.sleep(0);
+      }
     }
+    return deleted;
   }
 
   /** Sleep, interruptible by stop(). Unref'd: retention is housekeeping, and a

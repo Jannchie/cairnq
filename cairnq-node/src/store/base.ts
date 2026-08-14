@@ -6,7 +6,15 @@ import {
   ProtocolVersionMismatch,
   SerializationError,
 } from "../errors.js";
-import { rowToTask, STATUSES, TERMINAL, type Task, type TaskStatus } from "../models.js";
+import {
+  isTerminalStatus,
+  rowToRef,
+  rowToTask,
+  STATUSES,
+  type Task,
+  type TaskRef,
+  type TaskStatus,
+} from "../models.js";
 import { type BackpressureOptions, QueueDepthGate } from "../backpressure.js";
 
 const rejectMangled = function (this: unknown, _key: string, v: unknown): unknown {
@@ -77,7 +85,7 @@ export type Conflict = (typeof CONFLICTS)[number];
  */
 function reusable(conflict: Conflict, status: TaskStatus): boolean {
   if (conflict === "replace") return false;
-  if (!TERMINAL.includes(status)) return true;
+  if (!isTerminalStatus(status)) return true;
   return conflict === "reuse-succeeded" && status === "succeeded";
 }
 
@@ -110,8 +118,32 @@ export interface ListInput {
   offset?: number;
 }
 
+/** Validate a purge's inputs. Shared with RetentionSweeper, which fail-fasts at
+ * construction on the same rules an hourly sweep would otherwise only surface
+ * through its onError hook — one statement of the rules, two callers. */
+export function validatePurgeInput(input: PurgeInput): void {
+  if (input.olderThanMs != null && (!Number.isFinite(input.olderThanMs) || input.olderThanMs < 0)) {
+    throw new Error(`olderThanMs must be >= 0, got ${input.olderThanMs}`);
+  }
+  if (input.limit != null && input.limit < 1) {
+    throw new Error(`limit must be >= 1, got ${input.limit}`);
+  }
+  // Terminal only: purge never deletes live work, so accepting `queued` here
+  // would be accepting a filter that silently matches nothing.
+  if (input.status != null && !isTerminalStatus(input.status)) {
+    throw new Error(`status must be terminal, got ${input.status}`);
+  }
+}
+
 export interface PurgeInput {
   olderThanMs?: number;
+  /** Restrict the sweep to one terminal status. Retention needs are tiered —
+   * succeeded rows are spent once their result is consumed, failed ones are
+   * worth keeping for diagnosis — and without this the shortest-lived tier
+   * sets the retention for every row. Absent means all terminal statuses. */
+  status?: TaskStatus;
+  /** Restrict the sweep to one task name. Absent means all names. */
+  name?: string;
   limit?: number;
 }
 
@@ -234,6 +266,10 @@ export abstract class TaskStore {
     return rows.length ? rowToTask(rows[0]) : null;
   }
 
+  private static oneRef(rows: any[]): TaskRef | null {
+    return rows.length ? rowToRef(rows[0]) : null;
+  }
+
   // ------------------------------------------------------------- client side
   /**
    * Bound how deep a queue may get before `submit` blocks. Off unless set.
@@ -305,7 +341,7 @@ export abstract class TaskStore {
           // fresh one inserted below. Cancel only what is still live: a terminal
           // task has nothing to stop, and cancelling it would rewrite a settled
           // row (and hand a `canceled` back to whoever is waiting on it).
-          if (!TERMINAL.includes(current.status as TaskStatus)) {
+          if (!isTerminalStatus(current.status as TaskStatus)) {
             await fetch("cancel", { id: existing[0].task_id });
           }
         }
@@ -322,6 +358,18 @@ export abstract class TaskStore {
 
   async getByKey(key: string): Promise<Task | null> {
     return TaskStore.one(await this.fetch("get_by_key", { key }));
+  }
+
+  /** The wait loop's probe: id + status alone, so polling a task with a large
+   * payload does not re-read and re-parse that payload on every beat. */
+  async getStatus(taskId: string): Promise<TaskRef | null> {
+    return TaskStore.oneRef(await this.fetch("get_status", { id: taskId }));
+  }
+
+  /** getStatus, following a key instead of an id — re-resolved per call, so a
+   * `replace` moves the probe onto the new task. */
+  async getStatusByKey(key: string): Promise<TaskRef | null> {
+    return TaskStore.oneRef(await this.fetch("get_status_by_key", { key }));
   }
 
   async list(input: ListInput = {}): Promise<Task[]> {
@@ -385,14 +433,11 @@ export abstract class TaskStore {
    * call it in a loop until it returns fewer than `limit`.
    */
   async purge(input: PurgeInput = {}): Promise<string[]> {
-    if (input.olderThanMs != null && input.olderThanMs < 0) {
-      throw new Error(`olderThanMs must be >= 0, got ${input.olderThanMs}`);
-    }
-    if (input.limit != null && input.limit < 1) {
-      throw new Error(`limit must be >= 1, got ${input.limit}`);
-    }
+    validatePurgeInput(input);
     const rows = await this.fetch("purge", {
       older_than_ms: input.olderThanMs ?? 0,
+      status: input.status ?? null,
+      name: input.name ?? null,
       limit: input.limit ?? 1_000,
     });
     return rows.map((r) => r.id as string);

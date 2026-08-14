@@ -19,6 +19,25 @@ R = TypeVar("R")
 
 
 @dataclass(frozen=True)
+class TaskRef:
+    """The id + status pair the wait loop polls on (see get_status.sql) — a
+    probe, not a snapshot: everything else about the task is deliberately not
+    read. A dataclass like Task, not a tuple, so generic field access
+    (`getattr`, the conformance runner) treats the two models alike."""
+
+    id: str
+    status: TaskStatus
+
+    @classmethod
+    def from_row(cls, row: Any) -> "TaskRef":
+        return cls(id=row["id"], status=row["status"])
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL
+
+
+@dataclass(frozen=True)
 class TaskDef(Generic[P, R]):
     """A typed task handle. Define a task once and reference the same symbol from
     the worker (`@worker.task(my_task)`) and the client (`tasks.call(my_task, …)`),

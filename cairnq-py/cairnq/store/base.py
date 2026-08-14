@@ -39,7 +39,7 @@ from ..errors import (
     SerializationError,
     error_envelope,
 )
-from ..models import STATUSES, TERMINAL, Task, TaskStatus
+from ..models import STATUSES, TERMINAL, Task, TaskRef, TaskStatus
 
 # Runs one named protocol statement and returns its rows.
 Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
@@ -97,6 +97,23 @@ def dump_json(value: Any) -> str:
         return _ENCODER.encode(value)
     except (TypeError, ValueError) as exc:
         raise SerializationError(str(exc)) from exc
+
+
+def validate_purge_input(
+    *, older_than_ms: int, status: TaskStatus | None, limit: int
+) -> None:
+    """Validate a purge's inputs. Shared with RetentionSweeper, which fail-fasts
+    at construction on the same rules an hourly sweep would otherwise only
+    surface through its on_error hook — one statement of the rules, two
+    callers."""
+    if older_than_ms < 0:
+        raise ValueError(f"older_than_ms must be >= 0, got {older_than_ms}")
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    # Terminal only: purge never deletes live work, so accepting `queued` here
+    # would be accepting a filter that silently matches nothing.
+    if status is not None and status not in TERMINAL:
+        raise ValueError(f"status must be terminal, got {status!r}")
 
 
 LEASE_EXPIRED_ERROR_JSON = dump_json(
@@ -234,6 +251,10 @@ class TaskStore(ABC):
     def _one(rows: list[Any]) -> Task | None:
         return Task.from_row(rows[0]) if rows else None
 
+    @staticmethod
+    def _one_ref(rows: list[Any]) -> TaskRef | None:
+        return TaskRef.from_row(rows[0]) if rows else None
+
     # ------------------------------------------------------------- client side
     async def submit(
         self,
@@ -318,6 +339,16 @@ class TaskStore(ABC):
     async def get_by_key(self, key: str) -> Task | None:
         return self._one(await self._fetch("get_by_key", {"key": key}))
 
+    async def get_status(self, task_id: str) -> TaskRef | None:
+        """The wait loop's probe: id + status alone, so polling a task with a
+        large payload does not re-read and re-parse that payload on every beat."""
+        return self._one_ref(await self._fetch("get_status", {"id": task_id}))
+
+    async def get_status_by_key(self, key: str) -> TaskRef | None:
+        """get_status, following a key instead of an id — re-resolved per call,
+        so a `replace` moves the probe onto the new task."""
+        return self._one_ref(await self._fetch("get_status_by_key", {"key": key}))
+
     async def list(
         self,
         *,
@@ -377,16 +408,28 @@ class TaskStore(ABC):
             rows = await fetch(name, {"id": existing[0]["task_id"], **params})
             return self._one(rows)
 
-    async def purge(self, *, older_than_ms: int = 0, limit: int = 1_000) -> list[str]:
+    async def purge(
+        self,
+        *,
+        older_than_ms: int = 0,
+        status: TaskStatus | None = None,
+        name: str | None = None,
+        limit: int = 1_000,
+    ) -> list[str]:
         """Delete terminal tasks that completed more than `older_than_ms` ago and
         return their ids. Nothing else removes rows, so a long-lived database
         needs this called periodically. Bounded by `limit` to keep each sweep a
-        short write; call it in a loop until it returns fewer than `limit`."""
-        if older_than_ms < 0:
-            raise ValueError(f"older_than_ms must be >= 0, got {older_than_ms}")
-        if limit < 1:
-            raise ValueError(f"limit must be >= 1, got {limit}")
-        rows = await self._fetch("purge", {"older_than_ms": older_than_ms, "limit": limit})
+        short write; call it in a loop until it returns fewer than `limit`.
+
+        `status` / `name` restrict the sweep to one terminal status or task name.
+        Retention needs are tiered — a succeeded row is spent once its result is
+        consumed, while a failed one is worth keeping for diagnosis — and without
+        them the shortest-lived tier sets the retention for every row."""
+        validate_purge_input(older_than_ms=older_than_ms, status=status, limit=limit)
+        rows = await self._fetch(
+            "purge",
+            {"older_than_ms": older_than_ms, "status": status, "name": name, "limit": limit},
+        )
         return [r["id"] for r in rows]
 
     async def stats(self) -> dict[str, dict[TaskStatus, int]]:

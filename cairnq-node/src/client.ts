@@ -1,17 +1,19 @@
 import type { BackpressureOptions } from "./backpressure.js";
 import { type RetentionOptions, RetentionSweeper } from "./retention.js";
 import { TaskCanceled, TaskFailed } from "./errors.js";
-import { isFailed, isSucceeded, type Task, type TaskStatus } from "./models.js";
+import { isFailed, isSucceeded, type Task, type TaskRef, type TaskStatus } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
 import type { ListInput, PurgeInput, SubmitInput, TaskStore } from "./store/base.js";
 import { type TaskDef, taskName } from "./task.js";
-import { pollWait, pollWaitByKey } from "./wait.js";
+import { DEFAULT_WAIT_TIMEOUT_MS, type PollOptions, pollWait, pollWaitByKey } from "./wait.js";
 
 export type SubmitOptions = Omit<SubmitInput, "name" | "payload">;
-export interface CallOptions extends SubmitOptions {
+/** The wait loop's knobs with the timeout optional (default 30s) — the public
+ * face of PollOptions, whose comments document each knob. */
+export type WaitOptions = Partial<PollOptions>;
+export interface CallOptions extends SubmitOptions, Omit<WaitOptions, "timeoutMs"> {
   waitTimeoutMs?: number;
-  pollMs?: number;
 }
 
 /** Options this handle configures on the store it wraps, rather than the
@@ -99,6 +101,17 @@ export class CairnQ {
     return this._store.getByKey(key);
   }
 
+  /** The status-only probe wait polls on: id + status, no payload. Public for
+   * the same reason it exists — a dashboard or poller that only asks "is it
+   * finished yet" should not drag the payload back per ask. */
+  getStatus(taskId: string): Promise<TaskRef | null> {
+    return this._store.getStatus(taskId);
+  }
+
+  getStatusByKey(key: string): Promise<TaskRef | null> {
+    return this._store.getStatusByKey(key);
+  }
+
   list(input?: ListInput): Promise<Task[]> {
     return this._store.list(input);
   }
@@ -136,13 +149,12 @@ export class CairnQ {
   /** Wait for a task to finish. Resolves with the terminal Task (any status);
    * throws TaskTimeout without stopping the task, so `wait(err.taskId)` picks the
    * same wait back up — from another process, or after a longer deadline. */
-  wait(
-    taskId: string,
-    opts: { timeoutMs?: number; pollMs?: number } = {},
-  ): Promise<Task> {
+  wait(taskId: string, opts: WaitOptions = {}): Promise<Task> {
+    // `??`, not a spread default: a caller forwarding `timeoutMs: undefined`
+    // (call() does) must still get the default, and a spread would override it.
     return pollWait(this._store, taskId, {
-      timeoutMs: opts.timeoutMs ?? 30_000,
-      pollMs: opts.pollMs,
+      ...opts,
+      timeoutMs: opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
     });
   }
 
@@ -151,10 +163,10 @@ export class CairnQ {
    * that held it is gone. Re-resolves the key on each poll, so a `replace`
    * landing mid-wait moves the wait onto the new task, and a key with no task
    * yet is waited for rather than rejected. */
-  waitByKey(key: string, opts: { timeoutMs?: number; pollMs?: number } = {}): Promise<Task> {
+  waitByKey(key: string, opts: WaitOptions = {}): Promise<Task> {
     return pollWaitByKey(this._store, key, {
-      timeoutMs: opts.timeoutMs ?? 30_000,
-      pollMs: opts.pollMs,
+      ...opts,
+      timeoutMs: opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
     });
   }
 
@@ -168,9 +180,9 @@ export class CairnQ {
   async call(name: string, payload?: unknown, opts?: CallOptions): Promise<unknown>;
   async call<P, R>(task: TaskDef<P, R>, payload?: P, opts?: CallOptions): Promise<R>;
   async call(task: string | TaskDef, payload?: unknown, opts: CallOptions = {}): Promise<unknown> {
-    const { waitTimeoutMs = 30_000, pollMs, ...submit } = opts;
+    const { waitTimeoutMs, pollMs, maxPollMs, ...submit } = opts;
     const created = await this.submit(taskName(task), payload, submit);
-    const final = await pollWait(this._store, created.id, { timeoutMs: waitTimeoutMs, pollMs });
+    const final = await this.wait(created.id, { timeoutMs: waitTimeoutMs, pollMs, maxPollMs });
     if (isSucceeded(final)) return final.result;
     if (isFailed(final)) throw new TaskFailed(final.error);
     throw new TaskCanceled(final.id);

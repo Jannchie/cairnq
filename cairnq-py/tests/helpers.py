@@ -22,6 +22,30 @@ async def wait_for(
         await asyncio.sleep(0.01)
 
 
+async def succeed_next(client, result: dict | None = None) -> None:
+    """Claim the next queued task and succeed it, the way a worker elsewhere
+    would."""
+    (claimed,) = await client.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
+    await client.store.succeed(task_id=claimed.id, worker_id="w1", result=result or {})
+
+
+async def finish_one(client, name: str = "job") -> str:
+    """Run a task to `succeeded` — submitted here, finished as if by a worker."""
+    task = await client.submit(name, {})
+    await succeed_next(client)
+    return task.id
+
+
+async def fail_one(client, name: str = "job") -> str:
+    """Run a task to terminal `failed`."""
+    task = await client.submit(name, {})
+    (claimed,) = await client.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
+    await client.store.fail(
+        task_id=claimed.id, worker_id="w1", error={"message": "boom"}, retryable=False
+    )
+    return task.id
+
+
 async def all_terminal(client, ids) -> bool:
     """Whether every id has reached a terminal state. The predicate worker tests
     wait on, so `wait_for(lambda: all_terminal(client, ids))` reads as the thing

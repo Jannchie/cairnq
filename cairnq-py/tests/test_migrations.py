@@ -17,6 +17,7 @@ _EXPECTED_INDEXES = {
     "cairnq_tasks_completed_idx",
     "cairnq_tasks_lease_idx",
     "cairnq_tasks_claim_name_idx",
+    "cairnq_tasks_status_completed_idx",
 }
 
 
@@ -50,7 +51,7 @@ async def test_applies_every_migration_to_a_fresh_database(db_path):
 
     assert applied == {name for name, _ in load_migrations("sqlite")}
     assert _EXPECTED_INDEXES <= _index_names(db_path)
-    assert _meta(db_path, "schema_version") == "6"
+    assert _meta(db_path, "schema_version") == "7"
 
 
 async def test_upgrades_a_database_left_at_an_older_migration(db_path):
@@ -79,7 +80,7 @@ async def test_upgrades_a_database_left_at_an_older_migration(db_path):
     try:
         # The later migrations ran, and the store is usable afterwards.
         assert _EXPECTED_INDEXES <= _index_names(db_path)
-        assert _meta(db_path, "schema_version") == "6"
+        assert _meta(db_path, "schema_version") == "7"
         task = await client.submit("job", {"v": 1})
         assert (await client.get(task.id)).payload == {"v": 1}
     finally:

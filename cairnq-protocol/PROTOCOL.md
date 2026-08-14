@@ -226,10 +226,11 @@ statement snapshots). Pinned by `key_reuse_after_purge`.
 
 ## Operations
 
-Client-side (API role): `submit`, `get`, `get_by_key`, `list`, `stats`,
-`queue_depth`, `cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus
-SDK-orchestrated `wait` / `wait_by_key` / `call` (polling loops over `get` /
-`get_by_key`, not statements of their own). Worker-side: `claim` (and its
+Client-side (API role): `submit`, `get`, `get_by_key`, `get_status`,
+`get_status_by_key`, `list`, `stats`, `queue_depth`, `cancel`, `cancel_by_key`,
+`retry`, `retry_by_key`, `purge`, plus SDK-orchestrated `wait` / `wait_by_key` /
+`call` (polling loops over the statements above, not statements of their own).
+Worker-side: `claim` (and its
 `claim_one_queue` / `claim_one_name` / `claim_one_queue_one_name`
 specializations), `heartbeat`, `heartbeat_batch`, `progress`, `complete`,
 `succeed`, `fail`.
@@ -282,16 +283,32 @@ source and the rest are re-derived when it changes.
 long-lived database grows without bound unless the application calls it on a
 schedule. It deletes **terminal** tasks past a retention cutoff, bounded by a
 `limit` so a large backlog drains in short writes rather than one long one; a
-purged task's `key` pointer goes with it via `ON DELETE CASCADE`.
+purged task's `key` pointer goes with it via `ON DELETE CASCADE`. Optional
+`status` / `name` filters bound a sweep to one terminal status or task name —
+retention needs are tiered (a succeeded row is spent once its result is consumed;
+a failed one is worth keeping for diagnosis), and without them the shortest-lived
+tier would set the retention for every row. Both SDKs build tiered retention on
+this: a per-status cutoff map runs one filtered purge per entry. Migration `0007`
+adds `(status, completed_at_ms)` so a filtered sweep is a bounded range seek
+rather than a scan that visits every retained row just to discard it.
 
-`wait` and `call` are **SDK-orchestrated polling** over `get`: the interval starts
-at 100ms and grows 1.5× to a 500ms ceiling, so a short task stays responsive while
-a long wait doesn't re-read every 100ms for an hour. This is the only non-SQL
-operation, read-only. `call = submit + wait`; on timeout it raises
-`TaskTimeout(task_id=...)` and **the task keeps running**. The error carries the
-last task snapshot the poll observed, and its message says what state the task
-was stuck in (never claimed / queued / still running) — diagnostic text each SDK
-composes for itself, not part of the contract.
+`get_status` / `get_status_by_key` are the **status-only probes** behind the wait
+loop: `id` and `status` alone, because a waiting caller asks nothing but "is it
+finished yet" and re-reading the whole row would drag the payload back — and
+re-parse it — on every poll beat for the life of the wait.
+
+`wait` and `call` are **SDK-orchestrated polling** over those probes: the interval
+starts at 100ms and grows 1.5× to a 500ms ceiling (the caller may move both ends;
+the defaults are the contract), so a short task stays responsive while a long wait
+doesn't re-read every 100ms for an hour. The full row is read only once the probe
+reports a terminal status — and read *again through the probe's own path*
+(`get` / `get_by_key`), so a row purged or a key repointed between the two reads
+means the wait simply continues. This is the only non-SQL operation, read-only.
+`call = submit + wait`; on timeout it raises `TaskTimeout(task_id=...)` and **the
+task keeps running**. The error carries a task snapshot read on the timeout path,
+and its message says what state the task was stuck in (never claimed / queued /
+still running) — diagnostic text each SDK composes for itself, not part of the
+contract.
 
 ## Batch delivery
 
@@ -544,7 +561,7 @@ contract that an existing SDK could get wrong.
 
 Ordinals are **one sequence shared by both dialects**, so a dialect may have no
 file at an ordinal — `0003` is the Postgres-only LISTEN/NOTIFY trigger, and SQLite
-goes 0001, 0002, 0004, 0005, 0006. A migration that closes an ordinal sets
+goes 0001, 0002, 0004, 0005, 0006, 0007. A migration that closes an ordinal sets
 `schema_version` to it in *every* dialect it ships in, so the two never report
 different numbers for the same schema. (`0003` predates this rule and sets nothing, which is why both dialects
 read 2 until 0004 takes them to 4.)

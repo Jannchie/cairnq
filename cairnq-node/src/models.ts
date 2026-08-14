@@ -31,8 +31,28 @@ export interface Task {
   completed_at_ms: number | null;
 }
 
+/** The id + status pair the wait loop polls on (see get_status.sql) — a probe,
+ * not a snapshot: everything else about the task is deliberately not read. */
+export interface TaskRef {
+  id: string;
+  status: TaskStatus;
+}
+
 const JSON_COLUMNS = ["payload", "result", "error", "metadata"] as const;
-export const TERMINAL: TaskStatus[] = ["succeeded", "failed", "canceled"];
+// As a const tuple so TerminalStatus derives from it — the same declare-once
+// pattern as STATUSES/TaskStatus above.
+export const TERMINAL = ["succeeded", "failed", "canceled"] as const;
+export type TerminalStatus = (typeof TERMINAL)[number];
+
+export function isTerminalStatus(status: TaskStatus): status is TerminalStatus {
+  return (TERMINAL as readonly TaskStatus[]).includes(status);
+}
+
+/** Map a probe row (see get_status.sql) to a TaskRef — the ref twin of
+ * rowToTask, so the row shape stays models' knowledge alone. */
+export function rowToRef(row: Record<string, unknown>): TaskRef {
+  return { id: row.id as string, status: row.status as TaskStatus };
+}
 
 export function rowToTask(row: Record<string, unknown>): Task {
   const t: Record<string, unknown> = { ...row };
@@ -46,8 +66,9 @@ export function rowToTask(row: Record<string, unknown>): Task {
   return t as unknown as Task;
 }
 
-export function isTerminal(task: Task): boolean {
-  return TERMINAL.includes(task.status);
+/** Accepts anything carrying a status — a Task or a TaskRef probe. */
+export function isTerminal(task: Pick<Task, "status">): boolean {
+  return isTerminalStatus(task.status);
 }
 
 export function cancelRequested(task: Task): boolean {

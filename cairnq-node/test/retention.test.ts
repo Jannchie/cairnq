@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { CairnQ } from "../src/index.js";
 import { RetentionSweeper } from "../src/retention.js";
-import { freshDbPath, sleep, waitFor } from "./helpers.js";
+import { failOne, finishOne, freshDbPath, sleep, waitFor } from "./helpers.js";
 
 let open: CairnQ[] = [];
 
@@ -21,14 +21,6 @@ function client(opts: Parameters<typeof CairnQ.sqlite>[1] = {}): CairnQ {
   const c = CairnQ.sqlite(freshDbPath(), opts);
   open.push(c);
   return c;
-}
-
-/** Run a task to `succeeded`, so it is eligible for purge. */
-async function finishOne(c: CairnQ, name = "job"): Promise<string> {
-  const task = await c.submit(name, {});
-  const [claimed] = await c.store.claim({ queues: ["default"], workerId: "w1", leaseMs: 5_000 });
-  await c.store.succeed({ taskId: claimed.id, workerId: "w1", result: {} });
-  return task.id;
 }
 
 describe("retention", () => {
@@ -117,5 +109,53 @@ describe("retention", () => {
   it("refuses a cutoff or interval that cannot mean anything", () => {
     expect(() => client({ retention: { olderThanMs: -1 } })).toThrow(/olderThanMs/);
     expect(() => client({ retention: { olderThanMs: 0, intervalMs: 0 } })).toThrow(/intervalMs/);
+  });
+
+  it("keeps each status on its own clock", async () => {
+    // Retention needs are tiered: succeeded rows are spent once consumed, failed
+    // ones are worth keeping for diagnosis. A status the map does not name is
+    // never swept — granularity is an explicit statement of what may go.
+    const c = client({ retention: { olderThanMs: { succeeded: 0 }, intervalMs: 20 } });
+    const done = await finishOne(c);
+    const failed = await failOne(c);
+
+    await waitFor(async () => (await c.get(done)) === null);
+    expect(await c.get(done)).toBeNull();
+    expect((await c.get(failed))?.status).toBe("failed");
+  });
+
+  it("refuses a per-status map that names nothing, or a live status", () => {
+    expect(() => client({ retention: { olderThanMs: {} } })).toThrow(/at least one status/);
+    expect(() =>
+      client({ retention: { olderThanMs: { queued: 0 } as never } }),
+    ).toThrow(/terminal/);
+    expect(() => client({ retention: { olderThanMs: { succeeded: -1 } } })).toThrow(/>= 0/);
+  });
+});
+
+describe("purge filters", () => {
+  it("deletes only rows matching a status filter", async () => {
+    const c = client();
+    const done = await finishOne(c);
+    const failed = await failOne(c);
+    await sleep(10); // purge deletes strictly-older rows; same-ms completion would miss
+
+    expect(await c.purge({ status: "succeeded" })).toEqual([done]);
+    expect((await c.get(failed))?.status).toBe("failed");
+  });
+
+  it("deletes only rows matching a name filter", async () => {
+    const c = client();
+    const alpha = await finishOne(c, "alpha");
+    const beta = await finishOne(c, "beta");
+    await sleep(10); // purge deletes strictly-older rows; same-ms completion would miss
+
+    expect(await c.purge({ name: "alpha" })).toEqual([alpha]);
+    expect((await c.get(beta))?.status).toBe("succeeded");
+  });
+
+  it("refuses a status filter that could never match", async () => {
+    const c = client();
+    await expect(c.purge({ status: "queued" })).rejects.toThrow(/terminal/);
   });
 });

@@ -14,13 +14,8 @@ import pytest
 
 from cairnq import CairnQ, Retention, RetentionSweeper
 
-
-async def _finish_one(client: CairnQ) -> str:
-    """Run a task to `succeeded`, so it is eligible for purge."""
-    task = await client.submit("job", {})
-    (claimed,) = await client.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
-    await client.store.succeed(task_id=claimed.id, worker_id="w1", result={})
-    return task.id
+from .helpers import fail_one as _fail_one
+from .helpers import finish_one as _finish_one
 
 
 async def _wait_for(cond, timeout_s: float = 3.0) -> None:
@@ -141,3 +136,50 @@ def test_refuses_a_cutoff_or_interval_that_cannot_mean_anything():
         Retention(older_than_ms=0, interval_ms=0)
     with pytest.raises(ValueError, match="limit"):
         Retention(older_than_ms=0, limit=0)
+
+
+async def test_keeps_each_status_on_its_own_clock(db_path):
+    # Retention needs are tiered: succeeded rows are spent once consumed, failed
+    # ones are worth keeping for diagnosis. A status the mapping does not name is
+    # never swept — granularity is an explicit statement of what may go.
+    async with CairnQ.sqlite(
+        db_path, retention=Retention(older_than_ms={"succeeded": 0}, interval_ms=20)
+    ) as client:
+        done = await _finish_one(client)
+        failed = await _fail_one(client)
+
+        await _wait_for(lambda: _is_gone(client, done))
+        assert await client.get(done) is None
+        assert (await client.get(failed)).status == "failed"
+
+
+def test_refuses_a_per_status_mapping_that_names_nothing_or_a_live_status():
+    with pytest.raises(ValueError, match="at least one status"):
+        Retention(older_than_ms={})
+    with pytest.raises(ValueError, match="terminal"):
+        Retention(older_than_ms={"queued": 0})
+    with pytest.raises(ValueError, match=">= 0"):
+        Retention(older_than_ms={"succeeded": -1})
+
+
+async def test_purge_deletes_only_rows_matching_a_status_filter(client):
+    done = await _finish_one(client)
+    failed = await _fail_one(client)
+    await asyncio.sleep(0.01)  # purge deletes strictly-older rows; same-ms would miss
+
+    assert await client.purge(status="succeeded") == [done]
+    assert (await client.get(failed)).status == "failed"
+
+
+async def test_purge_deletes_only_rows_matching_a_name_filter(client):
+    alpha = await _finish_one(client, "alpha")
+    beta = await _finish_one(client, "beta")
+    await asyncio.sleep(0.01)  # purge deletes strictly-older rows; same-ms would miss
+
+    assert await client.purge(name="alpha") == [alpha]
+    assert (await client.get(beta)).status == "succeeded"
+
+
+async def test_purge_refuses_a_status_filter_that_could_never_match(client):
+    with pytest.raises(ValueError, match="terminal"):
+        await client.purge(status="queued")
