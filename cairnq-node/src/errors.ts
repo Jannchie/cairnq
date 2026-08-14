@@ -77,8 +77,12 @@ export class QueueFull extends CairnQError {
  * observed. No worker running, no handler for the name, wrong queue, and two
  * processes on different database files all look identical from the API side —
  * queued, never claimed — so that case names the likely causes. */
-function timeoutDetail(task: Task | null): string {
-  if (!task) return "task not found — wrong database file, or already purged?";
+function timeoutDetail(task: Task | null, key: string | null): string {
+  if (!task) {
+    return key === null
+      ? "task not found — wrong database file, or already purged?"
+      : "no task under this key — never submitted, or already purged?";
+  }
   if (isQueued(task)) {
     const delayMs = task.run_at_ms - nowMs();
     if (task.attempt === 0 && delayMs <= 0) {
@@ -94,23 +98,33 @@ function timeoutDetail(task: Task | null): string {
   return `still running (attempt ${task.attempt}/${task.max_attempts})`;
 }
 
-/** wait/call did not reach a terminal status in time. The task keeps running.
- * `task` is the last snapshot wait() observed (null if get() found nothing), and
- * the message says what state it was stuck in — a queued-never-claimed task is
- * the classic first-run failure (no worker, no handler, wrong queue or file). */
+/** wait/call did not reach a terminal status in time. The task keeps running, so
+ * `taskId` is the handle for picking the wait back up — `wait(err.taskId)`
+ * re-attaches to the same task from anywhere that can reach the store. `task` is
+ * the last snapshot wait() observed (null if the lookup found nothing), and the
+ * message says what state it was stuck in — a queued-never-claimed task is the
+ * classic first-run failure (no worker, no handler, wrong queue or file).
+ *
+ * `key` is set when the wait watched a key rather than an id; `taskId` is then
+ * the task the key pointed at, or the key itself when it pointed at nothing —
+ * there was no id to report. */
 export class TaskTimeout extends CairnQError {
   readonly task: Task | null;
+  readonly key: string | null;
   constructor(
     public taskId: string,
-    opts: { timeoutMs?: number; task?: Task | null } = {},
+    opts: { timeoutMs?: number; task?: Task | null; key?: string | null } = {},
   ) {
+    const key = opts.key ?? null;
+    const subject = key === null ? `task ${taskId}` : `key ${key}`;
     super(
       opts.timeoutMs == null
-        ? `task ${taskId} did not finish in time`
-        : `task ${taskId} did not finish within ${opts.timeoutMs}ms: ${timeoutDetail(opts.task ?? null)}`,
+        ? `${subject} did not finish in time`
+        : `${subject} did not finish within ${opts.timeoutMs}ms: ${timeoutDetail(opts.task ?? null, key)}`,
     );
     this.name = "TaskTimeout";
     this.task = opts.task ?? null;
+    this.key = key;
   }
 }
 

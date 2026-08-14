@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._wait import DEFAULT_POLL_MS, poll_wait
+from ._wait import DEFAULT_POLL_MS, poll_wait, poll_wait_by_key
 from .backpressure import (
     DEFAULT_MAX_WAIT_MS,
     INITIAL_PROBE_INTERVAL_MS,
@@ -159,7 +159,21 @@ class CairnQ:
     async def wait(
         self, task_id: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS
     ) -> Task:
+        """Wait for a task to finish. Returns the terminal Task (any status);
+        raises TaskTimeout without stopping the task, so `wait(err.task_id)` picks
+        the same wait back up — from another process, or after a longer
+        deadline."""
         return await poll_wait(self._store, task_id, timeout_ms=timeout_ms, poll_ms=poll_ms)
+
+    async def wait_by_key(
+        self, key: str, *, timeout_ms: int = 30_000, poll_ms: int = DEFAULT_POLL_MS
+    ) -> Task:
+        """Wait for whatever task the `key` currently points at — the
+        cross-process form of picking a wait back up, when the id was never in
+        hand or the process that held it is gone. Re-resolves the key on each
+        poll, so a `replace` landing mid-wait moves the wait onto the new task,
+        and a key with no task yet is waited for rather than rejected."""
+        return await poll_wait_by_key(self._store, key, timeout_ms=timeout_ms, poll_ms=poll_ms)
 
     async def call(
         self,
@@ -171,8 +185,12 @@ class CairnQ:
         **submit_kwargs: Any,
     ) -> Any:
         """submit + wait. Returns the result on success; raises TaskFailed /
-        TaskCanceled / TaskTimeout otherwise. On timeout the task keeps running.
-        Accepts a name string or a TaskDef (its name is used)."""
+        TaskCanceled / TaskTimeout otherwise. Accepts a name string or a TaskDef
+        (its name is used).
+
+        `wait_timeout_ms` bounds the wait, not the task: on timeout the task runs
+        on, and `wait(err.task_id)` — or `wait_by_key`, from a process that only
+        has the key — resumes the wait rather than starting the work over."""
         task = await self.submit(name, payload, **submit_kwargs)
         final = await self.wait(task.id, timeout_ms=wait_timeout_ms, poll_ms=poll_ms)
         if final.succeeded:

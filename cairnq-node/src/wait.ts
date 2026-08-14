@@ -7,6 +7,14 @@ export const DEFAULT_POLL_MS = 100;
 export const MAX_POLL_MS = 500;
 const GROWTH = 1.5;
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export interface PollOptions {
+  timeoutMs: number;
+  pollMs?: number;
+  maxPollMs?: number;
+}
+
 /**
  * Grow the polling interval towards the ceiling.
  *
@@ -19,28 +27,64 @@ export function nextPollMs(current: number, maxMs: number): number {
   return Math.min(maxMs, Math.max(current + 1, Math.floor(current * GROWTH)));
 }
 
-/** Poll get() until terminal or timeout. Returns the terminal Task (any status).
- * Throws TaskTimeout, leaving the task running. `pollMs` is the *first* interval;
- * it backs off towards `maxPollMs`. */
-export async function pollWait(
-  store: TaskStore,
-  taskId: string,
-  {
-    timeoutMs,
-    pollMs = DEFAULT_POLL_MS,
-    maxPollMs = MAX_POLL_MS,
-  }: { timeoutMs: number; pollMs?: number; maxPollMs?: number },
+/**
+ * Poll `read` until it yields a terminal task, or the timeout elapses.
+ *
+ * `wake` is what the loop sleeps on between reads: a store with a push channel
+ * (Postgres) cuts it short when the task goes terminal, but the re-read is the
+ * source of truth either way, so a plain sleep is always a correct answer.
+ */
+async function poll(
+  read: () => Promise<Task | null>,
+  wake: (task: Task | null, ms: number) => Promise<void>,
+  subject: string,
+  key: string | null,
+  { timeoutMs, pollMs = DEFAULT_POLL_MS, maxPollMs = MAX_POLL_MS }: PollOptions,
 ): Promise<Task> {
   const deadline = nowMs() + timeoutMs;
   let interval = pollMs;
   for (;;) {
-    const task = await store.get(taskId);
+    const task = await read();
     if (task && isTerminal(task)) return task;
     const remaining = deadline - nowMs();
-    if (remaining <= 0) throw new TaskTimeout(taskId, { timeoutMs, task });
-    // A store with a push channel (Postgres) cuts the sleep short when the task
-    // goes terminal; the re-get above stays the source of truth either way.
-    await store.taskDoneWake(taskId, Math.min(interval, remaining));
+    if (remaining <= 0) throw new TaskTimeout(task?.id ?? subject, { timeoutMs, task, key });
+    await wake(task, Math.min(interval, remaining));
     interval = nextPollMs(interval, maxPollMs);
   }
+}
+
+/** Poll get() until terminal or timeout. Returns the terminal Task (any status).
+ * Throws TaskTimeout, leaving the task running. `pollMs` is the *first* interval;
+ * it backs off towards `maxPollMs`. */
+export function pollWait(store: TaskStore, taskId: string, opts: PollOptions): Promise<Task> {
+  return poll(
+    () => store.get(taskId),
+    (_task, ms) => store.taskDoneWake(taskId, ms),
+    taskId,
+    null,
+    opts,
+  );
+}
+
+/**
+ * The same wait, following a key instead of an id.
+ *
+ * The key is re-resolved on every read, because that is what a key means: a
+ * pointer to the task that is *current* under it. A `replace` landing mid-wait
+ * moves the wait onto the new task rather than reporting the cancellation of the
+ * old one, and a key that points at nothing yet is simply not finished — it
+ * polls until something appears, the same way waiting on an id that does not
+ * exist yet does.
+ *
+ * There is nothing to subscribe to before the key resolves, so those naps are
+ * plain sleeps; once it resolves, the store's push channel applies as usual.
+ */
+export function pollWaitByKey(store: TaskStore, key: string, opts: PollOptions): Promise<Task> {
+  return poll(
+    () => store.getByKey(key),
+    (task, ms) => (task ? store.taskDoneWake(task.id, ms) : sleep(ms)),
+    key,
+    key,
+    opts,
+  );
 }

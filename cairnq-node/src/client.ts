@@ -5,7 +5,7 @@ import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
 import type { ListInput, PurgeInput, SubmitInput, TaskStore } from "./store/base.js";
 import { type TaskDef, taskName } from "./task.js";
-import { pollWait } from "./wait.js";
+import { pollWait, pollWaitByKey } from "./wait.js";
 
 export type SubmitOptions = Omit<SubmitInput, "name" | "payload">;
 export interface CallOptions extends SubmitOptions {
@@ -114,6 +114,9 @@ export class CairnQ {
     return this._store.stats();
   }
 
+  /** Wait for a task to finish. Resolves with the terminal Task (any status);
+   * throws TaskTimeout without stopping the task, so `wait(err.taskId)` picks the
+   * same wait back up — from another process, or after a longer deadline. */
   wait(
     taskId: string,
     opts: { timeoutMs?: number; pollMs?: number } = {},
@@ -124,9 +127,25 @@ export class CairnQ {
     });
   }
 
+  /** Wait for whatever task the `key` currently points at — the cross-process
+   * form of picking a wait back up, when the id was never in hand or the process
+   * that held it is gone. Re-resolves the key on each poll, so a `replace`
+   * landing mid-wait moves the wait onto the new task, and a key with no task
+   * yet is waited for rather than rejected. */
+  waitByKey(key: string, opts: { timeoutMs?: number; pollMs?: number } = {}): Promise<Task> {
+    return pollWaitByKey(this._store, key, {
+      timeoutMs: opts.timeoutMs ?? 30_000,
+      pollMs: opts.pollMs,
+    });
+  }
+
   /** submit + wait. Resolves with the result on success; rejects with
    * TaskFailed / TaskCanceled / TaskTimeout otherwise. Pass a TaskDef and the
-   * resolved value is typed as its Result. */
+   * resolved value is typed as its Result.
+   *
+   * `waitTimeoutMs` bounds the wait, not the task: on timeout the task runs on,
+   * and `wait(err.taskId)` — or `waitByKey`, from a process that only has the
+   * key — resumes the wait rather than starting the work over. */
   async call(name: string, payload?: unknown, opts?: CallOptions): Promise<unknown>;
   async call<P, R>(task: TaskDef<P, R>, payload?: P, opts?: CallOptions): Promise<R>;
   async call(task: string | TaskDef, payload?: unknown, opts: CallOptions = {}): Promise<unknown> {

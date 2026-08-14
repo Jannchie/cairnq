@@ -71,12 +71,14 @@ class QueueFull(CairnQError):
         )
 
 
-def _timeout_detail(task: Task | None) -> str:
+def _timeout_detail(task: Task | None, key: str | None) -> str:
     """One line of "why hasn't this finished" from the last snapshot wait()
     observed. No worker running, no handler for the name, wrong queue, and two
     processes on different database files all look identical from the API side —
     queued, never claimed — so that case names the likely causes."""
     if task is None:
+        if key is not None:
+            return "no task under this key — never submitted, or already purged?"
         return "task not found — wrong database file, or already purged?"
     if task.queued:
         delay_ms = task.run_at_ms - now_ms()
@@ -94,18 +96,33 @@ def _timeout_detail(task: Task | None) -> str:
 
 class TaskTimeout(CairnQError):
     """wait/call did not reach a terminal status within the timeout. The task
-    keeps running; `task_id` lets the caller follow up. `task` is the last
-    snapshot wait() observed (None if get() found nothing), and the message says
-    what state it was stuck in — a queued-never-claimed task is the classic
-    first-run failure (no worker, no handler, wrong queue or file)."""
+    keeps running, so `task_id` is the handle for picking the wait back up —
+    `wait(err.task_id)` re-attaches to the same task from anywhere that can reach
+    the store. `task` is the last snapshot wait() observed (None if the lookup
+    found nothing), and the message says what state it was stuck in — a
+    queued-never-claimed task is the classic first-run failure (no worker, no
+    handler, wrong queue or file).
 
-    def __init__(self, task_id: str, *, timeout_ms: int | None = None, task: Task | None = None):
+    `key` is set when the wait watched a key rather than an id; `task_id` is then
+    the task the key pointed at, or the key itself when it pointed at nothing —
+    there was no id to report."""
+
+    def __init__(
+        self,
+        task_id: str,
+        *,
+        timeout_ms: int | None = None,
+        task: Task | None = None,
+        key: str | None = None,
+    ):
         self.task_id = task_id
         self.task = task
+        self.key = key
+        subject = f"task {task_id}" if key is None else f"key {key}"
         message = (
-            f"task {task_id} did not finish in time"
+            f"{subject} did not finish in time"
             if timeout_ms is None
-            else f"task {task_id} did not finish within {timeout_ms}ms: {_timeout_detail(task)}"
+            else f"{subject} did not finish within {timeout_ms}ms: {_timeout_detail(task, key)}"
         )
         super().__init__(message)
 

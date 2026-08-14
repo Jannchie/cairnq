@@ -228,7 +228,8 @@ statement snapshots). Pinned by `key_reuse_after_purge`.
 
 Client-side (API role): `submit`, `get`, `get_by_key`, `list`, `stats`,
 `queue_depth`, `cancel`, `cancel_by_key`, `retry`, `retry_by_key`, `purge`, plus
-SDK-orchestrated `wait` / `call`. Worker-side: `claim` (and its
+SDK-orchestrated `wait` / `wait_by_key` / `call` (polling loops over `get` /
+`get_by_key`, not statements of their own). Worker-side: `claim` (and its
 `claim_one_queue` / `claim_one_name` / `claim_one_queue_one_name`
 specializations), `heartbeat`, `heartbeat_batch`, `progress`, `complete`,
 `succeed`, `fail`.
