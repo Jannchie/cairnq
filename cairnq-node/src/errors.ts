@@ -170,10 +170,12 @@ export class TaskCanceled extends CairnQError {
  * anywhere. Nothing inside the blocked handler can observe that, which is why it
  * is reported through `onError` alongside the other things the run loop survived.
  *
- * The cause is always synchronous work in a handler: a tight loop, a large
+ * The usual cause is synchronous work in a handler: a tight loop, a large
  * JSON.parse, a `*Sync` filesystem or crypto call. Node has one loop and no way
  * to preempt it — move the work to a worker thread, a child process, or an async
- * API that yields.
+ * API that yields. The other cause is a worker simply oversubscribed for its
+ * `leaseMs` — nothing is blocking, there is just more work than turns — which the
+ * same report covers, because the lease is at equal risk either way.
  */
 export class EventLoopBlocked extends CairnQError {
   constructor(
@@ -183,8 +185,9 @@ export class EventLoopBlocked extends CairnQError {
   ) {
     super(
       `heartbeat beat was ${lateMs}ms late (interval ${intervalMs}ms, lease ${leaseMs}ms): ` +
-        `the event loop was blocked long enough to miss a beat. Synchronous work in a ` +
-        `handler starves lease renewal — move it off the loop.`,
+        `the event loop was blocked long enough to miss a beat, so this worker's leases ` +
+        `are at risk. Usually synchronous work in a handler (move it off the loop); ` +
+        `otherwise the worker is oversubscribed for its leaseMs.`,
     );
     this.name = "EventLoopBlocked";
   }

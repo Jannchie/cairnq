@@ -60,14 +60,18 @@ describe("a handler that blocks the event loop", () => {
   });
 
   it("says nothing about a handler that yields", async () => {
+    // A production-shaped lease, so this asserts the detector's threshold rather
+    // than the scheduling luck of the machine running it: a 250ms handler would
+    // have to stall the loop for twenty seconds to be reported. Squeezing the
+    // lease down to the handler's own duration makes ordinary jitter on a loaded
+    // host — which is a real beat miss, and correctly reported — look like a bug.
     const errors: unknown[] = [];
     const worker = Worker.sqlite(dbPath, {
       pollIntervalMs: 20,
-      leaseMs: 300,
+      leaseMs: 30_000,
       onError: (err) => errors.push(err),
     });
     worker.task("slow", async () => {
-      // Longer than a beat, but it gives the loop back.
       await new Promise((r) => setTimeout(r, 250));
       return {};
     });

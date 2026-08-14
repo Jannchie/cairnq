@@ -140,7 +140,10 @@ class EventLoopBlocked(CairnQError):
 
     A *sync* handler is dispatched to a thread and cannot cause this, so the usual
     culprit is blocking work inside an async one: a synchronous HTTP client, a GPU
-    forward, a large hash. Move it to `asyncio.to_thread`.
+    forward, a large hash. Move it to `asyncio.to_thread`. The other cause is a
+    worker simply oversubscribed for its `lease_ms` — nothing is blocking, there
+    is just more work than turns — which the same report covers, because the lease
+    is at equal risk either way.
     """
 
     def __init__(self, late_ms: int, interval_ms: int, lease_ms: int):
@@ -149,9 +152,10 @@ class EventLoopBlocked(CairnQError):
         self.lease_ms = lease_ms
         super().__init__(
             f"heartbeat beat was {late_ms}ms late (interval {interval_ms}ms, lease "
-            f"{lease_ms}ms): the event loop was blocked long enough to miss a beat. "
-            "Blocking work inside an async handler starves lease renewal — run it "
-            "with asyncio.to_thread."
+            f"{lease_ms}ms): the event loop was blocked long enough to miss a beat, "
+            "so this worker's leases are at risk. Usually blocking work inside an "
+            "async handler (run it with asyncio.to_thread); otherwise the worker is "
+            "oversubscribed for its lease_ms."
         )
 
 

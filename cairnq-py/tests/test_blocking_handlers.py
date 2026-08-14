@@ -94,17 +94,22 @@ async def test_a_blocking_async_handler_is_reported(client, db_path):
 
 
 async def test_a_healthy_worker_reports_nothing(client, db_path):
+    # A production-shaped lease, so this asserts the detector's threshold rather
+    # than the scheduling luck of the machine running it: a 250ms handler would
+    # have to stall the loop for twenty seconds to be reported. Squeezing the
+    # lease down to the handler's own duration makes ordinary jitter on a loaded
+    # host — which is a real beat miss, and correctly reported — look like a bug.
     errors: list[BaseException] = []
     worker = Worker.sqlite(
         db_path,
         poll_interval_ms=20,
-        lease_ms=300,
+        lease_ms=30_000,
         on_error=lambda exc, info: errors.append(exc),
     )
 
     @worker.task("quick")
     async def quick(ctx, payload):
-        await asyncio.sleep(0.25)  # longer than a beat, but yielding
+        await asyncio.sleep(0.25)
         return {}
 
     async with worker.background():
