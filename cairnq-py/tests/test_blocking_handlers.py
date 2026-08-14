@@ -20,13 +20,15 @@ from .helpers import wait_for
 
 
 async def test_a_sync_handler_does_not_starve_the_heartbeat(client, db_path):
-    # The lease is short enough that a blocked loop loses it: at lease/3 the
-    # handler below would miss four beats.
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, lease_ms=200)
+    # The handler outlasts its lease, so running it on the loop loses that lease
+    # — which is the regression. The margin between the two is deliberately wide:
+    # squeezed to a 200ms lease this asserted that a shared CI runner never drops
+    # three consecutive 66ms beats, which is not what it is here to prove.
+    worker = Worker.sqlite(db_path, poll_interval_ms=20, lease_ms=600)
 
     @worker.task("slow")
     def slow(ctx, payload):
-        time.sleep(0.5)  # a sync handler, the way real blocking work arrives
+        time.sleep(1.5)  # a sync handler, the way real blocking work arrives
         return {"ok": True}
 
     async with worker.background():
