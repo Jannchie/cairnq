@@ -183,9 +183,18 @@ A worker **leases** a task rather than popping it:
 `key` is a business-stable pointer to the *current* task; `task_id` is one
 execution. On `submit` with a `key`, inside one transaction:
 
-- `reuse` — key exists → return the existing task.
-- `reject` — key exists → raise `AlreadyExists`.
-- `replace` — cancel the existing task, insert a new one, repoint the key.
+- `reuse` — the recorded task is still `queued`/`running` → return it. Terminal →
+  insert a new task and repoint the key.
+- `reuse-succeeded` — as `reuse`, and a `succeeded` task is returned too (result
+  and all). `failed`/`canceled` → insert a new task and repoint the key.
+- `reject` — key exists → raise `AlreadyExists`, whatever the task's state.
+- `replace` — cancel the existing task if it is still live, insert a new one,
+  repoint the key.
+
+**A strategy that declines the recorded task repoints the key**, and the write
+that follows is identical for all three: insert, `upsert_key`. Only a *live*
+task is cancelled on the way — a terminal one has nothing to stop, and
+re-cancelling it would rewrite a settled row.
 
 **Every keyed operation (submit-with-key and the `*_by_key` ops) takes
 `lock_key` as the first statement of its transaction.** The transaction alone
@@ -203,10 +212,17 @@ task inside the keyed transaction, treating a vanished task as "key free"
 (on Postgres a concurrent purge can remove it between the transaction's
 statement snapshots). Pinned by `key_reuse_after_purge`.
 
-> **`reuse` returns the recorded task whatever its state** — including a terminal
-> `succeeded`/`failed`/`canceled` one. It is idempotent submit, not "re-run if the
-> last attempt failed". To force a new run, use `replace` (new task, repoints key)
-> or `retry` (re-enqueue the same task).
+> **Reusing a terminal task is opt-in.** A key that matched a `failed` task and
+> handed it back would be permanently poisoned: every later submit under that key
+> replays the same failure, and nothing but `purge` ever clears it. So `reuse`
+> deduplicates work that is *in flight* — the double-submit, the retried
+> request — and a finished task means the key is free. Reusing a `succeeded`
+> result is a cache, correct only when the key encodes the whole input, so it is
+> spelled out: `reuse-succeeded`. No strategy ever hands back a `failed` or
+> `canceled` task; `retry` / `retry_by_key` re-enqueue that same task when the
+> caller means to.
+>
+> Pinned by `key_reuse_terminal`, `key_reuse_succeeded` and `key_reuse_failed`.
 
 ## Operations
 

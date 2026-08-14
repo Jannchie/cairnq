@@ -6,7 +6,7 @@ import {
   ProtocolVersionMismatch,
   SerializationError,
 } from "../errors.js";
-import { rowToTask, STATUSES, type Task, type TaskStatus } from "../models.js";
+import { rowToTask, STATUSES, TERMINAL, type Task, type TaskStatus } from "../models.js";
 import { type BackpressureOptions, QueueDepthGate } from "../backpressure.js";
 
 const rejectMangled = function (this: unknown, _key: string, v: unknown): unknown {
@@ -62,8 +62,24 @@ export function checkProtocolVersion(version: number): void {
 // CONFLICTS is the canonical declaration; the type derives from it so the
 // runtime guard in submit() and the type can't drift apart (same pattern as
 // STATUSES/TaskStatus in models.ts).
-const CONFLICTS = ["reuse", "reject", "replace"] as const;
+const CONFLICTS = ["reuse", "reuse-succeeded", "reject", "replace"] as const;
 export type Conflict = (typeof CONFLICTS)[number];
+
+/**
+ * Whether a keyed submit's strategy accepts the task the key already points at.
+ *
+ * Both reuse strategies deduplicate work that is still in play — that is what a
+ * key is for, and the answer cannot depend on the outcome of a task that has no
+ * outcome yet. They differ only on what a *finished* task means: `reuse` treats
+ * the key as free again, while `reuse-succeeded` reads a succeeded task as a
+ * cached result. Neither ever hands back a failed or canceled one, which would
+ * poison the key for every later submit (see PROTOCOL.md "Key conflict").
+ */
+function reusable(conflict: Conflict, status: TaskStatus): boolean {
+  if (conflict === "replace") return false;
+  if (!TERMINAL.includes(status)) return true;
+  return conflict === "reuse-succeeded" && status === "succeeded";
+}
 
 /** The queue a submit lands on when it names none. Owned here, where the
  * default is applied, so nothing above has to re-derive it. */
@@ -283,10 +299,15 @@ export abstract class TaskStore {
         // free after all, whatever the strategy.
         const current = (await fetch("get", { id: existing[0].task_id }))[0];
         if (current) {
-          if (conflict === "reuse") return rowToTask(current);
           if (conflict === "reject") throw new AlreadyExists(key);
-          // "replace": cancel the recorded task, then repoint the key below.
-          await fetch("cancel", { id: existing[0].task_id });
+          if (reusable(conflict, current.status as TaskStatus)) return rowToTask(current);
+          // The strategy declined the recorded task, so the key repoints to the
+          // fresh one inserted below. Cancel only what is still live: a terminal
+          // task has nothing to stop, and cancelling it would rewrite a settled
+          // row (and hand a `canceled` back to whoever is waiting on it).
+          if (!TERMINAL.includes(current.status as TaskStatus)) {
+            await fetch("cancel", { id: existing[0].task_id });
+          }
         }
       }
       const row = (await fetch("insert_task", ins))[0];

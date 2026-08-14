@@ -110,6 +110,25 @@ async def test_concurrent_same_key_submits_stay_idempotent(pg_client):
     assert len(live) == 1
 
 
+async def test_concurrent_same_key_submits_after_a_finished_task(pg_client):
+    # The same race one step later, and the one that actually costs money: the key
+    # points at a terminal task, so every racer wants to start a fresh one. The
+    # advisory lock has to serialize them into one insert plus seven reuses of it
+    # — otherwise the second submit cancels the first's brand-new task and the
+    # work runs twice against a caller who gets `canceled` back.
+    first = await pg_client.submit("job", {}, key="T")
+    await pg_client.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
+    await pg_client.store.succeed(task_id=first.id, worker_id="w1", result={"n": 1})
+
+    results = await asyncio.gather(
+        *(pg_client.submit("job", {}, key="T", conflict="reuse") for _ in range(8))
+    )
+    ids = {t.id for t in results}
+    assert len(ids) == 1
+    assert first.id not in ids
+    assert all(t.status == "queued" for t in results)
+
+
 async def test_ownership_rejects_non_owner(pg_client):
     store = pg_client.store
     t = await pg_client.submit("job", {})

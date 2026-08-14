@@ -1,0 +1,20 @@
+{
+  "name": "key_reuse_failed",
+  "description": "No strategy hands back a failed task — a key that replayed a failure forever would be poisoned until purge. Both reuse and reuse-succeeded insert a new task and repoint the key.",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "A", "conflict": "reuse", "max_attempts": 1 }, "save": "t1" },
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$t1.id", "worker_id": "w1", "error": { "type": "E", "code": "e", "message": "boom", "retryable": true }, "retryable": true, "delay_ms": 0 }, "expect": { "equals": { "status": "failed" } } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "A", "conflict": "reuse", "max_attempts": 1 }, "save": "t2", "expect": { "equals": { "status": "queued" } } },
+    { "op": "expect", "target": "$t2.id", "notEqualsRef": "$t1.id" },
+
+    { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$t2.id", "worker_id": "w1", "error": { "type": "E", "code": "e", "message": "boom", "retryable": true }, "retryable": true, "delay_ms": 0 }, "expect": { "equals": { "status": "failed" } } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "A", "conflict": "reuse-succeeded" }, "save": "t3", "expect": { "equals": { "status": "queued" } } },
+    { "op": "expect", "target": "$t3.id", "notEqualsRef": "$t2.id" },
+    { "op": "get_by_key", "args": { "key": "A" }, "save": "cur" },
+    { "op": "expect", "target": "$cur.id", "equalsRef": "$t3.id" }
+  ]
+}

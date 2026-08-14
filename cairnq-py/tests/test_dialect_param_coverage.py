@@ -37,10 +37,11 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     await store.connect()
     worker = "w1"
 
-    # Client side, including all three key-conflict branches.
+    # Client side, including every key-conflict branch.
     task = await store.submit(name="job", payload={"v": 1}, run_at_delay_ms=0)
     await store.submit(name="job", payload={}, key="k", conflict="reuse")
     await store.submit(name="job", payload={}, key="k", conflict="reuse")
+    await store.submit(name="job", payload={}, key="k", conflict="reuse-succeeded")
     await store.submit(name="job", payload={}, key="k", conflict="replace")
     await store.get(task.id)
     await store.get_by_key("k")

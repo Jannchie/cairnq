@@ -112,6 +112,25 @@ suite("postgres live", () => {
     expect(live.length).toBe(1);
   });
 
+  it("keeps reuse idempotent when the key's last task already finished", async () => {
+    // The same race one step later, and the one that actually costs money: the
+    // key points at a terminal task, so every racer wants to start a fresh one.
+    // The advisory lock has to serialize them into one insert plus seven reuses
+    // of it — otherwise the second submit cancels the first's brand-new task and
+    // the work runs twice against a caller who gets `canceled` back.
+    const first = await client.submit("job", {}, { key: "T" });
+    await client.store.claim({ queues: ["default"], workerId: "w1", leaseMs: 5_000 });
+    await client.store.succeed({ taskId: first.id, workerId: "w1", result: { n: 1 } });
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => client.submit("job", {}, { key: "T", conflict: "reuse" })),
+    );
+    const ids = new Set(results.map((t) => t.id));
+    expect(ids.size).toBe(1);
+    expect(ids.has(first.id)).toBe(false);
+    expect(results.every((t) => t.status === "queued")).toBe(true);
+  });
+
   it("rejects a non-owner worker write with LostLease", async () => {
     const t = await client.submit("job", {});
     await client.store.claim({ queues: ["default"], workerId: "owner", leaseMs: 5000 });

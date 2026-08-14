@@ -36,7 +36,7 @@ from ..errors import (
     SerializationError,
     error_envelope,
 )
-from ..models import STATUSES, Task, TaskStatus
+from ..models import STATUSES, TERMINAL, Task, TaskStatus
 
 # Runs one named protocol statement and returns its rows.
 Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
@@ -44,8 +44,26 @@ Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
 # Conflict is the canonical declaration; CONFLICTS derives from it (via
 # get_args) so the runtime guard in submit() and the type can't drift apart
 # (same pattern as TaskStatus/STATUSES in models.py).
-Conflict = Literal["reuse", "reject", "replace"]
+Conflict = Literal["reuse", "reuse-succeeded", "reject", "replace"]
 CONFLICTS: tuple[Conflict, ...] = get_args(Conflict)
+
+
+def _reusable(conflict: Conflict, status: TaskStatus) -> bool:
+    """Whether a keyed submit's strategy accepts the task the key already points
+    at.
+
+    Both reuse strategies deduplicate work that is still in play — that is what a
+    key is for, and the answer cannot depend on the outcome of a task that has no
+    outcome yet. They differ only on what a *finished* task means: `reuse` treats
+    the key as free again, while `reuse-succeeded` reads a succeeded task as a
+    cached result. Neither ever hands back a failed or canceled one, which would
+    poison the key for every later submit (see PROTOCOL.md "Key conflict").
+    """
+    if conflict == "replace":
+        return False
+    if status not in TERMINAL:
+        return True
+    return conflict == "reuse-succeeded" and status == "succeeded"
 
 SUPPORTED_PROTOCOL_MAJOR = 1
 
@@ -256,12 +274,17 @@ class TaskStore(ABC):
                 # task means the key is free after all, whatever the strategy.
                 rows = await fetch("get", {"id": existing[0]["task_id"]})
                 if rows:
-                    if conflict == "reuse":
-                        return Task.from_row(rows[0])
                     if conflict == "reject":
                         raise AlreadyExists(key)
-                    # "replace": cancel the recorded task, then repoint the key.
-                    await fetch("cancel", {"id": existing[0]["task_id"]})
+                    if _reusable(conflict, rows[0]["status"]):
+                        return Task.from_row(rows[0])
+                    # The strategy declined the recorded task, so the key repoints
+                    # to the fresh one inserted below. Cancel only what is still
+                    # live: a terminal task has nothing to stop, and cancelling it
+                    # would rewrite a settled row (and hand a `canceled` back to
+                    # whoever is waiting on it).
+                    if rows[0]["status"] not in TERMINAL:
+                        await fetch("cancel", {"id": existing[0]["task_id"]})
             rows = await fetch("insert_task", ins)
             await fetch("upsert_key", {"key": key, "task_id": task_id})
             return Task.from_row(rows[0])

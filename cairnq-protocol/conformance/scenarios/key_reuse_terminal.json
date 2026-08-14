@@ -1,12 +1,15 @@
 {
   "name": "key_reuse_terminal",
-  "description": "reuse returns the recorded task in WHATEVER state — including a terminal one. It is idempotent submit, not re-run-if-finished.",
+  "description": "reuse deduplicates work that is IN FLIGHT. A terminal task means the key is free again: the submit inserts a new task and repoints the key, and the old task is left settled (not re-cancelled).",
   "steps": [
     { "op": "submit", "args": { "name": "job", "payload": {}, "key": "A", "conflict": "reuse" }, "save": "t1" },
     { "op": "claim", "args": { "queues": ["default"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
     { "op": "complete", "args": { "id": "$t1.id", "worker_id": "w1", "result": { "n": 1 } }, "expect": { "equals": { "status": "succeeded" } } },
-    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "A", "conflict": "reuse" }, "save": "t2", "expect": { "equals": { "status": "succeeded" } } },
-    { "op": "expect", "target": "$t2.id", "equalsRef": "$t1.id" },
-    { "op": "expect", "target": "$t2.result", "equals": { "n": 1 } }
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "key": "A", "conflict": "reuse" }, "save": "t2", "expect": { "equals": { "status": "queued" } } },
+    { "op": "expect", "target": "$t2.id", "notEqualsRef": "$t1.id" },
+    { "op": "get_by_key", "args": { "key": "A" }, "save": "cur" },
+    { "op": "expect", "target": "$cur.id", "equalsRef": "$t2.id" },
+    { "op": "get", "args": { "id": "$t1.id" }, "expect": { "equals": { "status": "succeeded", "result": { "n": 1 } } } }
   ]
 }
