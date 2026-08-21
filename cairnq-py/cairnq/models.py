@@ -12,6 +12,18 @@ TaskStatus = Literal["queued", "running", "succeeded", "failed", "canceled"]
 STATUSES: tuple[TaskStatus, ...] = get_args(TaskStatus)
 
 _JSON_COLUMNS = ("payload", "result", "error", "metadata")
+
+# The bigint columns. `attempt` / `max_attempts` / `priority` are int4 and
+# `progress` is double precision, so every driver already gives those as numbers;
+# only int8 has a wire form worth normalizing.
+_MS_COLUMNS = (
+    "lease_until_ms",
+    "run_at_ms",
+    "cancel_requested_at_ms",
+    "created_at_ms",
+    "updated_at_ms",
+    "completed_at_ms",
+)
 TERMINAL: tuple[TaskStatus, ...] = ("succeeded", "failed", "canceled")
 
 P = TypeVar("P")
@@ -91,6 +103,20 @@ class Task:
             # back a str to parse; a jsonb-aware driver hands back a decoded
             # object. Parse only a str — never assume one backend.
             d[col] = json.loads(v) if isinstance(v, str) else v
+        for col in _MS_COLUMNS:
+            v = d.get(col)
+            # Same argument, for the other column type the drivers disagree
+            # about. Postgres sends int8 down the wire as text to protect
+            # precision it cannot know is unneeded; asyncpg decodes it, other
+            # drivers hand back a str. Normalizing here rather than demanding it
+            # of every driver is what lets an application inject a connection it
+            # configured for its own needs.
+            #
+            # Nullability differs per column (completed_at_ms may be null,
+            # created_at_ms may not), so this preserves null rather than
+            # producing 0. Mirrors rowToTask in the TypeScript SDK.
+            if v is not None and not isinstance(v, int):
+                d[col] = int(v)
         return cls(**{k: v for k, v in d.items() if k in _TASK_FIELDS})
 
     @property

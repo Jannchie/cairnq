@@ -8,11 +8,12 @@
  * instead of opening a second one, which is what makes a task's settlement
  * commit in the same transaction as the rows the task produced.
  *
- * Implementing one is small — see `createPoolExecutor` below for the reference
- * implementation over `pg`, and PROTOCOL.md for the two things an adapter must
- * get right that are easy to miss: int8 must come back as a JS number (every
- * cairnq bigint is an epoch-ms or a counter, all inside the safe range), and
- * jsonb must come back as an object, not a string.
+ * Implementing one is small — see `createPoolExecutor` in pg-pool.ts for the
+ * reference implementation over `pg`. An adapter passes rows through as its
+ * driver produced them: cairnq normalizes both column types the drivers disagree
+ * about (jsonb decoded or not, int8 as text or number) in `rowToTask`, so no
+ * adapter has to reconfigure its driver — and none has to change how the
+ * application's OWN columns come back in order to satisfy cairnq.
  */
 
 /** A row as the driver hands it back: column name -> value. */

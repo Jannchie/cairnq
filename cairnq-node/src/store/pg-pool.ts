@@ -15,11 +15,12 @@ async function loadPg(): Promise<typeof import("pg")> {
     throw new Error("PostgresStore requires the 'pg' package — install it (e.g. `npm i pg`)");
   }
   const pg = (mod.default ?? mod) as typeof import("pg");
-  // Postgres returns bigint (int8, OID 20) as a string to avoid precision loss.
-  // Every cairnq bigint is an epoch-ms or a counter, all within Number's safe
-  // integer range, so parse to number once (globally) to match the Task model
-  // (*_ms typed as number, same as the SQLite SDK). Set before any query runs.
-  pg.types.setTypeParser(pg.types.builtins.INT8, (v: string) => (v == null ? null : Number(v)));
+  // Deliberately NOT setting a global int8 type parser here. It would be the
+  // shortest fix for Postgres sending bigint as text, and it is what this file
+  // used to do — but pg's type parsers are process-global, so a library that
+  // installs one silently changes how the APPLICATION's own bigint columns come
+  // back. rowToTask normalizes instead, which costs nothing and leaves the
+  // caller's driver as they configured it.
   pgModule = pg;
   return pg;
 }

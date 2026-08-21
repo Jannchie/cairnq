@@ -39,6 +39,19 @@ export interface TaskRef {
 }
 
 const JSON_COLUMNS = ["payload", "result", "error", "metadata"] as const;
+// The bigint columns. `attempt` / `max_attempts` / `priority` are int4 and
+// `progress` is double precision, so every driver already gives those as numbers;
+// only int8 has a wire form worth normalizing. Nullability differs per column
+// (completed_at_ms may be null, created_at_ms may not), so the coercion has to
+// preserve null rather than turn it into 0.
+const MS_COLUMNS = [
+  "lease_until_ms",
+  "run_at_ms",
+  "cancel_requested_at_ms",
+  "created_at_ms",
+  "updated_at_ms",
+  "completed_at_ms",
+] as const;
 // As a const tuple so TerminalStatus derives from it — the same declare-once
 // pattern as STATUSES/TaskStatus above.
 export const TERMINAL = ["succeeded", "failed", "canceled"] as const;
@@ -62,6 +75,20 @@ export function rowToTask(row: Record<string, unknown>): Task {
     // string to parse; a jsonb-aware driver (Postgres `pg`) hands back an
     // already-decoded object. Parse only a string — never assume one backend.
     t[col] = typeof v === "string" ? JSON.parse(v) : (v ?? null);
+  }
+  for (const col of MS_COLUMNS) {
+    const v = row[col];
+    // Same argument, for the other column type the drivers disagree about.
+    // Postgres sends int8 down the wire as text to protect precision it cannot
+    // know is unneeded; `pg` surfaces that as a string, postgres.js does too,
+    // asyncpg decodes to int. Normalizing here rather than demanding it of every
+    // driver is what keeps an INJECTED executor honest: the alternative is
+    // asking an application to change its driver's global int8 handling to suit
+    // cairnq, which breaks that application's own bigint columns.
+    //
+    // Lossless: every one of these is an epoch-ms, and a millisecond timestamp
+    // does not reach Number.MAX_SAFE_INTEGER until the year 287396.
+    t[col] = v == null ? null : Number(v);
   }
   return t as unknown as Task;
 }
