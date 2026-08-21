@@ -1,3 +1,4 @@
+import { SchemaMismatch } from "../errors.js";
 import { loadMigrations, loadStatements } from "../sql.js";
 import {
   checkProtocolVersion,
@@ -163,6 +164,9 @@ export class PostgresStore extends TaskStore {
       this.provided ??
       (await createPoolExecutor(this.dsn!, { max: this.opts.max, schema: this.opts.schema }));
     try {
+      // Before migrations, which would otherwise create the very installation
+      // this is trying to warn about.
+      await this.checkSchema(executor);
       await this.applyMigrations(executor);
       checkProtocolVersion(await this.readProtocolVersion(executor));
     } catch (e) {
@@ -174,6 +178,59 @@ export class PostgresStore extends TaskStore {
     // Warm the LISTEN subscription in the background so the first idle sleep is
     // already wakeable. Fire-and-forget: failure just means polling.
     this.listenerReady();
+  }
+
+  /**
+   * Refuse a connection pointed somewhere other than the deployment's cairnq.
+   *
+   * Two shapes, because `schema` means "the schema cairnq's tables live in" and
+   * cairnq can either arrange that (it built the connection) or only check it
+   * (the caller's executor did):
+   *
+   * - `schema` configured -> assert the connection actually resolves there. On
+   *   the DSN path this is a cheap self-check; on an injected executor it is the
+   *   only way to state the expectation at all.
+   * - `schema` not configured -> the dangerous case is being about to create a
+   *   SECOND installation while one already exists elsewhere in this database,
+   *   which is exactly what a mismatched pair of SDKs does. Joining an existing
+   *   installation is fine no matter what else is around, so the check is
+   *   deliberately narrow: it fires only when this schema has no cairnq and some
+   *   other schema does.
+   *
+   * That narrowness is what keeps it from crying wolf. Two applications each
+   * running their own cairnq in their own schema are legitimate; the second one
+   * to be set up trips this once, and saying `schema` explicitly — which such a
+   * deployment should be doing anyway — is both the fix and the confirmation.
+   */
+  private async checkSchema(executor: PgExecutor): Promise<void> {
+    const rows = await executor.query(this.statements.installations, []);
+    const current = (rows[0]?.current_schema as string | null) ?? null;
+    const installations = (rows[0]?.installations as string[] | null) ?? [];
+    const wanted = this.opts.schema;
+
+    if (wanted != null) {
+      if (current !== wanted) {
+        throw new SchemaMismatch(
+          `cairnq is configured for schema ${JSON.stringify(wanted)} but this ` +
+            `connection resolves to ${JSON.stringify(current)} — check the ` +
+            `connection's search_path`,
+        );
+      }
+      return;
+    }
+    // A search_path naming nothing that exists: there is no "here" to compare
+    // against, and the migrations are about to fail with a clearer message.
+    if (current === null) return;
+    if (installations.length === 0 || installations.includes(current)) return;
+
+    throw new SchemaMismatch(
+      `cairnq tables already exist in schema ${installations.map((s) => JSON.stringify(s)).join(", ")} ` +
+        `of this database, but this connection resolves to ${JSON.stringify(current)}, where there are ` +
+        `none. Connecting would create a second, parallel installation that the other one can never see ` +
+        `— an API and a worker split this way agree about everything except where, and no task crosses. ` +
+        `Point this process at the same schema (\`schema\` option, or \`options=-c search_path=...\` in the ` +
+        `DSN), or pass \`schema\` explicitly to confirm a separate installation is what you meant.`,
+    );
   }
 
   private async applyMigrations(executor: PgExecutor): Promise<void> {

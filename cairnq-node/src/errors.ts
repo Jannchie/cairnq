@@ -208,6 +208,27 @@ export class ProtocolVersionMismatch extends CairnQError {
   }
 }
 
+/**
+ * This connection is not pointed at the cairnq installation the rest of the
+ * deployment is using — raised at connect, before any task is written.
+ *
+ * The schema a Postgres connection resolves to is out-of-band configuration
+ * (`search_path`, a `schema` option, an ORM's pool settings), so two processes
+ * given the same DSN can still land in different schemas. Every migration is
+ * `create table if not exists`, so the odd one out does not fail: it builds a
+ * second, empty installation and its protocol version check passes against the
+ * cairnq_meta it just created. Left undetected, an API and a worker then agree
+ * about everything except WHERE, and no task ever crosses.
+ *
+ * The Python SDK raises the same named error.
+ */
+export class SchemaMismatch extends CairnQError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SchemaMismatch";
+  }
+}
+
 /** A value could not be encoded for a protocol JSON column (non-finite number,
  * BigInt, circular structure, …). Raised at the boundary — submit rejects with
  * it, and a worker records a handler result that triggers it as a permanent

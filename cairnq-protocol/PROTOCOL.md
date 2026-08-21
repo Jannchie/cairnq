@@ -427,6 +427,39 @@ terminal record keeps them, as the history of how far the last attempt got.
 Per-statement parameters are documented in the header comment of each
 `sql/<dialect>/*.sql` file.
 
+## Schema (Postgres only)
+
+The canonical SQL names no schema. Which one a statement resolves in is the
+connection's `search_path`, which makes it **out-of-band configuration**: two
+processes handed the same DSN can still land in different schemas.
+
+That is not a benign difference. Every migration is `create table if not exists`,
+so the process that lands somewhere else does not fail — it builds a second,
+empty installation, and its `protocol_version` check passes against the
+`cairnq_meta` it just created. An API and a worker split this way agree about
+everything except *where*, both report healthy, and no task ever crosses.
+
+Both SDKs therefore take a `schema` option, meaning **the schema cairnq's tables
+live in**, and each does one of two things with it:
+
+- given a DSN, cairnq owns the connection: it creates the schema if absent and
+  sets `search_path` on every connection in the pool;
+- given an executor the caller built, cairnq only asserts that the connection
+  resolves there.
+
+And both run `installations.sql` once at connect, before migrations, to look
+*outside* their own `search_path` — the only vantage point from which the split
+is visible at all. Where `schema` was not given, a connection about to create a
+second installation beside an existing one raises `SchemaMismatch` rather than
+succeeding into a queue nobody else can see. Naming `schema` explicitly is both
+the fix for the ambiguous case and the confirmation for the legitimate one (two
+applications, one database, a cairnq each).
+
+Recording the schema in `cairnq_meta` and comparing it against
+`current_schema()` looks like the cheaper guard and is not one: `cairnq_meta`
+lives *inside* the schema, so each side reads the row it wrote itself and both
+comparisons pass.
+
 ## Error envelope
 
 Errors stored in `error` and surfaced by SDKs are JSON, never a language

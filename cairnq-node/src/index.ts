@@ -48,6 +48,7 @@ export {
   LostLease,
   EventLoopBlocked,
   ProtocolVersionMismatch,
+  SchemaMismatch,
   SerializationError,
 } from "./errors.js";
 export type { FailReason } from "./errors.js";

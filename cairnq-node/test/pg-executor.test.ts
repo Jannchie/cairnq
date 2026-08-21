@@ -9,6 +9,7 @@ import {
   type PgSession,
   PostgresStore,
   type Row,
+  SchemaMismatch,
   TaskContext,
 } from "../src/index.js";
 
@@ -17,6 +18,9 @@ import {
 // conformance suite); what is checked here is what the store ASKS the executor
 // to do — which is exactly what an adapter over another driver has to satisfy,
 // and what a refactor of the connection seam could silently break.
+
+/** Comments and runs of whitespace, so a recorded call is one readable line. */
+const COMMENT_OR_SPACE = /--[^\n]*|\s+/g;
 
 interface Recorder {
   executor: PgExecutor;
@@ -29,7 +33,13 @@ function fakeExecutor(over: Partial<PgExecutor> = {}): Recorder {
   const rec = { calls, closed: 0 } as Recorder;
   const session: PgSession = {
     async query(text: string): Promise<Row[]> {
-      calls.push(`query:${text.replace(/\s+/g, " ").trim().slice(0, 48)}`);
+      // Tagged, not truncated: every protocol statement opens with a comment
+      // block, so the first N characters identify none of them.
+      calls.push(
+        /current_schema\(\)/.test(text)
+          ? "query:installations"
+          : `query:${text.replace(COMMENT_OR_SPACE, " ").trim().slice(0, 48)}`,
+      );
       // The only read doConnect makes: cairnq_meta's protocol_version. Anything
       // else in the connect path is a migration bookkeeping SELECT, and an empty
       // result there means "not applied yet".
@@ -64,13 +74,20 @@ describe("PostgresStore over an injected executor", () => {
     await store.connect();
 
     // The ledger table itself is created outside any transaction...
-    expect(rec.calls[0]).toContain("create table if not exists cairnq_migrations");
+    const ledger = rec.calls.findIndex((c) =>
+      c.includes("create table if not exists cairnq_migrations"),
+    );
+    expect(ledger).toBeGreaterThanOrEqual(0);
+    // ...and the split-brain check comes before it, while there is still nothing
+    // of ours in this schema to find.
+    expect(rec.calls.slice(0, ledger)).toContain("query:installations");
     // ...and then every migration is check-and-apply under the lock. Without the
     // lock inside the transaction, two processes cold-starting together both see
     // a migration as unapplied and both run it.
     const begins = rec.calls.filter((c) => c === "tx:begin").length;
     expect(begins).toBeGreaterThan(0);
     expect(rec.calls.filter((c) => c === "tx:commit")).toHaveLength(begins);
+    expect(rec.calls.indexOf("tx:begin")).toBeGreaterThan(ledger);
     const firstBegin = rec.calls.indexOf("tx:begin");
     expect(rec.calls[firstBegin + 1]).toContain("lock table cairnq_migrations in exclusive mode");
   });
@@ -300,5 +317,68 @@ describe("schema option", () => {
     );
     expect(err).not.toBeNull();
     expect(err!.message).not.toMatch(/plain identifier/);
+  });
+});
+
+// ------------------------------------------------------------ split brain
+
+/** An executor reporting a database that already holds cairnq somewhere. */
+function inSchema(current: string | null, installations: string[]): PgExecutor {
+  const query = async (text: string): Promise<Row[]> => {
+    if (/current_schema\(\)/.test(text)) {
+      return [{ current_schema: current, installations }];
+    }
+    return /protocol_version/.test(text) && /select/i.test(text) ? [{ value: "1" }] : [];
+  };
+  const session: PgSession = { query, exec: async () => {} };
+  return {
+    query,
+    exec: session.exec,
+    tx: async (fn) => fn(session),
+    close: async () => {},
+  };
+}
+
+describe("split-brain guard", () => {
+  it("refuses to build a second installation beside one that already exists", async () => {
+    // The reported failure: the TS side migrated into `cairnq`, the other end
+    // defaults to `public`, both succeed, and no task ever crosses. Nothing
+    // downstream can see it — protocol_version reads from whichever cairnq_meta
+    // the connection found, so that check passes on both sides.
+    const store = new PostgresStore(inSchema("public", ["cairnq"]));
+    await expect(store.connect()).rejects.toBeInstanceOf(SchemaMismatch);
+    await expect(store.connect()).rejects.toThrow(/"cairnq".*"public"/s);
+  });
+
+  it("is quiet when this connection joins the installation that exists", async () => {
+    const store = new PostgresStore(inSchema("cairnq", ["cairnq"]));
+    await expect(store.connect()).resolves.toBeUndefined();
+  });
+
+  it("is quiet on a database with no cairnq in it yet", async () => {
+    const store = new PostgresStore(inSchema("public", []));
+    await expect(store.connect()).resolves.toBeUndefined();
+  });
+
+  it("lets an explicit schema through — two deployments in one database", async () => {
+    // Saying it is both the fix and the confirmation: a second application
+    // legitimately running its own cairnq names its schema, and that is exactly
+    // what the error tells the ambiguous case to do.
+    const store = new PostgresStore(inSchema("app_b", ["app_a"]), { schema: "app_b" });
+    await expect(store.connect()).resolves.toBeUndefined();
+  });
+
+  it("checks an explicit schema against where the connection actually landed", async () => {
+    // The only way an injected executor can state the expectation at all: cairnq
+    // did not build that connection and cannot set its search_path.
+    const store = new PostgresStore(inSchema("public", ["public"]), { schema: "cairnq" });
+    await expect(store.connect()).rejects.toThrow(/configured for schema "cairnq"/);
+  });
+
+  it("stays out of the way when the search_path resolves to nothing", async () => {
+    // Nothing to compare against, and the migrations are about to fail with a
+    // message that names the real problem.
+    const store = new PostgresStore(inSchema(null, ["cairnq"]));
+    await expect(store.connect()).resolves.toBeUndefined();
   });
 });

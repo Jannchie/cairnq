@@ -195,6 +195,23 @@ class ProtocolVersionMismatch(CairnQError):
     """The storage protocol major version is incompatible with this SDK."""
 
 
+class SchemaMismatch(CairnQError):
+    """This connection is not pointed at the cairnq installation the rest of
+    the deployment is using — raised at connect, before any task is written.
+
+    The schema a Postgres connection resolves to is out-of-band configuration
+    (``search_path``, a ``schema`` argument, a pool's server_settings), so two
+    processes given the same DSN can still land in different schemas. Every
+    migration is ``create table if not exists``, so the odd one out does not
+    fail: it builds a second, empty installation and its protocol version check
+    passes against the ``cairnq_meta`` it just created. Left undetected, an API
+    and a worker then agree about everything except WHERE, and no task ever
+    crosses.
+
+    The TypeScript SDK raises the same named error.
+    """
+
+
 class SerializationError(CairnQError):
     """A value could not be encoded for a protocol JSON column (non-finite
     number, set, datetime, …). Raised at the boundary — submit raises it, and a

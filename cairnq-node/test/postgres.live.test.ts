@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 
-import { CairnQ, LostLease, PostgresStore, Worker } from "../src/index.js";
+import { CairnQ, LostLease, PostgresStore, SchemaMismatch, Worker } from "../src/index.js";
 import { allTerminal, sleep, waitFor } from "./helpers.js";
 
 // Live Postgres smoke. Skipped unless CAIRNQ_TEST_PG_DSN is set — CI provides a
@@ -217,4 +217,57 @@ suite("postgres live", () => {
     // Never redelivered despite outliving the lease: one attempt each.
     expect([...tasks.values()].every((t) => t.attempt === 1)).toBe(true);
   }, 20_000);
+
+  // ------------------------------------------------------------ split brain
+  // The one failure a fake cannot prove: `create table if not exists` really
+  // does let a second, parallel installation come up beside the first, against
+  // a real server, with the version check really passing on both sides.
+  describe("schema", () => {
+    it("puts the tables in the schema it was given, and joins them again", async () => {
+      const scoped = CairnQ.postgres(LIVE_DSN, { schema: "cairnq_isolated" });
+      try {
+        await scoped.connect(); // creates the schema, migrates into it
+        const t = await scoped.submit("job", { n: 1 });
+        // The default-schema client shares the DSN and sees nothing of it.
+        expect(await client.get(t.id)).toBeNull();
+        // A second connection naming the same schema picks it straight up.
+        const rejoin = CairnQ.postgres(LIVE_DSN, { schema: "cairnq_isolated" });
+        try {
+          expect((await rejoin.get(t.id))?.payload).toEqual({ n: 1 });
+        } finally {
+          await rejoin.close();
+        }
+      } finally {
+        await scoped.close();
+        await admin.query("drop schema if exists cairnq_isolated cascade");
+      }
+    });
+
+    it("refuses to come up in a schema beside an installation that already exists", async () => {
+      // `client` (beforeEach) already migrated into the default schema, so a
+      // connection landing anywhere else is about to split the deployment in two.
+      await admin.query("create schema if not exists cairnq_elsewhere");
+      const other = CairnQ.postgres(LIVE_DSN, { schema: "cairnq_elsewhere" });
+      try {
+        // Explicit: allowed, and it is the confirmation the guard asks for.
+        await other.connect();
+      } finally {
+        await other.close();
+      }
+      // Implicit, via the DSN — the shape a mismatched pair of SDKs actually
+      // takes. Nothing about it is distinguishable downstream, so it has to fail
+      // here or not at all.
+      const url = new URL(LIVE_DSN);
+      url.searchParams.set("options", "-c search_path=cairnq_elsewhere2");
+      await admin.query("create schema if not exists cairnq_elsewhere2");
+      const implicit = CairnQ.postgres(url.toString());
+      try {
+        await expect(implicit.connect()).rejects.toBeInstanceOf(SchemaMismatch);
+      } finally {
+        await implicit.close();
+        await admin.query("drop schema if exists cairnq_elsewhere cascade");
+        await admin.query("drop schema if exists cairnq_elsewhere2 cascade");
+      }
+    });
+  });
 });
