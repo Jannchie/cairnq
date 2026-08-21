@@ -238,13 +238,19 @@ async def test_batch_of_one_is_still_a_batch_call(client, db_path):
 async def test_the_batch_heartbeat_keeps_every_lease_alive(client, db_path):
     """A handler outliving its lease must not have its tasks recovered under it —
     and one beat has to cover the whole batch, not one task at a time."""
+    # Margins, not luck: the point is that ONE beat covers the whole batch, and
+    # the handler outlives its lease several times over. A loaded CI runner can
+    # delay a beat past a 200ms lease without anything being wrong with the
+    # worker, which fails this for a reason it is not testing. Longer lease, same
+    # beat-to-lease ratio, same number of lifetimes slept. Mirrors the margins in
+    # batch-delivery.test.ts.
     worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=4, lease_ms=200, heartbeat_interval_ms=40
+        db_path, poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
     )
 
     @worker.task("slow", batch=4)
     async def slow(items):
-        await asyncio.sleep(0.6)  # three lease lifetimes
+        await asyncio.sleep(3.0)  # three lease lifetimes
         assert not any(item.lost_lease for item in items)
 
     ids = [(await client.submit("slow", {}, max_attempts=1)).id for _ in range(3)]
@@ -258,14 +264,18 @@ async def test_the_batch_heartbeat_keeps_every_lease_alive(client, db_path):
 async def test_a_settled_task_stops_being_heartbeaten(client, db_path):
     """Renewing a lease on a terminal row is a write against something nobody
     owns; the beat has to drop tasks the handler already finished."""
+    # Same margin reasoning as the case above. A lease expiring here does not
+    # just delay the test, it changes what it measures: the surviving task gets
+    # recovered and redelivered as a batch of its own, whose items[0] settles
+    # early too, and the assertion below counts two.
     worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=4, lease_ms=200, heartbeat_interval_ms=40
+        db_path, poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
     )
 
     @worker.task("half", batch=4)
     async def half(items):
         await items[0].succeed({"early": True})
-        await asyncio.sleep(0.3)  # several beats, with one task already terminal
+        await asyncio.sleep(1.5)  # several beats, with one task already terminal
 
     ids = [(await client.submit("half", {})).id for _ in range(2)]
     tasks = await _drain(client, ids, worker)
