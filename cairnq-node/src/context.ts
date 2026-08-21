@@ -3,6 +3,7 @@ import { asEnvelope, type FailReason, LostLease } from "./errors.js";
 import { cancelRequested, type Task } from "./models.js";
 import type { SubmitOptions } from "./client.js";
 import type { TaskStore } from "./store/base.js";
+import type { PgSession } from "./store/pg-executor.js";
 import { type TaskDef, taskName } from "./task.js";
 import { pollWait } from "./wait.js";
 
@@ -197,6 +198,42 @@ export class TaskContext {
     const task = await this.owned(() =>
       this.store.complete({ taskId: this.task.id, workerId: this.workerId, result }),
     );
+    this.markSettled();
+    return task;
+  }
+
+  /**
+   * Finalize this task as succeeded, committing the caller's own writes in the
+   * SAME transaction as the settlement. Whatever `write` returns becomes the
+   * task's result.
+   *
+   *     await ctx.succeedIn(async (session) => {
+   *       await db.withSession(session).insert(pages).values(rendered)
+   *       return { pages: rendered.length }
+   *     })
+   *
+   * The alternative — write the rows, then settle — has a window between the two
+   * commits where the work is durable but the task still reads as running. A
+   * crash there re-runs the whole task, which for a render or an ingest means
+   * recomputing it, and for non-idempotent work means doing it twice.
+   *
+   * `session` is the driver's, so this needs a Postgres store built on a
+   * PgExecutor the application shares with its own driver; anything else throws.
+   * If the settlement finds the lease gone, `write`'s work is rolled back with
+   * it and LostLease is raised. Returns null if this task was already settled.
+   *
+   * `write` may be replayed if the backend retries the transaction — derive
+   * nothing inside it that cannot be derived twice.
+   */
+  async succeedIn<T>(write: (session: PgSession) => Promise<T>): Promise<Task | null> {
+    if (this.isSettled) return null;
+    const task = await this.owned(async () => {
+      const { task } = await this.store.completeIn<PgSession, T>(
+        { taskId: this.task.id, workerId: this.workerId },
+        write,
+      );
+      return task;
+    });
     this.markSettled();
     return task;
   }

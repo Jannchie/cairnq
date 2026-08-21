@@ -320,7 +320,13 @@ worker = Worker.sqlite("tasks.db")      # or Worker.postgres(dsn)
   `wait`/`call` the moment a task is queued or finishes — millisecond pickup
   instead of the poll interval, with polling kept as the fallback (a lost
   notification costs one poll, never a task). Needs the optional driver:
-  `cairnq[postgres]` / `pg`.
+  `cairnq[postgres]` / `pg` — or, in the TypeScript SDK, no driver of its own at
+  all: given a `PgExecutor` over the one the application already runs, cairnq
+  joins that session, and `ctx.succeedIn()` then commits a task's settlement in
+  the same transaction as the rows the task produced.
+
+Both TypeScript drivers are optional peers (`better-sqlite3`, `pg`) and importing
+the package loads neither, so a Postgres-only deployment builds no native module.
 
 One caveat if you target both: Postgres `jsonb` rejects `\u0000` inside strings and
 SQLite accepts it, so keep NUL characters out of payloads that need portability.
@@ -346,7 +352,7 @@ SQLite accepts it, so keep NUL characters out of payloads that need portability.
 ```
 cairnq-protocol/   schema + canonical SQL (per dialect) + conformance scenarios + PROTOCOL.md
 cairnq-py/         Python SDK (aiosqlite / asyncpg)
-cairnq-node/       TypeScript SDK (better-sqlite3 / pg)
+cairnq-node/       TypeScript SDK (better-sqlite3 / pg, both optional)
 conformance/       cross-language end-to-end orchestrator
 ```
 

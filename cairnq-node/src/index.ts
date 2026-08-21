@@ -12,8 +12,19 @@ export { defineTask } from "./task.js";
 export type { TaskDef } from "./task.js";
 export { SQLiteStore } from "./store/sqlite.js";
 export { PostgresStore } from "./store/postgres.js";
+export { ListenUnavailable } from "./store/pg-executor.js";
+export type { PgExecutor, PgSession, Row } from "./store/pg-executor.js";
+export { createPoolExecutor } from "./store/pg-pool.js";
 export { TaskStore } from "./store/base.js";
-export type { ListInput, PurgeInput, SubmitInput, Conflict } from "./store/base.js";
+export type {
+  ListInput,
+  PurgeInput,
+  SubmitInput,
+  Conflict,
+  WatchOptions,
+  WatchSignal,
+} from "./store/base.js";
+export { DEFAULT_WATCH_POLL_MS } from "./store/base.js";
 export type { Task, TaskRef, TaskStatus, TerminalStatus } from "./models.js";
 export {
   STATUSES,

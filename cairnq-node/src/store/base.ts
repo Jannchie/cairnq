@@ -201,6 +201,35 @@ export function statementParams(sql: string): readonly string[] {
  * them in one place is what stops SQLite and Postgres from drifting apart in
  * behavior; the shared SQL already stops them from drifting in wording.
  */
+/**
+ * Why `watch` is calling back.
+ *
+ * `queued` / `done` come from the store's push channel and name what moved;
+ * `poll` is the timer saying the watch cannot rule out a change. None of them
+ * carries state — the row is the truth.
+ */
+export interface WatchSignal {
+  reason: "queued" | "done" | "poll";
+  /** The queue a task was queued on. Only on `queued`. */
+  queue?: string;
+  /** The task that reached a terminal status. Only on `done`. */
+  taskId?: string;
+}
+
+export interface WatchOptions {
+  /** Restrict `queued` signals to these queues. Unset watches every queue. */
+  queues?: string[];
+  /**
+   * How often to signal in the absence of a push channel — and, where there is
+   * one, how long a dropped listener can go unnoticed. The default trades a
+   * dashboard's idle query rate against how stale it may look.
+   */
+  pollMs?: number;
+}
+
+/** See WatchOptions.pollMs. */
+export const DEFAULT_WATCH_POLL_MS = 2_000;
+
 export abstract class TaskStore {
   /** Set by useBackpressure; null means submit is ungated. */
   private gate: QueueDepthGate | null = null;
@@ -221,6 +250,37 @@ export abstract class TaskStore {
    * build ids and payloads before opening the transaction, not within it.
    */
   protected abstract tx<T>(fn: (fetch: Fetch) => Promise<T>): Promise<T>;
+
+  /**
+   * `tx`, but also handing `fn` the driver's own session so the CALLER can run
+   * their statements in the same transaction as the protocol's.
+   *
+   * This is what lets a task's settlement and the rows that task produced commit
+   * together. Without it the two are separate transactions and there is a window
+   * where the work is durable but the task still reads as unfinished — a crash
+   * there costs a full recomputation on retry, and for non-idempotent work costs
+   * more than that.
+   *
+   * Optional, because the session type is the driver's, not the protocol's: a
+   * store that has no session worth handing out simply does not implement it and
+   * `completeIn` reports that. Postgres implements it; SQLite does not.
+   */
+  protected txWithSession?<T>(fn: (fetch: Fetch, session: unknown) => Promise<T>): Promise<T>;
+
+  /**
+   * Register for this store's push channel, if it has one; returns an
+   * unsubscribe. A store without a push channel does not implement this, and
+   * `watch` degrades to its timer alone.
+   */
+  protected subscribePush?(onSignal: (signal: WatchSignal) => void): () => void;
+
+  /**
+   * Nudge the push channel back up if it has dropped. Called from `watch`'s
+   * timer, which is the only thing keeping a client-side subscriber alive: a
+   * process that never claims never calls claimWake, so without this a listener
+   * that died once would never come back there.
+   */
+  protected warmPush?(): void;
 
   /**
    * Whether it is worth opening the claim transaction at all. SQLite gates its
@@ -461,6 +521,57 @@ export abstract class TaskStore {
   }
 
   /**
+   * Call `onSignal` when the tasks on `queues` may have changed — something was
+   * queued, or something finished.
+   *
+   * This is notify-ACCELERATED POLLING, not an event log, and the difference is
+   * the whole contract. Where a push channel is available (Postgres LISTEN) an
+   * idle watch costs nothing and a signal arrives within milliseconds of the
+   * event. Where it is not — a transaction-mode pooler refuses LISTEN, SQLite has
+   * no channel at all — the timer alone still delivers `poll` signals, so a
+   * consumer that re-reads on every signal is correct in both cases and merely
+   * less prompt in one.
+   *
+   * What it will NOT do is promise that a signal means something happened, or
+   * that every event produces its own signal. Treat a signal as "re-read now"
+   * and take the truth from `stats()` / `list()` / `get()`, which is where it
+   * lives. `reason` is a hint for reading less: a `done` signal names the task,
+   * so a dashboard can refresh that row instead of the list.
+   *
+   * Returns an unsubscribe. The timer is unref'd — watching does not hold a
+   * process open.
+   */
+  watch(opts: WatchOptions, onSignal: (signal: WatchSignal) => void): () => void {
+    const pollMs = Math.max(1, opts.pollMs ?? DEFAULT_WATCH_POLL_MS);
+    const queues = opts.queues ?? null;
+    let live = true;
+    const emit = (signal: WatchSignal): void => {
+      // A signal delivered after unsubscribe would have the consumer re-reading
+      // a store it has stopped caring about, possibly a closed one.
+      if (live) onSignal(signal);
+    };
+    const unsubscribe = this.subscribePush?.((signal) => {
+      // A queued signal names its queue, so a watch scoped to some queues can
+      // drop the rest. A done signal names only the task — which queue it was on
+      // is not in the notification, so it is never filtered out.
+      if (signal.reason === "queued" && queues && signal.queue && !queues.includes(signal.queue)) {
+        return;
+      }
+      emit(signal);
+    });
+    const timer = setInterval(() => {
+      this.warmPush?.();
+      emit({ reason: "poll" });
+    }, pollMs);
+    timer.unref?.();
+    return () => {
+      live = false;
+      unsubscribe?.();
+      clearInterval(timer);
+    };
+  }
+
+  /**
    * How many more tasks fit on `queue` under `maxDepth` — 0 once it is full.
    *
    * The cheap half of backpressure: bounded at `maxDepth` index entries, unlike
@@ -633,6 +744,45 @@ export abstract class TaskStore {
       id: input.taskId,
       worker_id: input.workerId,
       result: input.result == null ? null : dumpJson(input.result),
+    });
+  }
+
+  /**
+   * `complete`, with the caller's own writes committed in the same transaction.
+   *
+   * `fn` runs first and whatever it returns becomes the task's result; the
+   * settlement is the last statement in the transaction. So a lost lease — the
+   * settlement matching no row — rolls the caller's writes back with it, and
+   * there is no ordering in which the work is recorded but the task is not.
+   *
+   * The settlement runs LAST rather than checking ownership up front on purpose:
+   * the ownership predicate lives in the protocol's complete.sql, and a
+   * fail-fast pre-check here would be a second copy of it, free to drift. The
+   * cost of that choice is that a doomed attempt does its work before finding
+   * out, which is the rare path.
+   *
+   * `fn` must be replayable for the same reason `tx`'s callback must be.
+   */
+  async completeIn<S, T>(
+    input: { taskId: string; workerId: string },
+    fn: (session: S) => Promise<T>,
+  ): Promise<{ task: Task; value: T }> {
+    if (!this.txWithSession) {
+      throw new Error(
+        "this store cannot share a transaction with the caller — " +
+          "completeIn requires a Postgres store (see PgExecutor)",
+      );
+    }
+    return this.txWithSession(async (fetch, session) => {
+      const value = await fn(session as S);
+      const rows = await fetch("complete", {
+        id: input.taskId,
+        worker_id: input.workerId,
+        result: value == null ? null : dumpJson(value),
+      });
+      // Rolls back `fn`'s writes along with the settlement that did not land.
+      if (!rows.length) throw new LostLease(input.taskId);
+      return { task: rowToTask(rows[0]), value };
     });
   }
 

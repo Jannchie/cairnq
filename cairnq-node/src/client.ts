@@ -4,7 +4,15 @@ import { TaskCanceled, TaskFailed } from "./errors.js";
 import { isFailed, isSucceeded, type Task, type TaskRef, type TaskStatus } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
-import type { ListInput, PurgeInput, SubmitInput, TaskStore } from "./store/base.js";
+import type { PgExecutor } from "./store/pg-executor.js";
+import type {
+  ListInput,
+  PurgeInput,
+  SubmitInput,
+  TaskStore,
+  WatchOptions,
+  WatchSignal,
+} from "./store/base.js";
 import { type TaskDef, taskName } from "./task.js";
 import { DEFAULT_WAIT_TIMEOUT_MS, type PollOptions, pollWait, pollWaitByKey } from "./wait.js";
 
@@ -53,11 +61,16 @@ export class CairnQ {
     return new CairnQ(new SQLiteStore(path, { busyTimeoutMs }), client);
   }
 
-  /** Multi-host backend. `dsn` is a libpq connection string; requires the
-   * optional `pg` package. */
-  static postgres(dsn: string, opts: { max?: number } & ClientOptions = {}): CairnQ {
-    const { max, ...client } = opts;
-    return new CairnQ(new PostgresStore(dsn, { max }), client);
+  /** Multi-host backend. `source` is a libpq connection string — which requires
+   * the optional `pg` package — or a PgExecutor over a driver the application
+   * already runs (an ORM's pool, say), which cairnq then shares instead of
+   * opening a second one. */
+  static postgres(
+    source: string | PgExecutor,
+    opts: { max?: number; schema?: string } & ClientOptions = {},
+  ): CairnQ {
+    const { max, schema, ...client } = opts;
+    return new CairnQ(new PostgresStore(source, { max, schema }), client);
   }
 
   get store(): TaskStore {
@@ -144,6 +157,20 @@ export class CairnQ {
    * — `(await stats()).default.queued` is the backlog of a queue. */
   stats(): Promise<Record<string, Record<TaskStatus, number>>> {
     return this._store.stats();
+  }
+
+  /**
+   * Call `onSignal` when the tasks on `queues` may have changed. Returns an
+   * unsubscribe.
+   *
+   * Notify-accelerated polling, not an event log: a signal means "re-read now",
+   * and `stats()` / `list()` / `get()` are where the truth is. On Postgres an
+   * idle watch costs nothing and signals land in milliseconds; everywhere else
+   * the timer alone still delivers, so the same consumer code is correct either
+   * way. See TaskStore.watch for the full contract.
+   */
+  watch(opts: WatchOptions, onSignal: (signal: WatchSignal) => void): () => void {
+    return this._store.watch(opts, onSignal);
   }
 
   /** Wait for a task to finish. Resolves with the terminal Task (any status);

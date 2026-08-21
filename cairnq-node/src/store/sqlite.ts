@@ -1,7 +1,9 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import Database from "better-sqlite3";
+import { createRequire } from "node:module";
+
+import type Database from "better-sqlite3";
 
 import { nowMs } from "../ids.js";
 import { loadMigrations, loadStatements } from "../sql.js";
@@ -13,6 +15,25 @@ import {
   statementParams,
   TaskStore,
 } from "./base.js";
+
+// `better-sqlite3` is an optional dependency, matching `pg` on the Postgres side:
+// a Postgres-only deployment should not have to build a native module it never
+// loads, and importing this file must not pull one in. Required (not imported)
+// because ensure() is synchronous — the open path applies migrations and cannot
+// await — and createRequire gives a synchronous load from ESM.
+const require = createRequire(import.meta.url);
+let sqliteModule: typeof Database | null = null;
+function loadSqlite(): typeof Database {
+  if (sqliteModule) return sqliteModule;
+  try {
+    sqliteModule = require("better-sqlite3") as typeof Database;
+  } catch {
+    throw new Error(
+      "SQLiteStore requires the 'better-sqlite3' package — install it (e.g. `npm i better-sqlite3`)",
+    );
+  }
+  return sqliteModule;
+}
 
 type DB = Database.Database;
 type Stmt = Database.Statement;
@@ -261,7 +282,7 @@ export class SQLiteStore extends TaskStore {
     if (this.db) return this.db;
     const memory = isMemory(this.path);
     if (!memory) mkdirSync(dirname(this.path), { recursive: true });
-    const db = new Database(this.path);
+    const db = new (loadSqlite())(this.path);
     // Only the synchronous part of the open path gets a real busy_timeout: the WAL
     // switch and the migrations cannot await a retry. See the class comment.
     db.pragma(`busy_timeout = ${this.busyBudgetMs}`);

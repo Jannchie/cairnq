@@ -14,6 +14,7 @@ import { newId } from "./ids.js";
 import { type Task } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
+import type { PgExecutor } from "./store/pg-executor.js";
 import type { TaskStore } from "./store/base.js";
 import { type TaskDef, taskName } from "./task.js";
 
@@ -291,14 +292,15 @@ export class Worker {
     return worker;
   }
 
-  /** Multi-host backend. `dsn` is a libpq connection string; requires the
-   * optional `pg` package. */
+  /** Multi-host backend. `source` is a libpq connection string — which requires
+   * the optional `pg` package — or a PgExecutor over a driver the application
+   * already runs, which cairnq then shares instead of opening a second pool. */
   static postgres(
-    dsn: string,
-    opts: WorkerOptions & { queues?: string[]; max?: number } = {},
+    source: string | PgExecutor,
+    opts: WorkerOptions & { queues?: string[]; max?: number; schema?: string } = {},
   ): Worker {
-    const { queues = ["default"], max, ...rest } = opts;
-    const worker = new Worker(new PostgresStore(dsn, { max }), queues, rest);
+    const { queues = ["default"], max, schema, ...rest } = opts;
+    const worker = new Worker(new PostgresStore(source, { max, schema }), queues, rest);
     worker.ownsStore = true;
     return worker;
   }

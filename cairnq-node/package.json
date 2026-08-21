@@ -39,19 +39,21 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": {
-    "better-sqlite3": "^13.0.2"
-  },
   "peerDependencies": {
+    "better-sqlite3": "^13.0.2",
     "pg": "^8.13.0"
   },
   "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
     "pg": {
       "optional": true
     }
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
+    "better-sqlite3": "^13.0.2",
     "@types/node": "^22.7.0",
     "@types/pg": "^8.11.10",
     "pg": "^8.13.0",

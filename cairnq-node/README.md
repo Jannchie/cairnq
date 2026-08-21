@@ -1,8 +1,12 @@
 # cairnq (TypeScript / Node)
 
 SQLite-first, cross-language, storage-centered durable task runtime. The
-TypeScript SDK (Node ≥ 20, `better-sqlite3`). API and worker processes coordinate
-only through a shared SQLite file.
+TypeScript SDK (Node ≥ 20). API and worker processes coordinate only through a
+shared SQLite file.
+
+Both drivers are optional peers — install the one you use:
+`npm i better-sqlite3` for the SQLite backend, `npm i pg` for Postgres. Importing
+`cairnq` loads neither, so a Postgres-only deployment builds no native module.
 
 ```ts
 import { CairnQ, Worker } from "cairnq";
@@ -97,6 +101,65 @@ worker.task("long.job", async (ctx) => {
 
 Same code, Postgres instead of the file — `CairnQ.postgres(dsn)` /
 `Worker.postgres(dsn)`. Requires the optional `pg` peer dependency (`npm i pg`).
+
+### Sharing the application's connection
+
+Given a `PgExecutor` instead of a DSN, cairnq runs inside a session the
+application already has — no second driver, no second pool:
+
+```ts
+import { CairnQ, type PgExecutor } from "cairnq";
+
+const executor: PgExecutor = { /* ~30 lines over your driver */ };
+const tasks = CairnQ.postgres(executor);
+```
+
+`schema` (DSN form only) puts cairnq's tables in a schema of their own:
+`CairnQ.postgres(dsn, { schema: "cairnq" })` creates it if absent and sets
+`search_path` per connection. The protocol's SQL names no schema, so nothing else
+changes. With your own executor, the search_path is yours to set.
+
+Two things an adapter must get right: `int8` has to come back as a JS number
+(every cairnq `*_ms` is an epoch or a counter, all inside the safe range), and
+`jsonb` as an object rather than a string. An executor cairnq was handed is
+never closed by cairnq.
+
+That shared session is also what lets a task's settlement commit together with
+the rows the task produced:
+
+```ts
+worker.task("render.document", async (ctx, payload) => {
+  const rendered = await render(payload);
+  return ctx.succeedIn(async (session) => {
+    await db.withSession(session).insert(pages).values(rendered);
+    return { pages: rendered.length }; // becomes the task's result
+  });
+});
+```
+
+Without it the two are separate transactions, and a crash between them leaves
+work durable while the task still reads as running — on retry, recomputed. If
+the lease turns out to be gone, the settlement matches no row and the caller's
+writes roll back with it.
+
+## Watching
+
+`watch` calls back when the tasks on a queue may have changed — for a dashboard
+that would otherwise poll:
+
+```ts
+const stop = tasks.watch({ queues: ["render"] }, async (signal) => {
+  if (signal.reason === "done") return refreshOne(signal.taskId!);
+  setCounts(await tasks.stats());
+});
+```
+
+It is notify-accelerated polling, not an event log. On Postgres an idle watch
+costs nothing and a signal lands within milliseconds; where LISTEN is
+unavailable — a transaction-mode pooler, or SQLite, which has no channel — the
+timer alone still delivers `poll` signals. So the same consumer is correct either
+way, and only its promptness differs. Treat a signal as "re-read now"; the truth
+is in `stats()` / `list()` / `get()`.
 
 The protocol (schema + canonical SQL) lives in `../cairnq-protocol` and is shared
 verbatim with the Python SDK. See `../cairnq-protocol/PROTOCOL.md`.
