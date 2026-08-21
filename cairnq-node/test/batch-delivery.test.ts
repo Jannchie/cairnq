@@ -259,15 +259,20 @@ describe("batch delivery", () => {
   it("keeps every lease in the batch alive with one beat", async () => {
     // A handler outliving its lease must not have its tasks recovered under it —
     // and one beat has to cover the whole batch, not one task at a time.
+    // Margins, not luck: the point is that ONE beat covers the whole batch, and
+    // the handler outlives its lease several times over. A loaded CI runner can
+    // delay a beat past a 200ms lease without anything being wrong with the
+    // worker, which fails this for a reason it is not testing. Longer lease, same
+    // beat-to-lease ratio, same number of lifetimes slept.
     const worker = Worker.sqlite(dbPath, {
       pollIntervalMs: 20,
       concurrency: 4,
-      leaseMs: 200,
-      heartbeatIntervalMs: 40,
+      leaseMs: 1_000,
+      heartbeatIntervalMs: 200,
     });
 
     worker.task("slow", { batch: 4 }, async (items) => {
-      await sleep(600); // three lease lifetimes
+      await sleep(3_000); // three lease lifetimes
       expect(items.some((i) => i.lostLease)).toBe(false);
     });
 
@@ -282,16 +287,18 @@ describe("batch delivery", () => {
   it("stops heartbeating a task the handler already settled", async () => {
     // Renewing a lease on a terminal row is a write against something nobody
     // owns; the beat has to drop tasks the handler already finished.
+    // Same margin reasoning as the case above: what is under test is which
+    // tasks a beat covers, not whether a beat lands inside 200ms on a busy host.
     const worker = Worker.sqlite(dbPath, {
       pollIntervalMs: 20,
       concurrency: 4,
-      leaseMs: 200,
-      heartbeatIntervalMs: 40,
+      leaseMs: 1_000,
+      heartbeatIntervalMs: 200,
     });
 
     worker.task("half", { batch: 4 }, async (items) => {
       await items[0].succeed({ early: true });
-      await sleep(300); // several beats, with one task already terminal
+      await sleep(1_500); // several beats, with one task already terminal
     });
 
     const ids = await submitMany("half", 2, () => ({}));

@@ -4,6 +4,8 @@ in TS and simply missing here."""
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from cairnq import CairnQ, Worker
@@ -44,5 +46,10 @@ async def test_purge_is_available_on_the_client(client, db_path):
     await store.succeed(task_id=t.id, worker_id="w1", result={"ok": True})
 
     assert await client.purge(older_than_ms=3_600_000) == []
+    # purge's cutoff is strict (`completed_at_ms < :before_ms`), so a task that
+    # finished in the CURRENT millisecond is not yet "older than 0ms ago". On a
+    # fast machine the succeed above lands in the same millisecond as the purge
+    # below; one tick of the clock is what the assertion is actually waiting for.
+    await asyncio.sleep(0.005)
     assert await client.purge(older_than_ms=0) == [t.id]
     assert await client.get(t.id) is None
