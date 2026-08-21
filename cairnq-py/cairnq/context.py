@@ -204,6 +204,46 @@ class TaskContext:
         self._mark_settled()
         return task
 
+    async def succeed_in(
+        self, write: Callable[[Any], Awaitable[Any]]
+    ) -> Task | None:
+        """Finalize this task as succeeded, committing the caller's own writes in
+        the SAME transaction as the settlement. Whatever `write` returns becomes
+        the task's result.
+
+            async def handler(ctx, payload):
+                rendered = await render(payload)
+                return await ctx.succeed_in(
+                    lambda session: write_pages(session, rendered)
+                )
+
+        The alternative — write the rows, then settle — has a window between the
+        two commits where the work is durable but the task still reads as
+        running. A crash there re-runs the whole task, which for a render or an
+        ingest means recomputing it, and for non-idempotent work means doing it
+        twice.
+
+        `session` is the driver's, so this needs a Postgres store built on a
+        PgExecutor the application shares with its own driver; anything else
+        raises NotImplementedError. If the settlement finds the lease gone,
+        `write`'s work is rolled back with it and LostLease is raised. Returns
+        None if this task was already settled.
+
+        Mirrors `succeedIn` in the TypeScript SDK.
+        """
+        if self._settled:
+            return None
+
+        async def settle() -> Task:
+            task, _ = await self._store.complete_in(
+                task_id=self._task.id, worker_id=self._worker_id, write=write
+            )
+            return task
+
+        task = await self._owned(settle)
+        self._mark_settled()
+        return task
+
     async def fail(
         self, error: Any = "task failed", *, retryable: bool = True
     ) -> Task | None:

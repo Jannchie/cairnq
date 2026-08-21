@@ -14,12 +14,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from functools import lru_cache
 from typing import Any
 
+from ..errors import SchemaMismatch
 from .._sql import load_migrations, load_statements
-from .base import COMMENT, NAMED, Fetch, TaskStore, check_protocol_version, statement_params
+from .pg_executor import ListenUnavailable, PgExecutor, PgSession
+from .pg_pool import check_schema_name, create_pool_executor
+from .base import (
+    COMMENT,
+    NAMED,
+    Fetch,
+    TaskStore,
+    WatchSignal,
+    check_protocol_version,
+    statement_params,
+)
 
 # Notification channels, emitted by the 0003_notify trigger.
 QUEUED_CHANNEL = "cairnq_queued"
@@ -59,18 +70,27 @@ def to_positional(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
 
 
 class PostgresStore(TaskStore):
-    def __init__(self, dsn: str, *, min_size: int = 1, max_size: int = 10):
-        try:
-            import asyncpg
-        except ImportError as e:  # pragma: no cover - import guard
-            raise RuntimeError(
-                "PostgresStore requires asyncpg — install cairnq[postgres]"
-            ) from e
-        self._asyncpg = asyncpg
-        self._dsn = dsn
+    def __init__(
+        self,
+        source: str | PgExecutor,
+        *,
+        min_size: int = 1,
+        max_size: int = 10,
+        schema: str | None = None,
+    ):
+        """`source` is either a libpq connection string — this store then owns an
+        asyncpg pool and requires the optional asyncpg package — or a PgExecutor
+        the caller already has, which this store uses and never closes."""
+        if schema is not None:
+            check_schema_name(schema)
+        self._dsn = source if isinstance(source, str) else None
+        # The caller's executor, if one was injected — never closed by this store.
+        self._provided: PgExecutor | None = None if isinstance(source, str) else source
+        # Set once migrations have run and the protocol version checked out.
+        self._executor: PgExecutor | None = None
         self._min_size = min_size
         self._max_size = max_size
-        self._pool: Any = None
+        self._schema = schema
         self._init_lock = asyncio.Lock()
         self._sql = load_statements("postgres")
         # LISTEN/NOTIFY state. One dedicated connection listens on both channels
@@ -94,27 +114,40 @@ class PostgresStore(TaskStore):
         self._pending_queues: set[str] = set()
         self._queued_event = asyncio.Event()
         self._done_waiters: dict[str, set[asyncio.Event]] = {}
+        # watch() subscribers. Separate from the wake events: a waiter is
+        # one-shot and consumes the notification, a subscriber is standing and
+        # only observes.
+        self._subscribers: set[Callable[[WatchSignal], None]] = set()
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
-        if self._pool is not None:
+        if self._executor is not None:
             return
-        # The lock makes concurrent first-touch operations share one pool instead
-        # of each racing to create its own (double-check after acquiring).
+        # The lock makes concurrent first-touch operations share one executor
+        # instead of each racing to create its own (double-check after acquiring).
         async with self._init_lock:
-            if self._pool is not None:
+            if self._executor is not None:
                 return
-            pool = await self._asyncpg.create_pool(
-                self._dsn, min_size=self._min_size, max_size=self._max_size
+            executor = self._provided or await create_pool_executor(
+                self._dsn or "",
+                min_size=self._min_size,
+                max_size=self._max_size,
+                schema=self._schema,
             )
             try:
-                async with pool.acquire() as conn:
-                    await self._apply_migrations(conn)
-                    check_protocol_version(await self._read_protocol_version(conn))
+                # Before migrations, which would otherwise create the very
+                # installation this is trying to warn about.
+                await self._check_schema(executor)
+                await self._apply_migrations(executor)
+                check_protocol_version(await self._read_protocol_version(executor))
             except BaseException:
-                await pool.close()  # never leak a pool when connect fails
+                # Never leak an executor we created; never close one we were handed.
+                if self._provided is None:
+                    with contextlib.suppress(Exception):
+                        await executor.close()
                 raise
-            self._pool = pool  # publish only a fully-migrated, version-checked pool
+            # Publish only a fully-migrated, version-checked executor.
+            self._executor = executor
             # Warm the LISTEN connection in the background so the first idle
             # sleep is already wakeable. Fire-and-forget: failure means polling.
             self._listener_ready()
@@ -123,42 +156,99 @@ class PostgresStore(TaskStore):
         # about to refuse to speak to.
         self._start_retention()
 
-    async def _apply_migrations(self, conn: Any) -> None:
-        await conn.execute(
+    async def _check_schema(self, session: PgSession) -> None:
+        """Refuse a connection pointed somewhere other than the deployment's
+        cairnq. The TypeScript SDK applies the same rule; see installations.sql
+        for why looking outside the connection's own search_path is the only way
+        to see this.
+
+        Two shapes, because ``schema`` means "the schema cairnq's tables live in"
+        and cairnq can either arrange that or only check it:
+
+        - ``schema`` given -> assert the connection actually resolves there.
+        - ``schema`` omitted -> the dangerous case is being about to create a
+          SECOND installation while one already exists elsewhere in this
+          database, which is exactly what a mismatched pair of SDKs does.
+          Joining an existing installation is fine no matter what else is
+          around, so this fires only when this schema has no cairnq and some
+          other schema does.
+
+        That narrowness is what keeps it from crying wolf. Two applications each
+        running their own cairnq in their own schema are legitimate; the second
+        one to be set up trips this once, and naming ``schema`` explicitly —
+        which such a deployment should be doing anyway — is both the fix and the
+        confirmation.
+        """
+        rows = await session.query(self._sql["installations"], [])
+        row = dict(rows[0]) if rows else {}
+        current = row.get("current_schema")
+        installations = list(row.get("installations") or [])
+
+        if self._schema is not None:
+            if current != self._schema:
+                raise SchemaMismatch(
+                    f"cairnq is configured for schema {self._schema!r} but this "
+                    f"connection resolves to {current!r} — check the connection's "
+                    "search_path"
+                )
+            return
+        # A search_path naming nothing that exists: there is no "here" to compare
+        # against, and the migrations are about to fail with a clearer message.
+        if current is None:
+            return
+        if not installations or current in installations:
+            return
+
+        found = ", ".join(repr(s) for s in installations)
+        raise SchemaMismatch(
+            f"cairnq tables already exist in schema {found} of this database, but "
+            f"this connection resolves to {current!r}, where there are none. "
+            "Connecting would create a second, parallel installation that the "
+            "other one can never see — an API and a worker split this way agree "
+            "about everything except where, and no task crosses. Point this "
+            "process at the same schema (schema=..., or options=-c "
+            "search_path=... in the DSN), or pass schema= explicitly to confirm "
+            "a separate installation is what you meant."
+        )
+
+    async def _apply_migrations(self, executor: PgExecutor) -> None:
+        await executor.execute(
             "create table if not exists cairnq_migrations "
             "(name text primary key, applied_at_ms bigint not null)"
         )
         for name, sql in load_migrations("postgres"):
-            # Check and apply inside one transaction, with the row lock taken up
-            # front: two processes cold-starting together would otherwise both see
-            # a migration as unapplied and both run it.
-            async with conn.transaction():
-                await conn.execute("lock table cairnq_migrations in exclusive mode")
-                already = await conn.fetchval(
-                    "select 1 from cairnq_migrations where name = $1", name
+            # Check and apply inside one transaction, with the table lock taken
+            # up front: two processes cold-starting together would otherwise both
+            # see a migration as unapplied and both run it.
+            async with executor.transaction() as session:
+                await session.execute("lock table cairnq_migrations in exclusive mode")
+                already = await session.query(
+                    "select 1 from cairnq_migrations where name = $1", [name]
                 )
-                if already is None:
-                    await conn.execute(sql)  # multi-statement DDL
-                    await conn.execute(
+                if not already:
+                    await session.execute(sql)  # multi-statement DDL
+                    await session.query(
                         "insert into cairnq_migrations (name, applied_at_ms) values "
                         "($1, (extract(epoch from now()) * 1000)::bigint)",
-                        name,
+                        [name],
                     )
 
     async def close(self) -> None:
         self._listener_unavailable = True  # no revival after close
-        conn, self._listener = self._listener, None
-        if conn is not None:
+        stop, self._listener = self._listener, None
+        if stop is not None:
             with contextlib.suppress(Exception):
-                await conn.close()
+                stop()
         if self._listener_connecting is not None:
             self._listener_connecting.cancel()
             with contextlib.suppress(BaseException):
                 await self._listener_connecting
         self._release_waiters()
-        if self._pool is not None:
-            pool, self._pool = self._pool, None
-            await pool.close()
+        executor, self._executor = self._executor, None
+        # An injected executor belongs to the caller, whose other work would not
+        # survive cairnq closing it.
+        if executor is not None and self._provided is None:
+            await executor.close()
 
     # ----------------------------------------------------------- wake channel
     async def claim_wake(self, queues: list[str], timeout_ms: int) -> None:
@@ -215,13 +305,28 @@ class PostgresStore(TaskStore):
 
     async def _start_listener(self) -> None:
         try:
+            executor = self._executor or self._provided
+            # Not connected yet: transient by definition — connect() calls back in.
+            if executor is None:
+                return
+            if getattr(executor, "listen", None) is None:
+                self._listener_unavailable = True  # this executor will never push
+                return
             try:
-                # Built from the raw DSN: if pool options ever grow connection-
-                # level settings (ssl, application_name), the listener must get
-                # them too.
-                conn = await self._asyncpg.connect(self._dsn)
+                stop = await executor.listen(
+                    (QUEUED_CHANNEL, DONE_CHANNEL),
+                    self._on_notification,
+                    # A dropped listener degrades to polling; the next wake
+                    # reconnects.
+                    self._on_listener_lost,
+                )
+            except ListenUnavailable:
+                # Deterministic (e.g. a transaction-mode pooler): off for good
+                # rather than a reconnect loop that cannot succeed.
+                self._listener_unavailable = True
+                return
             except Exception:
-                # Could not even connect — transient. Schedule a backed-off
+                # Could not establish it — transient. Schedule a backed-off
                 # retry; polling covers the gap.
                 self._listener_retry_at = (
                     asyncio.get_running_loop().time() + self._listener_backoff_ms / 1000
@@ -230,35 +335,36 @@ class PostgresStore(TaskStore):
                     LISTENER_RETRY_MAX_MS, self._listener_backoff_ms * 2
                 )
                 return
-            try:
-                await conn.add_listener(QUEUED_CHANNEL, self._on_notification)
-                await conn.add_listener(DONE_CHANNEL, self._on_notification)
-                conn.add_termination_listener(self._on_listener_lost)
-            except Exception:
-                # Connected, but LISTEN was refused (e.g. a transaction-mode
-                # pooler) — deterministic, so off for good. Polling covers it.
-                self._listener_unavailable = True
-                with contextlib.suppress(Exception):
-                    await conn.close()
-                return
             if self._listener_unavailable:
                 with contextlib.suppress(Exception):
-                    await conn.close()  # closed while we were connecting
+                    stop()  # closed while we were subscribing
                 return
-            self._listener = conn
+            self._listener = stop
             self._listener_backoff_ms = LISTENER_RETRY_MS
         finally:
             self._listener_connecting = None
 
-    def _on_notification(self, _conn: Any, _pid: int, channel: str, payload: str) -> None:
-        if channel == QUEUED_CHANNEL:
+    def _on_notification(self, channel: str, payload: str | None) -> None:
+        if channel == QUEUED_CHANNEL and payload:
             self._pending_queues.add(payload)
             self._queued_event.set()
-        elif channel == DONE_CHANNEL:
+            self._publish(WatchSignal(reason="queued", queue=payload))
+        elif channel == DONE_CHANNEL and payload:
             for event in self._done_waiters.get(payload, ()):
                 event.set()
+            self._publish(WatchSignal(reason="done", task_id=payload))
 
-    def _on_listener_lost(self, _conn: Any) -> None:
+    def _publish(self, signal: WatchSignal) -> None:
+        """Hand a notification to every watch() subscriber. A raising subscriber
+        is its own problem: it must not cost the others their signal, nor take
+        down the listener connection that delivered it."""
+        for subscriber in list(self._subscribers):
+            try:
+                subscriber(signal)
+            except Exception:
+                pass  # deliberately swallowed — see above
+
+    def _on_listener_lost(self) -> None:
         # A dropped listener degrades to polling; the next wake call reconnects.
         self._listener = None
         self._release_waiters()
@@ -270,36 +376,57 @@ class PostgresStore(TaskStore):
             for event in waiters:
                 event.set()
 
-    async def _read_protocol_version(self, conn: Any) -> int:
-        # Takes an explicit conn: during connect the pool is not published yet,
-        # so this cannot go through _fetch. The statement binds nothing, so it
-        # runs as-is.
-        row = await conn.fetchrow(self._sql["protocol_version"])
-        return int(row["value"]) if row else 0
+    async def _read_protocol_version(self, session: PgSession) -> int:
+        # Takes an explicit session: during connect the executor is not published
+        # yet, so this cannot go through _fetch. The statement binds nothing.
+        rows = await session.query(self._sql["protocol_version"], [])
+        return int(dict(rows[0])["value"]) if rows else 0
 
     async def protocol_version(self) -> int:
         await self._ensure()
-        async with self._pool.acquire() as conn:
-            return await self._read_protocol_version(conn)
+        assert self._executor is not None
+        return await self._read_protocol_version(self._executor)
 
     async def _ensure(self) -> None:
-        if self._pool is None:
+        if self._executor is None:
             await self.connect()
 
     # ----------------------------------------------------------- dialect seam
     async def _fetch(self, name: str, params: dict[str, Any]) -> list[Any]:
         await self._ensure()
+        assert self._executor is not None
         text, values = to_positional(self._sql[name], params)
-        async with self._pool.acquire() as conn:
-            return await conn.fetch(text, *values)
+        return await self._executor.query(text, values)
+
+    def _bound_fetch(self, session: PgSession) -> Fetch:
+        """A Fetch that runs the protocol's statements on one particular session."""
+
+        async def fetch(name: str, params: dict[str, Any]) -> list[Any]:
+            text, values = to_positional(self._sql[name], params)
+            return await session.query(text, values)
+
+        return fetch
 
     @contextlib.asynccontextmanager
     async def _transaction(self) -> AsyncIterator[Fetch]:
         await self._ensure()
-        async with self._pool.acquire() as conn, conn.transaction():
+        assert self._executor is not None
+        async with self._executor.transaction() as session:
+            yield self._bound_fetch(session)
 
-            async def fetch(name: str, params: dict[str, Any]) -> list[Any]:
-                text, values = to_positional(self._sql[name], params)
-                return await conn.fetch(text, *values)
+    @contextlib.asynccontextmanager
+    async def _transaction_with_session(self) -> AsyncIterator[tuple[Fetch, Any]]:
+        await self._ensure()
+        assert self._executor is not None
+        async with self._executor.transaction() as session:
+            yield self._bound_fetch(session), session
 
-            yield fetch
+    # ------------------------------------------------------------ push seams
+    def _subscribe_push(self, on_signal: Callable[[WatchSignal], None]) -> Callable[[], None]:
+        self._subscribers.add(on_signal)
+        self._listener_ready()  # an API-side watcher is often the only thing asking
+        return lambda: self._subscribers.discard(on_signal)
+
+    def _warm_push(self) -> None:
+        if self._subscribers:
+            self._listener_ready()

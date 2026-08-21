@@ -32,6 +32,7 @@ from .errors import (
 )
 from .models import Task, TaskDef, task_name
 from .store.base import TaskStore
+from .store.pg_executor import PgExecutor
 from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
 
@@ -374,19 +375,24 @@ class Worker:
     @classmethod
     def postgres(
         cls,
-        dsn: str,
+        source: str | PgExecutor,
         *,
         queues: list[str] | tuple[str, ...] = ("default",),
         concurrency: int = 1,
         lease_ms: int = 30_000,
         min_size: int = 1,
         max_size: int = 10,
+        schema: str | None = None,
         **kwargs: Any,
     ) -> "Worker":
-        """Multi-host backend. `dsn` is a libpq connection string; requires the
-        optional asyncpg package (install cairnq[postgres])."""
+        """Multi-host backend. `source` is a libpq connection string — which
+        requires the optional asyncpg package (install cairnq[postgres]) — or a
+        PgExecutor over a driver the application already runs.
+
+        `schema` is the schema cairnq's tables live in, and must match every
+        other process in the deployment — see CairnQ.postgres."""
         worker = cls(
-            PostgresStore(dsn, min_size=min_size, max_size=max_size),
+            PostgresStore(source, min_size=min_size, max_size=max_size, schema=schema),
             queues,
             concurrency=concurrency,
             lease_ms=lease_ms,

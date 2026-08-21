@@ -18,6 +18,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from contextlib import AbstractAsyncContextManager
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, get_args
@@ -155,6 +156,28 @@ def statement_params(sql: str) -> tuple[str, ...]:
 ClaimDraw = Callable[[list[str] | None, int], Awaitable[list[Task]]]
 
 
+@dataclass(frozen=True, slots=True)
+class WatchSignal:
+    """Why `watch` is calling back.
+
+    ``queued`` / ``done`` come from the store's push channel and name what
+    moved; ``poll`` is the timer saying the watch cannot rule out a change. None
+    of them carries state — the row is the truth.
+    """
+
+    reason: Literal["queued", "done", "poll"]
+    #: The queue a task was queued on. Only on ``queued``.
+    queue: str | None = None
+    #: The task that reached a terminal status. Only on ``done``.
+    task_id: str | None = None
+
+
+#: How often `watch` signals in the absence of a push channel — and, where there
+#: is one, how long a dropped listener can go unnoticed. The default trades a
+#: dashboard's idle query rate against how stale it may look.
+DEFAULT_WATCH_POLL_MS = 2_000
+
+
 class TaskStore(ABC):
     #: Set by use_backpressure; None means submit is ungated.
     _gate: QueueDepthGate | None = None
@@ -216,6 +239,20 @@ class TaskStore(ABC):
     @abstractmethod
     def _transaction(self) -> AbstractAsyncContextManager[Fetch]:
         """Run several statements atomically; yields a Fetch bound to the txn."""
+
+    def _subscribe_push(
+        self, on_signal: Callable[[WatchSignal], None]
+    ) -> Callable[[], None] | None:
+        """Register for this store's push channel, if it has one; returns an
+        unsubscribe. A store without a push channel returns None and `watch`
+        degrades to its timer alone."""
+        return None
+
+    def _warm_push(self) -> None:
+        """Nudge the push channel back up if it has dropped. Called from
+        `watch`'s timer, which is the only thing keeping a client-side
+        subscriber alive: a process that never claims never calls claim_wake, so
+        without this a listener that died once would never come back there."""
 
     async def _has_claimable_work(self, params: dict[str, Any]) -> bool:
         """Whether it is worth opening the claim transaction at all. SQLite gates
@@ -443,6 +480,70 @@ class TaskStore(ABC):
             per[row["status"]] = int(row["count"])
         return out
 
+    def watch(
+        self,
+        on_signal: Callable[[WatchSignal], None],
+        *,
+        queues: list[str] | tuple[str, ...] | None = None,
+        poll_ms: int = DEFAULT_WATCH_POLL_MS,
+    ) -> Callable[[], None]:
+        """Call `on_signal` when the tasks on `queues` may have changed —
+        something was queued, or something finished.
+
+        This is notify-ACCELERATED POLLING, not an event log, and the difference
+        is the whole contract. Where a push channel is available (Postgres
+        LISTEN) an idle watch costs nothing and a signal arrives within
+        milliseconds of the event. Where it is not — a transaction-mode pooler
+        refuses LISTEN, SQLite has no channel at all — the timer alone still
+        delivers ``poll`` signals, so a consumer that re-reads on every signal is
+        correct in both cases and merely less prompt in one.
+
+        What it will NOT do is promise that a signal means something happened, or
+        that every event produces its own signal. Treat a signal as "re-read now"
+        and take the truth from `stats` / `list` / `get`, which is where it
+        lives. ``reason`` is a hint for reading less: a ``done`` signal names the
+        task, so a dashboard can refresh that row instead of the list.
+
+        Returns an unsubscribe. Mirrors `watch` in the TypeScript SDK.
+        """
+        interval = max(1, poll_ms) / 1000
+        wanted = set(queues) if queues else None
+        live = True
+
+        def emit(signal: WatchSignal) -> None:
+            # A signal delivered after unsubscribe would have the consumer
+            # re-reading a store it has stopped caring about, possibly a closed
+            # one.
+            if live:
+                on_signal(signal)
+
+        def filtered(signal: WatchSignal) -> None:
+            # A queued signal names its queue, so a watch scoped to some queues
+            # can drop the rest. A done signal names only the task — which queue
+            # it was on is not in the notification, so it is never filtered out.
+            if signal.reason == "queued" and wanted is not None and signal.queue not in wanted:
+                return
+            emit(signal)
+
+        unsubscribe = self._subscribe_push(filtered)
+
+        async def tick() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                self._warm_push()
+                emit(WatchSignal(reason="poll"))
+
+        timer = asyncio.get_running_loop().create_task(tick())
+
+        def stop() -> None:
+            nonlocal live
+            live = False
+            if unsubscribe is not None:
+                unsubscribe()
+            timer.cancel()
+
+        return stop
+
     async def queue_depth(self, queue: str, max_depth: int) -> int:
         """How many more tasks fit on `queue` under `max_depth` — 0 once it is
         full.
@@ -621,6 +722,72 @@ class TaskStore(ABC):
                 "result": None if result is None else dump_json(result),
             },
         )
+
+    def _transaction_with_session(
+        self,
+    ) -> AbstractAsyncContextManager[tuple[Fetch, Any]]:
+        """`_transaction`, but also handing out the driver's own session so the
+        CALLER can run their statements in the same transaction as the
+        protocol's.
+
+        This is what lets a task's settlement and the rows that task produced
+        commit together. Without it the two are separate transactions and there
+        is a window where the work is durable but the task still reads as
+        unfinished — a crash there costs a full recomputation on retry, and for
+        non-idempotent work costs more than that.
+
+        Optional, because the session type is the driver's, not the protocol's: a
+        store with no session worth handing out does not implement it and
+        `complete_in` reports that. Postgres implements it; SQLite does not.
+        """
+        raise NotImplementedError
+
+    async def complete_in(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        write: Callable[[Any], Awaitable[Any]],
+    ) -> tuple[Task, Any]:
+        """`complete`, with the caller's own writes committed in the same
+        transaction.
+
+        `write` runs first and whatever it returns becomes the task's result; the
+        settlement is the last statement in the transaction. So a lost lease —
+        the settlement matching no row — rolls the caller's writes back with it,
+        and there is no ordering in which the work is recorded but the task is
+        not.
+
+        The settlement runs LAST rather than checking ownership up front on
+        purpose: the ownership predicate lives in the protocol's complete.sql,
+        and a fail-fast pre-check here would be a second copy of it, free to
+        drift. The cost of that choice is that a doomed attempt does its work
+        before finding out, which is the rare path.
+        """
+        try:
+            ctx = self._transaction_with_session()
+        except NotImplementedError:
+            ctx = None
+        if ctx is None:
+            raise NotImplementedError(
+                "this store cannot share a transaction with the caller — "
+                "complete_in requires a Postgres store (see PgExecutor)"
+            )
+        async with ctx as (fetch, session):
+            value = await write(session)
+            rows = await fetch(
+                "complete",
+                {
+                    "id": task_id,
+                    "worker_id": worker_id,
+                    "result": None if value is None else dump_json(value),
+                },
+            )
+            # Rolls back `write`'s writes along with the settlement that did not
+            # land.
+            if not rows:
+                raise LostLease(task_id)
+            return Task.from_row(rows[0]), value
 
     async def fail(
         self,

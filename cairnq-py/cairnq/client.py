@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from ._wait import (
@@ -17,7 +18,8 @@ from .backpressure import (
 from .errors import TaskCanceled, TaskFailed
 from .models import Task, TaskDef, TaskRef, TaskStatus, task_name
 from .retention import Retention, RetentionSweeper
-from .store.base import Conflict, TaskStore
+from .store.pg_executor import PgExecutor
+from .store.base import DEFAULT_WATCH_POLL_MS, Conflict, TaskStore, WatchSignal
 from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
 
@@ -62,11 +64,27 @@ class CairnQ:
 
     @classmethod
     def postgres(
-        cls, dsn: str, *, min_size: int = 1, max_size: int = 10, **kwargs: Any
+        cls,
+        source: str | PgExecutor,
+        *,
+        min_size: int = 1,
+        max_size: int = 10,
+        schema: str | None = None,
+        **kwargs: Any,
     ) -> "CairnQ":
-        """Multi-host backend. `dsn` is a libpq connection string; requires the
-        optional asyncpg package (install cairnq[postgres])."""
-        return cls(PostgresStore(dsn, min_size=min_size, max_size=max_size), **kwargs)
+        """Multi-host backend. `source` is a libpq connection string — which
+        requires the optional asyncpg package (install cairnq[postgres]) — or a
+        PgExecutor over a driver the application already runs, which cairnq then
+        shares instead of opening a second pool.
+
+        `schema` is the schema cairnq's tables live in: it is created if absent
+        and set as the connection's search_path. Every process in a deployment
+        must agree on it — the TypeScript SDK takes the same option, and both
+        refuse to connect where they can see the two ends have diverged."""
+        return cls(
+            PostgresStore(source, min_size=min_size, max_size=max_size, schema=schema),
+            **kwargs,
+        )
 
     @property
     def store(self) -> TaskStore:
@@ -189,6 +207,23 @@ class CairnQ:
         """Task counts per queue, keyed by status and zero-filled across all
         statuses — `stats()["default"]["queued"]` is the backlog of a queue."""
         return await self._store.stats()
+
+    def watch(
+        self,
+        on_signal: Callable[[WatchSignal], None],
+        *,
+        queues: list[str] | tuple[str, ...] | None = None,
+        poll_ms: int = DEFAULT_WATCH_POLL_MS,
+    ) -> Callable[[], None]:
+        """Call `on_signal` when the tasks on `queues` may have changed. Returns
+        an unsubscribe.
+
+        Notify-accelerated polling, not an event log: a signal means "re-read
+        now", and `stats` / `list` / `get` are where the truth is. On Postgres an
+        idle watch costs nothing and signals land in milliseconds; everywhere
+        else the timer alone still delivers, so the same consumer code is correct
+        either way. See TaskStore.watch for the full contract."""
+        return self._store.watch(on_signal, queues=queues, poll_ms=poll_ms)
 
     async def queue_depth(self, queue: str, max_depth: int) -> int:
         """How many more tasks fit on `queue` under `max_depth` — 0 once it is

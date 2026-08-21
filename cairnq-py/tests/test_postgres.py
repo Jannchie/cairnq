@@ -60,48 +60,48 @@ def test_memoized_translation_still_binds_per_call_values():
 
 # ------------------------------------------------------- listener resilience
 # The LISTEN connection is an accelerator: losing it degrades to polling. These
-# pin the retry policy — a failure to even connect is transient and retried
-# with backoff; a server that accepts the connection but refuses LISTEN (e.g. a
-# transaction-mode pooler) is deterministic and disables the channel for good.
+# pin the retry POLICY, which lives in the store — a failure to even establish
+# the subscription is transient and retried with backoff; a server that accepts
+# the connection but refuses LISTEN (e.g. a transaction-mode pooler) reports
+# ListenUnavailable and the channel is off for good. Which connection actually
+# carries it is the executor's business, so these drive the executor seam rather
+# than asyncpg.
 
 
-def _fresh_store():
+def _store_listening(listen):
+    """A store over an executor whose only real method is `listen`."""
     pytest.importorskip("asyncpg")
     from cairnq.store.postgres import PostgresStore
 
-    return PostgresStore("postgresql://localhost:1/never-connected")
+    class Executor:
+        async def query(self, text, values):
+            return []
 
+        async def execute(self, sql):
+            pass
 
-def _patch_connect(store, connect):
-    """Swap the store's asyncpg module for a stub whose connect is `connect`."""
-    store._asyncpg = type("FakeAsyncpg", (), {"connect": staticmethod(connect)})
+        def transaction(self):
+            raise AssertionError("not used by these tests")
 
+        async def close(self):
+            pass
 
-class _AcceptingConn:
-    """The minimal surface _start_listener touches on a healthy connection."""
-
-    def __init__(self):
-        self.closed = False
-
-    async def add_listener(self, _channel, _cb):
-        pass
-
-    def add_termination_listener(self, _cb):
-        pass
-
-    async def close(self):
-        self.closed = True
+    executor = Executor()
+    executor.listen = listen
+    store = PostgresStore(executor)
+    # The listener policy runs off `_provided` before connect() publishes an
+    # executor, which is what lets these skip the migration round trip.
+    return store
 
 
 async def test_listener_connect_failure_is_transient_and_backed_off():
-    store = _fresh_store()
     calls = {"n": 0}
 
-    async def refused(_dsn):
+    async def refused(_channels, _on_notify, _on_close):
         calls["n"] += 1
         raise OSError("connection refused")
 
-    _patch_connect(store, refused)
+    store = _store_listening(refused)
     assert store._listener_ready() is False
     await store._listener_connecting
     assert calls["n"] == 1
@@ -122,37 +122,33 @@ async def test_listener_connect_failure_is_transient_and_backed_off():
 
 
 async def test_listener_refused_listen_is_permanent():
-    store = _fresh_store()
+    from cairnq.store.pg_executor import ListenUnavailable
 
-    class RefusingConn(_AcceptingConn):
-        async def add_listener(self, _channel, _cb):
-            raise RuntimeError("LISTEN is not supported here")
+    calls = {"n": 0}
 
-    conn = RefusingConn()
+    async def refusing(_channels, _on_notify, _on_close):
+        calls["n"] += 1
+        raise ListenUnavailable("LISTEN is not supported here")
 
-    async def connect(_dsn):
-        return conn
-
-    _patch_connect(store, connect)
+    store = _store_listening(refusing)
     assert store._listener_ready() is False
     await store._listener_connecting
     assert store._listener_unavailable is True
-    assert conn.closed is True
     assert store._listener_ready() is False, "permanently off: no further attempts"
     assert store._listener_connecting is None
+    assert calls["n"] == 1
 
 
 async def test_listener_recovers_once_the_server_is_back():
-    store = _fresh_store()
-    conn = _AcceptingConn()
     state = {"up": False}
+    stopped = {"n": 0}
 
-    async def connect(_dsn):
+    async def connect(_channels, _on_notify, _on_close):
         if not state["up"]:
             raise OSError("connection refused")
-        return conn
+        return lambda: stopped.__setitem__("n", stopped["n"] + 1)
 
-    _patch_connect(store, connect)
+    store = _store_listening(connect)
     store._listener_ready()
     await store._listener_connecting  # first attempt fails, schedules a retry
 
@@ -160,9 +156,19 @@ async def test_listener_recovers_once_the_server_is_back():
     store._listener_retry_at = 0.0  # fast-forward past the backoff
     store._listener_ready()
     await store._listener_connecting
-    assert store._listener is conn
+    assert store._listener is not None
     assert store._listener_ready() is True
 
     from cairnq.store.postgres import LISTENER_RETRY_MS
 
     assert store._listener_backoff_ms == LISTENER_RETRY_MS, "backoff resets on success"
+
+
+async def test_an_executor_that_cannot_listen_is_off_for_good():
+    # Not every driver exposes a dedicated connection; the contract says such an
+    # executor costs latency, never correctness.
+    store = _store_listening(None)
+    del store._provided.listen
+    assert store._listener_ready() is False
+    await store._listener_connecting
+    assert store._listener_unavailable is True

@@ -111,5 +111,64 @@ async def long_job(ctx, payload):
 Same code, Postgres instead of the file — `CairnQ.postgres(dsn)` /
 `Worker.postgres(dsn)`. Install with `pip install cairnq[postgres]`.
 
+`schema` puts cairnq's tables in a schema of their own:
+`CairnQ.postgres(dsn, schema="cairnq")` creates it if absent and sets
+`search_path` on every connection. **Every process in a deployment must agree on
+it** — a queue whose API and worker resolve to different schemas is two empty
+queues, and both sides come up healthy. cairnq refuses to connect where it can
+see that about to happen; the TypeScript SDK takes the same option and applies
+the same rule.
+
+### Sharing the application's connection
+
+Given a `PgExecutor` instead of a DSN, cairnq runs inside a session the
+application already has — no second driver, no second pool:
+
+```python
+from cairnq import CairnQ, PgExecutor
+
+executor: PgExecutor = ...   # ~40 lines over your driver
+tasks = CairnQ.postgres(executor)
+```
+
+An adapter passes rows through as its driver produced them; cairnq normalizes
+what the drivers disagree about. An executor cairnq was handed is never closed
+by cairnq.
+
+That shared session is also what lets a task's settlement commit together with
+the rows the task produced:
+
+```python
+@worker.task("render.document")
+async def render_document(ctx, payload):
+    rendered = await render(payload)
+
+    async def write(session):
+        await session.query("insert into pages (doc, n) values ($1, $2)", [...])
+        return {"pages": len(rendered)}   # becomes the task's result
+
+    return await ctx.succeed_in(write)
+```
+
+Without it the two are separate transactions, and a crash between them leaves
+work durable while the task still reads as running — on retry, recomputed. If
+the lease turns out to be gone, the settlement matches no row and the caller's
+writes roll back with it.
+
+## Watching
+
+`watch` calls back when the tasks on a queue may have changed — for a dashboard
+that would otherwise poll:
+
+```python
+stop = tasks.watch(on_signal, queues=["render"])
+```
+
+It is notify-accelerated polling, not an event log. On Postgres an idle watch
+costs nothing and a signal lands within milliseconds; where LISTEN is
+unavailable — a transaction-mode pooler, or SQLite, which has no channel — the
+timer alone still delivers `poll` signals. Treat a signal as "re-read now"; the
+truth is in `stats()` / `list()` / `get()`.
+
 The protocol (schema + canonical SQL) lives in `../cairnq-protocol` and is shared
 verbatim with the TypeScript SDK. See `../cairnq-protocol/PROTOCOL.md`.

@@ -8,12 +8,16 @@ from importlib.metadata import version as _pkg_version
 from .backpressure import QueueDepthGate, QueueDepthLimit
 from .client import CairnQ
 from .context import TaskContext
+from .store.pg_executor import ListenUnavailable, PgExecutor, PgSession
+from .store.pg_pool import create_pool_executor
+from .store.base import DEFAULT_WATCH_POLL_MS, WatchSignal
 from .errors import (
     AlreadyExists,
     CairnQError,
     EventLoopBlocked,
     LostLease,
     ProtocolVersionMismatch,
+    SchemaMismatch,
     QueueFull,
     SerializationError,
     TaskCanceled,
@@ -60,5 +64,12 @@ __all__ = [
     "LostLease",
     "EventLoopBlocked",
     "ProtocolVersionMismatch",
+    "SchemaMismatch",
+    "create_pool_executor",
+    "ListenUnavailable",
+    "PgSession",
+    "PgExecutor",
+    "DEFAULT_WATCH_POLL_MS",
+    "WatchSignal",
     "SerializationError",
 ]
