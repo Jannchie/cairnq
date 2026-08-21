@@ -7,6 +7,8 @@ from collections import defaultdict
 
 import pytest
 
+from .conftest import FakeExecutor
+
 from cairnq._sql import load_statements
 from cairnq.store.postgres import positional_statement, to_positional
 
@@ -68,30 +70,18 @@ def test_memoized_translation_still_binds_per_call_values():
 # than asyncpg.
 
 
-def _store_listening(listen):
-    """A store over an executor whose only real method is `listen`."""
+def _store_listening(listen=None):
+    """A store over an executor whose only interesting method is `listen`.
+
+    Omitting `listen` builds an executor that has none, which is a real case:
+    not every driver exposes a connection to hold. The listener policy runs off
+    `_provided` before connect() publishes an executor, which is what lets these
+    skip the migration round trip.
+    """
     pytest.importorskip("asyncpg")
     from cairnq.store.postgres import PostgresStore
 
-    class Executor:
-        async def query(self, text, values):
-            return []
-
-        async def execute(self, sql):
-            pass
-
-        def transaction(self):
-            raise AssertionError("not used by these tests")
-
-        async def close(self):
-            pass
-
-    executor = Executor()
-    executor.listen = listen
-    store = PostgresStore(executor)
-    # The listener policy runs off `_provided` before connect() publishes an
-    # executor, which is what lets these skip the migration round trip.
-    return store
+    return PostgresStore(FakeExecutor(listen=listen))
 
 
 async def test_listener_connect_failure_is_transient_and_backed_off():
@@ -167,8 +157,7 @@ async def test_listener_recovers_once_the_server_is_back():
 async def test_an_executor_that_cannot_listen_is_off_for_good():
     # Not every driver exposes a dedicated connection; the contract says such an
     # executor costs latency, never correctness.
-    store = _store_listening(None)
-    del store._provided.listen
+    store = _store_listening()
     assert store._listener_ready() is False
     await store._listener_connecting
     assert store._listener_unavailable is True

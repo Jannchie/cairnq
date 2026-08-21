@@ -31,7 +31,7 @@ def members_of(cls: type) -> set[str]:
 
 
 def names(entries: list) -> list[str]:
-    return [e if isinstance(e, str) else e["member"] for e in entries]
+    return [e["member"] for e in entries]
 
 
 @pytest.mark.parametrize("cls_name", sorted(CLASSES))
@@ -59,13 +59,16 @@ def test_exemptions_still_describe_reality(cls_name: str):
 @pytest.mark.parametrize("cls_name", sorted(CLASSES))
 def test_declares_every_member_it_exposes(cls_name: str):
     declared = SURFACE["classes"][cls_name]
-    # `internal` exists for TypeScript, whose `private` is erased at runtime.
-    # Python needs no entries there, but honoring the list keeps one declaration
-    # serving both gates.
-    known = set(declared["shared"]) | set(declared["internal"]) | set(names(declared["only_py"]))
+    # `internal` is NOT honored here. It exists only because TypeScript's
+    # `private` is erased at runtime, so the Node gate cannot tell a private
+    # method from a public one on its own. Python marks its own with a leading
+    # underscore, which members_of already drops — and honoring the list anyway
+    # would turn it into an escape hatch that silences BOTH gates, which is
+    # exactly the load-bearing direction surface.json exists to keep loud.
+    known = set(declared["shared"]) | set(names(declared["only_py"]))
     undeclared = sorted(members_of(CLASSES[cls_name]) - known)
     assert not undeclared, (
         "add these to cairnq-protocol/surface.json — to `shared` (and implement "
-        f"them in cairnq-node), to `only_py` with a reason, or rename them with a "
+        "them in cairnq-node), to `only_py` with a reason, or rename them with a "
         f"leading underscore if they are internal: {undeclared}"
     )

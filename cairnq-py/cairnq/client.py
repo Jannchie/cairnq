@@ -77,10 +77,12 @@ class CairnQ:
         PgExecutor over a driver the application already runs, which cairnq then
         shares instead of opening a second pool.
 
-        `schema` is the schema cairnq's tables live in: it is created if absent
-        and set as the connection's search_path. Every process in a deployment
-        must agree on it — the TypeScript SDK takes the same option, and both
-        refuse to connect where they can see the two ends have diverged."""
+        `schema` is the schema cairnq's tables live in. Given a DSN, cairnq owns
+        the connection and arranges it: the schema is created if absent and set
+        as the search_path. Given an executor, the connection is yours and cairnq
+        only asserts that it resolves there. Every process in a deployment must
+        agree on it — the TypeScript SDK takes the same option, and both refuse
+        to connect where they can see the two ends have diverged."""
         return cls(
             PostgresStore(source, min_size=min_size, max_size=max_size, schema=schema),
             **kwargs,

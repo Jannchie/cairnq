@@ -360,6 +360,12 @@ class PostgresStore(TaskStore):
         """Hand a notification to every watch() subscriber. A raising subscriber
         is its own problem: it must not cost the others their signal, nor take
         down the listener connection that delivered it."""
+        # The common case is a worker with no watchers at all, and this runs on
+        # every notification the database delivers.
+        if not self._subscribers:
+            return
+        # Copied so a subscriber that unsubscribes from inside its own callback
+        # does not mutate the set being iterated.
         for subscriber in list(self._subscribers):
             try:
                 subscriber(signal)

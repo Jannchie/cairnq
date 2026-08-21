@@ -14,11 +14,16 @@ import { findProtocolRoot } from "../src/sql.js";
 // every member here is declared there — is the load-bearing one: it makes a
 // one-sided addition fail on the side that added it, while it is being added.
 
+interface Exemption {
+  member: string;
+  reason: string;
+}
+
 interface Declared {
   shared: string[];
   internal: string[];
-  only_node: ({ member: string; reason: string } | string)[];
-  only_py: ({ member: string; reason: string } | string)[];
+  only_node: Exemption[];
+  only_py: Exemption[];
 }
 
 const surface: { classes: Record<string, Declared> } = JSON.parse(
@@ -51,8 +56,8 @@ function membersOf(cls: new (...args: never[]) => unknown): string[] {
   return [...new Set([...own, ...statics])].map(canonical).sort();
 }
 
-function names(entries: Declared["only_node"]): string[] {
-  return entries.map((e) => (typeof e === "string" ? e : e.member));
+function names(entries: Exemption[]): string[] {
+  return entries.map((e) => e.member);
 }
 
 describe.each(Object.keys(CLASSES))("%s matches the declared surface", (cls) => {
@@ -101,7 +106,7 @@ describe("the declaration itself", () => {
           // A bare name would make the list a place to park gaps. The reason is
           // what turns it into a claim someone can disagree with in review.
           expect(typeof entry, `${cls}.${side}: entries need a reason`).toBe("object");
-          expect((entry as { reason: string }).reason.length).toBeGreaterThan(20);
+          expect(entry.reason.length).toBeGreaterThan(20);
         }
       }
     }

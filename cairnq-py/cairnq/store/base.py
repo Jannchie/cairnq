@@ -38,6 +38,7 @@ from ..errors import (
     LostLease,
     ProtocolVersionMismatch,
     SerializationError,
+    UnsupportedBackend,
     error_envelope,
 )
 from ..models import STATUSES, TERMINAL, Task, TaskRef, TaskStatus
@@ -531,7 +532,14 @@ class TaskStore(ABC):
             while True:
                 await asyncio.sleep(interval)
                 self._warm_push()
-                emit(WatchSignal(reason="poll"))
+                # Guarded for the same reason PostgresStore guards its push
+                # fan-out: a consumer that raises must not take the timer down
+                # with it. Losing the timer would silently retire the fallback
+                # that makes watch correct where there is no push channel.
+                try:
+                    emit(WatchSignal(reason="poll"))
+                except Exception:
+                    pass  # the consumer's problem, not the watch's
 
         timer = asyncio.get_running_loop().create_task(tick())
 
@@ -737,10 +745,11 @@ class TaskStore(ABC):
         non-idempotent work costs more than that.
 
         Optional, because the session type is the driver's, not the protocol's: a
-        store with no session worth handing out does not implement it and
-        `complete_in` reports that. Postgres implements it; SQLite does not.
+        store with no session worth handing out does not override it, and
+        `complete_in` detects that by identity rather than by calling it.
+        Postgres implements it; SQLite does not.
         """
-        raise NotImplementedError
+        raise UnsupportedBackend(f"{type(self).__name__} has no driver session to share")
 
     async def complete_in(
         self,
@@ -764,16 +773,17 @@ class TaskStore(ABC):
         drift. The cost of that choice is that a doomed attempt does its work
         before finding out, which is the rare path.
         """
-        try:
-            ctx = self._transaction_with_session()
-        except NotImplementedError:
-            ctx = None
-        if ctx is None:
-            raise NotImplementedError(
+        # Existence, not behavior: mirrors the TypeScript SDK's `if
+        # (!this.txWithSession)`. Catching NotImplementedError out of the call
+        # would also swallow one raised from INSIDE a real implementation and
+        # report it as "this backend cannot", which is a different and much more
+        # confusing failure.
+        if type(self)._transaction_with_session is TaskStore._transaction_with_session:
+            raise UnsupportedBackend(
                 "this store cannot share a transaction with the caller — "
                 "complete_in requires a Postgres store (see PgExecutor)"
             )
-        async with ctx as (fetch, session):
+        async with self._transaction_with_session() as (fetch, session):
             value = await write(session)
             rows = await fetch(
                 "complete",

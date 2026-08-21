@@ -235,6 +235,10 @@ Worker-side: `claim` (and its
 specializations), `heartbeat`, `heartbeat_batch`, `progress`, `complete`,
 `succeed`, `fail`.
 
+Connect-time, run by both SDKs before any of the above: `protocol_version` (the
+version guard) and `installations` (the schema guard — see "Schema" below).
+Neither is a state transition; both are reads the SDK makes on the way up.
+
 `stats` is the one aggregate read: task counts grouped by queue and status
 (`stats.sql`). SDKs zero-fill the statuses a queue has no rows in; a queue with
 no rows at all does not appear. Terminal tasks keep counting until `purge`

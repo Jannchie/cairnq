@@ -209,6 +209,21 @@ export class ProtocolVersionMismatch extends CairnQError {
 }
 
 /**
+ * This store cannot do what was asked, and no argument would change that — the
+ * capability belongs to the backend, not to the call.
+ *
+ * Thrown by `completeIn` on a store with no driver session to share (SQLite has
+ * none). A CairnQError rather than a bare Error so the same catch works across
+ * both SDKs; the Python SDK raises the same named error.
+ */
+export class UnsupportedBackend extends CairnQError {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnsupportedBackend";
+  }
+}
+
+/**
  * This connection is not pointed at the cairnq installation the rest of the
  * deployment is using — raised at connect, before any task is written.
  *

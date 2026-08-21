@@ -14,6 +14,7 @@ import pytest
 from cairnq import CairnQ, LostLease, WatchSignal
 from cairnq.context import TaskContext
 from cairnq.models import Task
+from .conftest import FakeExecutor
 
 pytest.importorskip("asyncpg")
 
@@ -33,62 +34,33 @@ def _row(status: str = "succeeded") -> dict:
     }
 
 
-class _Session:
-    """Answers the connect-path statements; records everything else."""
-
-    def __init__(self, calls: list, complete_matches: bool):
-        self.calls = calls
-        self._complete_matches = complete_matches
-
-    async def query(self, text: str, values) -> list:
-        if "current_schema()" in text:
-            return [{"current_schema": None, "schema": None}]
-        if "protocol_version" in text and "select" in text:
-            return [{"value": "1"}]
-        if "update cairnq_tasks" in text and "succeeded" in text:
-            self.calls.append("complete")
-            return [_row()] if self._complete_matches else []
-        self.calls.append("query")
-        return []
-
-    async def execute(self, sql: str) -> None:
-        self.calls.append("execute")
+def _executor(**kwargs) -> FakeExecutor:
+    return FakeExecutor(completed_row=_row(), **kwargs)
 
 
-class _Executor:
-    def __init__(self, complete_matches: bool = True, listen=None):
-        self.calls: list = []
-        self.rolled_back = False
-        self._session = _Session(self.calls, complete_matches)
-        if listen is not None:
-            self.listen = listen
+async def _pushing_store(): 
+    """A connected store over an executor whose LISTEN is under test control.
 
-    async def query(self, text: str, values) -> list:
-        return await self._session.query(text, values)
+    Returns the store and a `notify(channel, payload)` that fires what the
+    database would have. The subscription is established synchronously by
+    watch() -> _subscribe_push -> _listener_ready, so awaiting the task it
+    creates is deterministic — no sleeping on it.
+    """
+    captured: dict = {}
 
-    async def execute(self, sql: str) -> None:
-        await self._session.execute(sql)
+    async def listen(_channels, on_notify, _on_close):
+        captured["notify"] = on_notify
+        return lambda: None
 
-    def transaction(self):
-        executor = self
+    store = PostgresStore(_executor(listen=listen))
+    await store.connect()
+    return store, captured
 
-        class _Txn:
-            async def __aenter__(self):
-                executor.calls.append("BEGIN")
-                return executor._session
 
-            async def __aexit__(self, exc_type, exc, tb):
-                if exc_type is None:
-                    executor.calls.append("COMMIT")
-                else:
-                    executor.rolled_back = True
-                    executor.calls.append("ROLLBACK")
-                return False
-
-        return _Txn()
-
-    async def close(self) -> None:
-        pass
+async def _settled(store: PostgresStore):
+    """Await the in-flight LISTEN subscription, if watch() started one."""
+    if store._listener_connecting is not None:
+        await store._listener_connecting
 
 
 def _context(store: PostgresStore) -> TaskContext:
@@ -98,7 +70,7 @@ def _context(store: PostgresStore) -> TaskContext:
 # ------------------------------------------------------------- succeed_in
 
 async def test_commits_the_callers_writes_and_the_settlement_together():
-    executor = _Executor()
+    executor = _executor()
     store = PostgresStore(executor)
     await store.connect()
     executor.calls.clear()
@@ -117,7 +89,7 @@ async def test_commits_the_callers_writes_and_the_settlement_together():
 
 
 async def test_rolls_the_callers_writes_back_when_the_lease_was_gone():
-    executor = _Executor(complete_matches=False)
+    executor = _executor(complete_matches=False)
     store = PostgresStore(executor)
     await store.connect()
     executor.calls.clear()
@@ -135,7 +107,7 @@ async def test_rolls_the_callers_writes_back_when_the_lease_was_gone():
 
 
 async def test_does_not_settle_twice():
-    store = PostgresStore(_Executor())
+    store = PostgresStore(_executor())
     await store.connect()
     ctx = _context(store)
     assert await ctx.succeed_in(lambda _s: _none()) is not None
@@ -147,29 +119,21 @@ async def _none():
 
 
 async def test_a_sqlite_store_says_plainly_that_it_cannot_do_this(client):
-    with pytest.raises(NotImplementedError, match="cannot share a transaction"):
+    from cairnq import UnsupportedBackend
+
+    with pytest.raises(UnsupportedBackend, match="cannot share a transaction"):
         await client.store.complete_in(task_id="t1", worker_id="w1", write=lambda _s: _none())
 
 
 # ------------------------------------------------------------------ watch
 
 async def test_watch_delivers_queued_and_done_signals():
-    captured = {}
-
-    async def listen(channels, on_notify, on_close):
-        captured["notify"] = on_notify
-        return lambda: None
-
-    store = PostgresStore(_Executor(listen=listen))
-    await store.connect()
+    store, captured = await _pushing_store()
     seen: list[WatchSignal] = []
     # A poll interval far beyond the test, so anything observed came from push.
     stop = store.watch(seen.append, poll_ms=60_000)
     try:
-        for _ in range(50):
-            if "notify" in captured:
-                break
-            await asyncio.sleep(0.002)
+        await _settled(store)
         captured["notify"]("cairnq_queued", "render")
         captured["notify"]("cairnq_done", "task-7")
         assert seen == [
@@ -181,21 +145,11 @@ async def test_watch_delivers_queued_and_done_signals():
 
 
 async def test_watch_drops_queues_it_was_not_asked_about():
-    captured = {}
-
-    async def listen(channels, on_notify, on_close):
-        captured["notify"] = on_notify
-        return lambda: None
-
-    store = PostgresStore(_Executor(listen=listen))
-    await store.connect()
+    store, captured = await _pushing_store()
     seen: list[WatchSignal] = []
     stop = store.watch(seen.append, queues=["render"], poll_ms=60_000)
     try:
-        for _ in range(50):
-            if "notify" in captured:
-                break
-            await asyncio.sleep(0.002)
+        await _settled(store)
         captured["notify"]("cairnq_queued", "ingest")
         captured["notify"]("cairnq_queued", "render")
         # A done notification names only the task — which queue it was on is not
@@ -228,14 +182,7 @@ async def test_watch_keeps_signalling_where_there_is_no_push_channel(client):
 
 
 async def test_one_subscribers_exception_does_not_cost_the_others_their_signal():
-    captured = {}
-
-    async def listen(channels, on_notify, on_close):
-        captured["notify"] = on_notify
-        return lambda: None
-
-    store = PostgresStore(_Executor(listen=listen))
-    await store.connect()
+    store, captured = await _pushing_store()
     seen: list[WatchSignal] = []
 
     def boom(_signal):
@@ -244,10 +191,7 @@ async def test_one_subscribers_exception_does_not_cost_the_others_their_signal()
     stop_a = store.watch(boom, poll_ms=60_000)
     stop_b = store.watch(seen.append, poll_ms=60_000)
     try:
-        for _ in range(50):
-            if "notify" in captured:
-                break
-            await asyncio.sleep(0.002)
+        await _settled(store)
         captured["notify"]("cairnq_queued", "render")
         assert len(seen) == 1
     finally:

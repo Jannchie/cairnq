@@ -38,13 +38,13 @@ export interface TaskRef {
   status: TaskStatus;
 }
 
-const JSON_COLUMNS = ["payload", "result", "error", "metadata"] as const;
+export const JSON_COLUMNS = ["payload", "result", "error", "metadata"] as const;
 // The bigint columns. `attempt` / `max_attempts` / `priority` are int4 and
 // `progress` is double precision, so every driver already gives those as numbers;
 // only int8 has a wire form worth normalizing. Nullability differs per column
 // (completed_at_ms may be null, created_at_ms may not), so the coercion has to
 // preserve null rather than turn it into 0.
-const MS_COLUMNS = [
+export const MS_COLUMNS = [
   "lease_until_ms",
   "run_at_ms",
   "cancel_requested_at_ms",

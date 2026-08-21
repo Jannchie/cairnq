@@ -49,6 +49,7 @@ export {
   EventLoopBlocked,
   ProtocolVersionMismatch,
   SchemaMismatch,
+  UnsupportedBackend,
   SerializationError,
 } from "./errors.js";
 export type { FailReason } from "./errors.js";

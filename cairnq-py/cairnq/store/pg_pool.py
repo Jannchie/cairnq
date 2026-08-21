@@ -36,7 +36,9 @@ class _ConnSession:
         self._conn = conn
 
     async def query(self, text: str, values: Sequence[Any]) -> list[Any]:
-        return list(await self._conn.fetch(text, *values))
+        # asyncpg's fetch already returns a list; copying it would be a full
+        # shallow copy of every result set the SDK reads.
+        return await self._conn.fetch(text, *values)
 
     async def execute(self, sql: str) -> None:
         # No arguments: asyncpg sends this over the simple query protocol, which

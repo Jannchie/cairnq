@@ -16,3 +16,88 @@ async def client(db_path):
         yield c
     finally:
         await c.close()
+
+
+# ------------------------------------------------------------- fake executor
+# One PgExecutor stub, shared by every test that needs a PostgresStore without a
+# Postgres. Kept here rather than per file because nothing type-checks a Protocol
+# implementation in Python: a second copy would mean a change to PgExecutor
+# breaks only whichever file happens to exercise the new method.
+
+
+class FakeSession:
+    """Answers the statements PostgresStore runs on the way up, records the rest.
+
+    `installations` is the shape installations.sql produces — one row per schema
+    holding cairnq, and one all-null-schema row when there are none.
+    """
+
+    def __init__(
+        self,
+        calls: list,
+        *,
+        complete_matches: bool = True,
+        completed_row: dict | None = None,
+        current_schema: str | None = None,
+        installations: list[str] | None = None,
+    ):
+        self.calls = calls
+        self._complete_matches = complete_matches
+        self._completed_row = completed_row
+        found = installations or []
+        self._installations = [
+            {"current_schema": current_schema, "schema": s} for s in found
+        ] or [{"current_schema": current_schema, "schema": None}]
+
+    async def query(self, text: str, values=()) -> list:
+        if "current_schema()" in text:
+            return self._installations
+        if "protocol_version" in text and "select" in text:
+            return [{"value": "1"}]
+        if "update cairnq_tasks" in text and "succeeded" in text:
+            self.calls.append("complete")
+            return [self._completed_row] if self._complete_matches else []
+        self.calls.append("query")
+        return []
+
+    async def execute(self, sql: str) -> None:
+        self.calls.append("execute")
+
+
+class FakeExecutor:
+    """A PgExecutor over FakeSession. `listen` is absent unless one is passed —
+    an executor without it is a real case the store has to handle."""
+
+    def __init__(self, listen=None, **session_kwargs):
+        self.calls: list = []
+        self.rolled_back = False
+        self.session = FakeSession(self.calls, **session_kwargs)
+        if listen is not None:
+            self.listen = listen
+
+    async def query(self, text: str, values=()) -> list:
+        return await self.session.query(text, values)
+
+    async def execute(self, sql: str) -> None:
+        await self.session.execute(sql)
+
+    def transaction(self):
+        executor = self
+
+        class _Txn:
+            async def __aenter__(self):
+                executor.calls.append("BEGIN")
+                return executor.session
+
+            async def __aexit__(self, exc_type, exc, tb):
+                if exc_type is None:
+                    executor.calls.append("COMMIT")
+                else:
+                    executor.rolled_back = True
+                    executor.calls.append("ROLLBACK")
+                return False
+
+        return _Txn()
+
+    async def close(self) -> None:
+        pass

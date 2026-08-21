@@ -195,6 +195,16 @@ class ProtocolVersionMismatch(CairnQError):
     """The storage protocol major version is incompatible with this SDK."""
 
 
+class UnsupportedBackend(CairnQError):
+    """This store cannot do what was asked, and no argument would change that —
+    the capability belongs to the backend, not to the call.
+
+    Raised by `complete_in` on a store with no driver session to share (SQLite
+    has none). A CairnQError rather than NotImplementedError so the same `except`
+    works across both SDKs; the TypeScript SDK raises the same named error.
+    """
+
+
 class SchemaMismatch(CairnQError):
     """This connection is not pointed at the cairnq installation the rest of
     the deployment is using — raised at connect, before any task is written.

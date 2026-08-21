@@ -5,6 +5,7 @@ import {
   LostLease,
   ProtocolVersionMismatch,
   SerializationError,
+  UnsupportedBackend,
 } from "../errors.js";
 import {
   isTerminalStatus,
@@ -561,7 +562,15 @@ export abstract class TaskStore {
     });
     const timer = setInterval(() => {
       this.warmPush?.();
-      emit({ reason: "poll" });
+      // Guarded for the same reason PostgresStore guards its push fan-out: a
+      // consumer that throws must not take the timer down with it. Losing the
+      // timer would silently retire the fallback that makes watch correct
+      // where there is no push channel at all.
+      try {
+        emit({ reason: "poll" });
+      } catch {
+        // The consumer's problem, not the watch's.
+      }
     }, pollMs);
     timer.unref?.();
     return () => {
@@ -768,7 +777,7 @@ export abstract class TaskStore {
     fn: (session: S) => Promise<T>,
   ): Promise<{ task: Task; value: T }> {
     if (!this.txWithSession) {
-      throw new Error(
+      throw new UnsupportedBackend(
         "this store cannot share a transaction with the caller — " +
           "completeIn requires a Postgres store (see PgExecutor)",
       );

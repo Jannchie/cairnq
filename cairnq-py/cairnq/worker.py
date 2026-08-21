@@ -389,8 +389,9 @@ class Worker:
         requires the optional asyncpg package (install cairnq[postgres]) — or a
         PgExecutor over a driver the application already runs.
 
-        `schema` is the schema cairnq's tables live in, and must match every
-        other process in the deployment — see CairnQ.postgres."""
+        `schema` is the schema cairnq's tables live in — arranged by cairnq on
+        the DSN path, only asserted on the executor path — and must match every
+        other process in the deployment. See CairnQ.postgres."""
         worker = cls(
             PostgresStore(source, min_size=min_size, max_size=max_size, schema=schema),
             queues,

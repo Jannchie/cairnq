@@ -1,6 +1,10 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { rowToTask } from "../src/models.js";
+import { JSON_COLUMNS, MS_COLUMNS, rowToTask } from "../src/models.js";
+import { findProtocolRoot } from "../src/sql.js";
 
 // Both backends are optional dependencies, and the point of that is wasted if
 // importing the package loads them anyway. A Postgres-only deployment — which is
@@ -83,5 +87,37 @@ describe("row normalization", () => {
     const ms = "8640000000000000"; // JS's own maximum Date, well inside the range
     expect(Number(ms)).toBeLessThan(Number.MAX_SAFE_INTEGER);
     expect(rowToTask({ ...base, created_at_ms: ms }).created_at_ms).toBe(8_640_000_000_000_000);
+  });
+});
+
+/** Column names of one type in the canonical cairnq_tasks DDL. */
+function columnsOfType(type: string): string[] {
+  const ddl = readFileSync(
+    join(findProtocolRoot(), "migrations", "postgres", "0001_init.sql"),
+    "utf-8",
+  );
+  // Scoped to cairnq_tasks: cairnq_task_keys has *_ms columns of its own, and
+  // they are not part of a Task row.
+  const table = /create table if not exists cairnq_tasks \(([\s\S]*?)\n\);/.exec(ddl);
+  if (!table) throw new Error("cannot find the cairnq_tasks DDL");
+  return [...table[1].matchAll(new RegExp(`^\\s*(\\w+)\\s+${type}\\b`, "gm"))].map(
+    (m) => m[1],
+  );
+}
+
+// Which columns need normalizing is a fact about the SCHEMA, but rowToTask keeps
+// it as a hand-written list — and so does the Python SDK, separately. Adding a
+// bigint column to the migration and forgetting one of those lists is a silent
+// failure: TypeScript erases the `number` type, so the field just arrives as a
+// string, and the conformance suite compares shared behavior, so it stays green
+// whether one SDK misses it or both do. The lists cost nothing at runtime; this
+// is what keeps them honest.
+describe("the normalized column lists match the canonical DDL", () => {
+  it("covers every bigint column of cairnq_tasks", () => {
+    expect([...MS_COLUMNS].sort()).toEqual(columnsOfType("bigint").sort());
+  });
+
+  it("covers every jsonb column of cairnq_tasks", () => {
+    expect([...JSON_COLUMNS].sort()).toEqual(columnsOfType("jsonb").sort());
   });
 });

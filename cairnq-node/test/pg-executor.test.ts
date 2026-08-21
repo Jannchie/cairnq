@@ -10,6 +10,7 @@ import {
   PostgresStore,
   type Row,
   SchemaMismatch,
+  UnsupportedBackend,
   TaskContext,
 } from "../src/index.js";
 
@@ -289,7 +290,7 @@ describe("ctx.succeedIn — settlement and the caller's writes in one transactio
     const store = CairnQ.sqlite(":memory:");
     await expect(
       store.store.completeIn({ taskId: "t1", workerId: "w1" }, async () => null),
-    ).rejects.toThrow(/cannot share a transaction/);
+    ).rejects.toBeInstanceOf(UnsupportedBackend);
     await store.close();
   });
 });
@@ -324,22 +325,17 @@ describe("schema option", () => {
 
 /** An executor reporting a database that already holds cairnq somewhere. */
 function inSchema(current: string | null, installations: string[]): PgExecutor {
-  const query = async (text: string): Promise<Row[]> => {
-    if (/current_schema\(\)/.test(text)) {
+  const base = fakeExecutor().executor;
+  return {
+    ...base,
+    async query(text: string, values: readonly unknown[]): Promise<Row[]> {
+      if (!/current_schema\(\)/.test(text)) return base.query(text, values);
       // One row per installation, and one all-null-schema row when there are
       // none — the shape installations.sql's LEFT JOIN produces.
       return installations.length
         ? installations.map((schema) => ({ current_schema: current, schema }))
         : [{ current_schema: current, schema: null }];
-    }
-    return /protocol_version/.test(text) && /select/i.test(text) ? [{ value: "1" }] : [];
-  };
-  const session: PgSession = { query, exec: async () => {} };
-  return {
-    query,
-    exec: session.exec,
-    tx: async (fn) => fn(session),
-    close: async () => {},
+    },
   };
 }
 
