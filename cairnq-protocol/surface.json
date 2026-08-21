@@ -1,0 +1,83 @@
+{
+  "$comment": [
+    "The public API both SDKs must expose, and the places they deliberately differ.",
+    "",
+    "The conformance suite tests SHARED behavior across four implementations, so a",
+    "capability that exists on one side only has no counterpart to disagree with and",
+    "the suite stays green by construction. Feature drift is invisible to a suite",
+    "shaped that way — which is how 0.9.0 shipped four Node-only additions, one of",
+    "which (`schema`) could silently split a deployment's queue in two.",
+    "",
+    "Members are named in snake_case here; the TypeScript gate converts its own",
+    "camelCase names before comparing. Each SDK's gate asserts BOTH directions:",
+    "everything declared here exists there, AND everything there is declared here.",
+    "The second direction is the load-bearing one — it makes a one-sided addition",
+    "fail on the side that added it, at the moment it is added, rather than",
+    "surfacing as a missing feature on the other side a release later.",
+    "",
+    "`internal` lists members that are not public API. TypeScript's `private` is",
+    "erased at runtime, so the Node gate cannot tell them apart on its own; Python's",
+    "leading underscore is checked by convention instead and needs no entry. Having",
+    "to add a name here when introducing a private method is the point: it asks",
+    "which kind of member it is while that is still a live question.",
+    "",
+    "`only_node` / `only_py` are the deliberate asymmetries. Each carries a reason.",
+    "An entry here is a claim that the difference is idiomatic rather than a gap —",
+    "if it is a gap, the fix is to close it, not to list it."
+  ],
+
+  "classes": {
+    "CairnQ": {
+      "shared": [
+        "call", "cancel", "cancel_by_key", "close", "connect", "get", "get_by_key",
+        "get_status", "get_status_by_key", "list", "postgres", "purge",
+        "queue_depth", "retry", "retry_by_key", "sqlite", "stats", "store",
+        "submit", "wait", "wait_by_key", "watch"
+      ],
+      "internal": [],
+      "only_node": [],
+      "only_py": []
+    },
+
+    "Worker": {
+      "shared": [
+        "background", "close", "postgres", "run", "serve", "sqlite", "stop",
+        "task", "worker_id"
+      ],
+      "internal": [
+        "attempt", "close_if_owned", "context", "deliveries", "fail_no_handler",
+        "idle", "install_signals", "loop", "outcome_of", "report", "run_call",
+        "safe_fail", "schedule", "settle_each", "sleep_or_stop", "source_calls",
+        "start_heartbeat", "succeed_one"
+      ],
+      "only_node": [],
+      "only_py": [
+        {
+          "member": "register",
+          "reason": "Python's task() is a decorator, so registering a handler imperatively needs a second entry point. TypeScript's task() is already the imperative form and carries the same options as overloads."
+        }
+      ]
+    },
+
+    "TaskContext": {
+      "shared": [
+        "attempt", "canceled", "correlation_id", "fail", "heartbeat", "lost_lease",
+        "metadata", "name", "payload", "progress", "queue", "root_id", "settled",
+        "submit", "succeed", "succeed_in", "task_id", "wait", "worker_id"
+      ],
+      "internal": ["mark_lease_lost", "mark_settled", "observe", "observe_cancel", "owned"],
+      "only_node": [
+        {
+          "member": "signal",
+          "reason": "The lease-lost handle, in each language's own currency: an AbortSignal to hand to fetch here, an asyncio.Event to await there (cairnq-py's lease_lost). Same capability, and neither type exists in the other runtime."
+        }
+      ],
+      "only_py": [
+        {
+          "member": "lease_lost",
+          "reason": "See TaskContext.signal under only_node — the same handle, as an asyncio.Event."
+        }
+      ]
+    }
+  }
+}

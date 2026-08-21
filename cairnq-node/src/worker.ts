@@ -222,7 +222,7 @@ function release(counts: Map<string, number>, key: string | undefined): void {
 
 export class Worker {
   private readonly handlers = new Map<string, Registration>();
-  private readonly workerId = newId("worker");
+  private readonly ownId = newId("worker");
   /** Payload bytes charged to running handlers — see maxInFlightBytes. */
   private inFlightBytes = 0;
   /** Calls in flight, for the names that cap their own concurrency. */
@@ -305,8 +305,10 @@ export class Worker {
     return worker;
   }
 
-  get id(): string {
-    return this.workerId;
+  /** This worker's id — what `worker_id` on a running task points at, and what
+   * the Python SDK calls `worker_id` too. */
+  get workerId(): string {
+    return this.ownId;
   }
 
   task(handler: Handler): this;
@@ -474,7 +476,7 @@ export class Worker {
   }
 
   private context(task: Task, leaseMs: number): TaskContext {
-    return new TaskContext(this.store, task, this.workerId, leaseMs, {
+    return new TaskContext(this.store, task, this.ownId, leaseMs, {
       retryBackoffMs: this.backoffMs,
       retryBackoffMaxMs: this.backoffMaxMs,
     });
@@ -588,7 +590,7 @@ export class Worker {
           // Only what this worker can run. Queues do not partition work by task
           // name, so another worker's tasks would otherwise be claimed here and
           // failed for want of a handler.
-          { queues: this.queues, workerId: this.workerId, leaseMs, names },
+          { queues: this.queues, workerId: this.ownId, leaseMs, names },
           async (claim) => {
             const drawn: { src: ClaimSource; calls: [Registration | undefined, Task[]][] }[] = [];
             let left = free;
@@ -826,7 +828,7 @@ export class Worker {
     try {
       // complete (not succeed): finalizes as canceled if a cancel was requested
       // while the handler ran, else succeeded.
-      await this.store.complete({ taskId: ctx.taskId, workerId: this.workerId, result });
+      await this.store.complete({ taskId: ctx.taskId, workerId: this.ownId, result });
       ctx.markSettled();
     } catch (err) {
       if (err instanceof LostLease) {
@@ -967,7 +969,7 @@ export class Worker {
         try {
           const renewed = await this.store.heartbeatBatch({
             taskIds: live.map((c) => c.taskId),
-            workerId: this.workerId,
+            workerId: this.ownId,
             leaseMs,
           });
           for (const ctx of live) {
@@ -1003,7 +1005,7 @@ export class Worker {
     try {
       await this.store.fail({
         taskId: ctx.taskId,
-        workerId: this.workerId,
+        workerId: this.ownId,
         error: envelope,
         retryable,
         delayMs: failDelayMs(ctx.attempt, retryable, this.backoffMs, this.backoffMaxMs),

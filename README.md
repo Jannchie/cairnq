@@ -356,6 +356,13 @@ cairnq-node/       TypeScript SDK (better-sqlite3 / pg, both optional)
 conformance/       cross-language end-to-end orchestrator
 ```
 
+`cairnq-protocol/surface.json` declares the public API both SDKs must expose, and
+the handful of places they deliberately differ, each with a reason. Both sides
+check it both ways: everything declared exists here, and everything here is
+declared. The conformance suite compares *shared* behavior, so a capability only
+one SDK has nothing to disagree with — that gap is what surface.json closes, and
+it is enforced rather than aspirational.
+
 The protocol is the contract. `cairnq-protocol/sql/<dialect>/*.sql` holds the
 **canonical state-transition statements**, loaded verbatim by both SDKs — that
 (plus a shared conformance suite both SDKs run against both dialects) is how four

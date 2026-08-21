@@ -114,10 +114,18 @@ const executor: PgExecutor = { /* ~30 lines over your driver */ };
 const tasks = CairnQ.postgres(executor);
 ```
 
-`schema` (DSN form only) puts cairnq's tables in a schema of their own:
+`schema` puts cairnq's tables in a schema of their own:
 `CairnQ.postgres(dsn, { schema: "cairnq" })` creates it if absent and sets
 `search_path` per connection. The protocol's SQL names no schema, so nothing else
-changes. With your own executor, the search_path is yours to set.
+changes. With your own executor the search_path is yours to set, and `schema`
+becomes an assertion about where it lands.
+
+**Every process in a deployment must agree on it.** A queue whose API and worker
+resolve to different schemas is two empty queues, and — because every migration is
+`create table if not exists` — both sides come up healthy, pass their protocol
+version check, and never see each other's tasks. cairnq refuses to connect where
+it can see that about to happen (`SchemaMismatch`); the Python SDK applies the
+same rule.
 
 Two things an adapter must get right: `int8` has to come back as a JS number
 (every cairnq `*_ms` is an epoch or a counter, all inside the safe range), and

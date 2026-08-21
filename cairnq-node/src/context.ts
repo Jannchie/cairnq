@@ -37,7 +37,7 @@ export class TaskContext {
   constructor(
     private readonly store: TaskStore,
     private readonly task: Task,
-    public readonly workerId: string,
+    private readonly ownerId: string,
     private readonly leaseMs: number,
     opts: TaskContextOptions = {},
   ) {
@@ -47,6 +47,10 @@ export class TaskContext {
 
   get taskId(): string {
     return this.task.id;
+  }
+  /** The worker running this task — what `worker_id` on the row points at. */
+  get workerId(): string {
+    return this.ownerId;
   }
   get name(): string {
     return this.task.name;
@@ -150,7 +154,7 @@ export class TaskContext {
     return this.owned(() =>
       this.store.progress({
         taskId: this.task.id,
-        workerId: this.workerId,
+        workerId: this.ownerId,
         progress: value,
         message,
       }),
@@ -161,7 +165,7 @@ export class TaskContext {
     return this.owned(() =>
       this.store.heartbeat({
         taskId: this.task.id,
-        workerId: this.workerId,
+        workerId: this.ownerId,
         leaseMs: this.leaseMs,
       }),
     );
@@ -196,7 +200,7 @@ export class TaskContext {
   async succeed(result: unknown = null): Promise<Task | null> {
     if (this.isSettled) return null;
     const task = await this.owned(() =>
-      this.store.complete({ taskId: this.task.id, workerId: this.workerId, result }),
+      this.store.complete({ taskId: this.task.id, workerId: this.ownerId, result }),
     );
     this.markSettled();
     return task;
@@ -229,7 +233,7 @@ export class TaskContext {
     if (this.isSettled) return null;
     const task = await this.owned(async () => {
       const { task } = await this.store.completeIn<PgSession, T>(
-        { taskId: this.task.id, workerId: this.workerId },
+        { taskId: this.task.id, workerId: this.ownerId },
         write,
       );
       return task;
@@ -253,7 +257,7 @@ export class TaskContext {
     const task = await this.owned(() =>
       this.store.fail({
         taskId: this.task.id,
-        workerId: this.workerId,
+        workerId: this.ownerId,
         error: envelope,
         retryable,
         delayMs: failDelayMs(this.task.attempt, retryable, this.backoffMs, this.backoffMaxMs),
