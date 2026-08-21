@@ -42,7 +42,7 @@ class _Session:
 
     async def query(self, text: str, values) -> list:
         if "current_schema()" in text:
-            return [{"current_schema": None, "installations": []}]
+            return [{"current_schema": None, "schema": None}]
         if "protocol_version" in text and "select" in text:
             return [{"value": "1"}]
         if "update cairnq_tasks" in text and "succeeded" in text:

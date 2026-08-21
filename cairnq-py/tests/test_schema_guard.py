@@ -25,10 +25,14 @@ class StubSession:
     """Answers installations.sql and nothing else."""
 
     def __init__(self, current: str | None, installations: list[str]):
-        self._row = {"current_schema": current, "installations": installations}
+        # One row per installation, and one all-null-schema row when there are
+        # none — the shape installations.sql's LEFT JOIN produces.
+        self._rows = [
+            {"current_schema": current, "schema": s} for s in installations
+        ] or [{"current_schema": current, "schema": None}]
 
     async def query(self, _text: str, _values):
-        return [self._row]
+        return self._rows
 
     async def execute(self, _sql: str) -> None:
         pass

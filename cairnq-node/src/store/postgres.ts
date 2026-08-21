@@ -203,9 +203,13 @@ export class PostgresStore extends TaskStore {
    * deployment should be doing anyway — is both the fix and the confirmation.
    */
   private async checkSchema(executor: PgExecutor): Promise<void> {
+    // One row per installation; the statement's LEFT JOIN guarantees at least
+    // one, so current_schema is readable even where cairnq lives nowhere yet.
     const rows = await executor.query(this.statements.installations, []);
     const current = (rows[0]?.current_schema as string | null) ?? null;
-    const installations = (rows[0]?.installations as string[] | null) ?? [];
+    const installations = rows
+      .map((r) => r.schema as string | null)
+      .filter((s): s is string => s != null);
     const wanted = this.opts.schema;
 
     if (wanted != null) {

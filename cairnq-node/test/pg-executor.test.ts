@@ -326,7 +326,11 @@ describe("schema option", () => {
 function inSchema(current: string | null, installations: string[]): PgExecutor {
   const query = async (text: string): Promise<Row[]> => {
     if (/current_schema\(\)/.test(text)) {
-      return [{ current_schema: current, installations }];
+      // One row per installation, and one all-null-schema row when there are
+      // none — the shape installations.sql's LEFT JOIN produces.
+      return installations.length
+        ? installations.map((schema) => ({ current_schema: current, schema }))
+        : [{ current_schema: current, schema: null }];
     }
     return /protocol_version/.test(text) && /select/i.test(text) ? [{ value: "1" }] : [];
   };

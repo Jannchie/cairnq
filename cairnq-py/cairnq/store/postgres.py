@@ -179,10 +179,12 @@ class PostgresStore(TaskStore):
         which such a deployment should be doing anyway — is both the fix and the
         confirmation.
         """
-        rows = await session.query(self._sql["installations"], [])
-        row = dict(rows[0]) if rows else {}
-        current = row.get("current_schema")
-        installations = list(row.get("installations") or [])
+        # One row per installation; the statement's LEFT JOIN guarantees at
+        # least one, so current_schema is readable even where cairnq lives
+        # nowhere yet.
+        rows = [dict(r) for r in await session.query(self._sql["installations"], [])]
+        current = rows[0].get("current_schema") if rows else None
+        installations = [r["schema"] for r in rows if r.get("schema") is not None]
 
         if self._schema is not None:
             if current != self._schema:
