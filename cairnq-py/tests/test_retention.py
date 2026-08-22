@@ -12,7 +12,7 @@ import asyncio
 
 import pytest
 
-from cairnq import CairnQ, Retention, RetentionSweeper
+from cairnq import CairnQ, Retention, RetentionRule, RetentionSweeper
 
 from .helpers import fail_one as _fail_one
 from .helpers import finish_one as _finish_one
@@ -154,12 +154,57 @@ async def test_keeps_each_status_on_its_own_clock(db_path):
 
 
 def test_refuses_a_per_status_mapping_that_names_nothing_or_a_live_status():
-    with pytest.raises(ValueError, match="at least one status"):
+    with pytest.raises(ValueError, match="at least one rule"):
         Retention(older_than_ms={})
     with pytest.raises(ValueError, match="terminal"):
         Retention(older_than_ms={"queued": 0})
     with pytest.raises(ValueError, match=">= 0"):
         Retention(older_than_ms={"succeeded": -1})
+
+
+def test_refuses_a_rule_sequence_that_names_nothing_or_a_rule_purge_would_reject():
+    with pytest.raises(ValueError, match="at least one rule"):
+        Retention(older_than_ms=[])
+    with pytest.raises(ValueError, match="terminal"):
+        Retention(older_than_ms=[RetentionRule(older_than_ms=0, status="queued")])
+    with pytest.raises(ValueError, match=">= 0"):
+        Retention(older_than_ms=[RetentionRule(older_than_ms=-1)])
+
+
+async def test_sweeps_each_rule_on_its_own_cutoff(client):
+    # The shape the whole feature is for: one installation, two workloads — an
+    # RPC result spent on read, a job's failure kept for diagnosis. Without a
+    # queue dimension the shorter-lived one would set the retention for both.
+    rpc = await _finish_one(client, queue="rpc")
+    job = await _finish_one(client, queue="jobs")
+    broken = await _fail_one(client, queue="jobs")
+    await asyncio.sleep(0.01)  # purge deletes strictly-older rows
+
+    sweeper = RetentionSweeper(
+        client.store,
+        Retention(
+            older_than_ms=[
+                RetentionRule(queue="rpc", older_than_ms=0),
+                RetentionRule(queue="jobs", status="failed", older_than_ms=3_600_000),
+            ],
+            interval_ms=3_600_000,
+        ),
+    )
+    assert await sweeper.sweep() == 1
+    assert await client.get(rpc) is None
+    # Neither jobs row matched: the succeeded one has no rule at all, and the
+    # failed one has an hour to go.
+    assert (await client.get(job)).status == "succeeded"
+    assert (await client.get(broken)).status == "failed"
+
+
+async def test_purge_deletes_only_rows_matching_a_queue_filter(client):
+    rpc = await _finish_one(client, queue="rpc")
+    job = await _finish_one(client, queue="jobs")
+    await asyncio.sleep(0.01)  # purge deletes strictly-older rows; same-ms would miss
+
+    assert await client.purge(queue="rpc") == [rpc]
+    assert (await client.get(job)).status == "succeeded"
 
 
 async def test_purge_deletes_only_rows_matching_a_status_filter(client):

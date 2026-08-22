@@ -1,6 +1,6 @@
 {
   "name": "stats",
-  "description": "stats aggregates task counts by queue and status, zero-filling the statuses a queue has no rows in; a queue with no rows does not appear",
+  "description": "stats aggregates task counts by queue and status, zero-filling the statuses a queue has no rows in; a queue with no rows does not appear unless it is the queue that was asked for",
   "steps": [
     { "op": "submit", "args": { "name": "a", "payload": {}, "queue": "q1" } },
     { "op": "submit", "args": { "name": "b", "payload": {}, "queue": "q1" } },
@@ -9,6 +9,14 @@
     { "op": "stats", "save": "st" },
     { "op": "expect", "target": "$st.q1", "equals": { "queued": 1, "running": 1, "succeeded": 0, "failed": 0, "canceled": 0 } },
     { "op": "expect", "target": "$st.q2", "equals": { "queued": 1, "running": 0, "succeeded": 0, "failed": 0, "canceled": 0 } },
-    { "op": "expect", "target": "$st.q3", "isNull": ["queued"] }
+    { "op": "expect", "target": "$st.q3", "isNull": ["queued"] },
+
+    { "op": "stats", "args": { "queue": "q1" }, "save": "one" },
+    { "op": "expect", "target": "$one.q1", "equals": { "queued": 1, "running": 1, "succeeded": 0, "failed": 0, "canceled": 0 } },
+    { "op": "expect", "target": "$one.q2", "isNull": ["queued"] },
+
+    { "op": "stats", "args": { "queue": "q3" }, "save": "empty" },
+    { "op": "expect", "target": "$empty.q3", "equals": { "queued": 0, "running": 0, "succeeded": 0, "failed": 0, "canceled": 0 } },
+    { "op": "expect", "target": "$empty.q1", "isNull": ["queued"] }
   ]
 }

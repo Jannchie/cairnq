@@ -1,4 +1,4 @@
-import type { TaskStatus, TerminalStatus } from "./models.js";
+import type { TerminalStatus } from "./models.js";
 import { validatePurgeInput, type PurgeInput, type TaskStore } from "./store/base.js";
 
 /** Sweep every hour unless asked otherwise — often enough that a queue with a
@@ -13,17 +13,47 @@ const DEFAULT_LIMIT = 1_000;
  * an explicit statement of what may go, not a default for what wasn't named. */
 export type RetentionCutoffs = Partial<Record<TerminalStatus, number>>;
 
+/**
+ * One "these rows may go after this long" statement. Each field left out widens
+ * what the rule covers; `olderThanMs` is the only required one.
+ *
+ * A rule is one `purge` call's filters, so the fields are exactly `PurgeInput`'s
+ * — deliberately, since a rule the sweeper can express but the store cannot
+ * enforce would be a lie about what is being deleted.
+ */
+export interface RetentionRule {
+  /** Only this queue. Absent means every queue. */
+  queue?: string;
+  /** Only this terminal status. Absent means all three. */
+  status?: TerminalStatus;
+  /** Only this task name. Absent means every name. */
+  name?: string;
+  /** How long a row matching this rule is kept after it finished. */
+  olderThanMs: number;
+}
+
 export interface RetentionOptions {
   /**
    * How long a terminal task is kept after it finished. Required: there is no
    * safe default for how long someone else's results stay readable.
    *
-   * A number keeps every terminal status the same time. Retention needs are
-   * often tiered — a succeeded row is spent once its result is consumed, while
-   * a failed one is worth keeping for diagnosis — so a per-status map sets a
-   * cutoff per status instead: `{ succeeded: 300_000, failed: 86_400_000 }`.
+   * Three forms, widening as the deployment does:
+   *
+   * - A number keeps every terminal row the same time.
+   * - A per-status map tiers by outcome — a succeeded row is spent once its
+   *   result is consumed, a failed one is worth keeping for diagnosis:
+   *   `{ succeeded: 300_000, failed: 86_400_000 }`. A status left out is never
+   *   swept.
+   * - An array of rules tiers by anything `purge` can filter on, which is what a
+   *   store shared by two workloads needs — the recommended way for two
+   *   languages to coordinate is one installation, and an RPC queue read once
+   *   has nothing in common with a durable queue kept for a week:
+   *   `[{ queue: "rpc", olderThanMs: 300_000 },
+   *      { queue: "jobs", status: "failed", olderThanMs: 604_800_000 }]`.
+   *   Rules are independent, each its own sweep — nothing a rule does not match
+   *   is swept, and rules that overlap simply delete the same row once.
    */
-  olderThanMs: number | RetentionCutoffs;
+  olderThanMs: number | RetentionCutoffs | RetentionRule[];
   /** Time between sweeps. Default 3_600_000 (one hour). */
   intervalMs?: number;
   /** Rows deleted per statement while draining. Default 1_000. */
@@ -34,6 +64,18 @@ export interface RetentionOptions {
    * retaining — so without this a store quietly stops being swept. Must not throw.
    */
   onError?: (err: unknown) => void;
+}
+
+/** The three `olderThanMs` forms as the one form the sweep runs on. The number
+ * and the per-status map are the rule array's common cases spelled shorter, so
+ * they are widened here rather than handled separately downstream. */
+function toRules(spec: number | RetentionCutoffs | RetentionRule[]): RetentionRule[] {
+  if (typeof spec === "number") return [{ olderThanMs: spec }];
+  if (Array.isArray(spec)) return spec;
+  return (Object.entries(spec) as [TerminalStatus, number][]).map(([status, olderThanMs]) => ({
+    status,
+    olderThanMs,
+  }));
 }
 
 /**
@@ -72,7 +114,8 @@ export class RetentionSweeper {
   private readonly intervalMs: number;
   /** Rows per purge statement while draining — see DEFAULT_LIMIT. */
   private readonly limit: number;
-  /** One purge per cutoff: a lone entry for a number, one per status for a map. */
+  /** One purge per rule: a lone entry for a number, one per status for a map,
+   * one per element for an array. */
   private readonly purgeInputs: PurgeInput[];
 
   constructor(
@@ -84,21 +127,15 @@ export class RetentionSweeper {
       throw new Error(`retention.intervalMs must be >= 1, got ${this.intervalMs}`);
     }
     this.limit = opts.limit ?? DEFAULT_LIMIT;
-    const cutoffs: [TaskStatus | undefined, number][] =
-      typeof opts.olderThanMs === "number"
-        ? [[undefined, opts.olderThanMs]]
-        : (Object.entries(opts.olderThanMs) as [TaskStatus, number][]);
-    // An empty map retains nothing and sweeps nothing — almost certainly a bug
-    // upstream of this call, so refuse it rather than silently never purging.
-    if (!cutoffs.length) {
-      throw new Error("retention.olderThanMs must name at least one status");
+    const rules = toRules(opts.olderThanMs);
+    // An empty map or array retains nothing and sweeps nothing — almost
+    // certainly a bug upstream of this call, so refuse it rather than silently
+    // never purging.
+    if (!rules.length) {
+      throw new Error("retention.olderThanMs must name at least one rule");
     }
     this.arm();
-    this.purgeInputs = cutoffs.map(([status, ms]) => ({
-      olderThanMs: ms,
-      status,
-      limit: this.limit,
-    }));
+    this.purgeInputs = rules.map((rule) => ({ ...rule, limit: this.limit }));
     // Fail fast on the store's own purge rules (terminal status, cutoff >= 0):
     // the sweep runs an hour from now, and its errors only surface via onError.
     for (const input of this.purgeInputs) validatePurgeInput(input);

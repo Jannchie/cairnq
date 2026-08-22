@@ -152,11 +152,43 @@ describe("retention", () => {
   });
 
   it("refuses a per-status map that names nothing, or a live status", () => {
-    expect(() => client({ retention: { olderThanMs: {} } })).toThrow(/at least one status/);
+    expect(() => client({ retention: { olderThanMs: {} } })).toThrow(/at least one rule/);
     expect(() =>
       client({ retention: { olderThanMs: { queued: 0 } as never } }),
     ).toThrow(/terminal/);
     expect(() => client({ retention: { olderThanMs: { succeeded: -1 } } })).toThrow(/>= 0/);
+  });
+
+  it("refuses a rule array that names nothing, or a rule purge would reject", () => {
+    expect(() => client({ retention: { olderThanMs: [] } })).toThrow(/at least one rule/);
+    expect(() =>
+      client({ retention: { olderThanMs: [{ status: "queued" as never, olderThanMs: 0 }] } }),
+    ).toThrow(/terminal/);
+    expect(() => client({ retention: { olderThanMs: [{ olderThanMs: -1 }] } })).toThrow(/>= 0/);
+  });
+
+  it("sweeps each rule on its own cutoff, so one queue's retention is not the other's", async () => {
+    const c = client();
+    const rpc = await finishOne(c, { queue: "rpc" });
+    const job = await finishOne(c, { queue: "jobs" });
+    const broken = await failOne(c, { queue: "jobs" });
+    await sleep(10); // purge deletes strictly-older rows
+
+    const sweeper = new RetentionSweeper(c.store, {
+      // The shape the whole feature is for: one installation, two workloads —
+      // an RPC result spent on read, a job's failure kept for diagnosis.
+      olderThanMs: [
+        { queue: "rpc", olderThanMs: 0 },
+        { queue: "jobs", status: "failed", olderThanMs: 3_600_000 },
+      ],
+      intervalMs: 3_600_000,
+    });
+    expect(await sweeper.sweep()).toBe(1);
+    expect(await c.get(rpc)).toBeNull();
+    // Neither jobs row matched: the succeeded one has no rule at all, and the
+    // failed one has an hour to go.
+    expect((await c.get(job))?.status).toBe("succeeded");
+    expect((await c.get(broken))?.status).toBe("failed");
   });
 });
 
@@ -171,10 +203,20 @@ describe("purge filters", () => {
     expect((await c.get(failed))?.status).toBe("failed");
   });
 
+  it("deletes only rows matching a queue filter", async () => {
+    const c = client();
+    const rpc = await finishOne(c, { queue: "rpc" });
+    const job = await finishOne(c, { queue: "jobs" });
+    await sleep(10); // purge deletes strictly-older rows; same-ms completion would miss
+
+    expect(await c.purge({ queue: "rpc" })).toEqual([rpc]);
+    expect((await c.get(job))?.status).toBe("succeeded");
+  });
+
   it("deletes only rows matching a name filter", async () => {
     const c = client();
-    const alpha = await finishOne(c, "alpha");
-    const beta = await finishOne(c, "beta");
+    const alpha = await finishOne(c, { name: "alpha" });
+    const beta = await finishOne(c, { name: "beta" });
     await sleep(10); // purge deletes strictly-older rows; same-ms completion would miss
 
     expect(await c.purge({ name: "alpha" })).toEqual([alpha]);

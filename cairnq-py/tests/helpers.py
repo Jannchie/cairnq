@@ -22,24 +22,24 @@ async def wait_for(
         await asyncio.sleep(0.01)
 
 
-async def succeed_next(client, result: dict | None = None) -> None:
+async def succeed_next(client, result: dict | None = None, queue: str = "default") -> None:
     """Claim the next queued task and succeed it, the way a worker elsewhere
     would."""
-    (claimed,) = await client.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
+    (claimed,) = await client.store.claim(queues=[queue], worker_id="w1", lease_ms=5_000)
     await client.store.succeed(task_id=claimed.id, worker_id="w1", result=result or {})
 
 
-async def finish_one(client, name: str = "job") -> str:
+async def finish_one(client, name: str = "job", queue: str = "default") -> str:
     """Run a task to `succeeded` — submitted here, finished as if by a worker."""
-    task = await client.submit(name, {})
-    await succeed_next(client)
+    task = await client.submit(name, {}, queue=queue)
+    await succeed_next(client, queue=queue)
     return task.id
 
 
-async def fail_one(client, name: str = "job") -> str:
+async def fail_one(client, name: str = "job", queue: str = "default") -> str:
     """Run a task to terminal `failed`."""
-    task = await client.submit(name, {})
-    (claimed,) = await client.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
+    task = await client.submit(name, {}, queue=queue)
+    (claimed,) = await client.store.claim(queues=[queue], worker_id="w1", lease_ms=5_000)
     await client.store.fail(
         task_id=claimed.id, worker_id="w1", error={"message": "boom"}, retryable=False
     )

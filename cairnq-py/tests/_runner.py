@@ -152,12 +152,13 @@ class Runner:
         if op == "purge":
             return await c.purge(
                 older_than_ms=a.get("older_than_ms", 0),
+                queue=a.get("queue"),
                 status=a.get("status"),
                 name=a.get("name"),
                 limit=a.get("limit", 1000),
             )
         if op == "stats":
-            return await c.stats()
+            return await c.stats(a.get("queue"))
         if op == "queue_depth":
             return await c.queue_depth(a["queue"], a["max_depth"])
         if op == "sleep":

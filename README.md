@@ -251,15 +251,31 @@ and a JSON protocol.
   Retention needs are usually tiered — a succeeded row is spent once its result
   is consumed, a failed one is worth keeping for diagnosis — so `older_than_ms`
   also takes a per-status mapping (`{"succeeded": 300_000, "failed":
-  86_400_000}`; a status left out is never swept). `purge(older_than_ms=...,
-  status=..., name=..., limit=...)` remains the manual form, for an external
-  scheduler or a one-off drain.
+  86_400_000}`; a status left out is never swept). And because one installation
+  is how two languages are meant to coordinate here, it routinely carries two
+  workloads whose rows have nothing to do with each other's lifetimes — so
+  `older_than_ms` also takes a list of rules, tiered on anything `purge` filters
+  on:
+
+  ```python
+  tasks = CairnQ.sqlite("tasks.db", retention=Retention(older_than_ms=[
+      RetentionRule(queue="rpc", older_than_ms=300_000),
+      RetentionRule(queue="jobs", status="failed", older_than_ms=7 * 86_400_000),
+  ]))
+  ```
+
+  Rules are independent — nothing a rule does not match is swept.
+  `purge(older_than_ms=..., queue=..., status=..., name=..., limit=...)` remains
+  the manual form, for an external scheduler or a one-off drain.
 
 - **Operational visibility**: `stats()` returns task counts per queue and status
   (zero-filled), so a dashboard or health check reads backlog without listing
-  rows; an `on_error` / `onError` hook on the worker reports what the run loop
-  survived (a failed claim, a store write that blew up while finalizing) —
-  without it those are silent.
+  rows; `stats(queue)` narrows it to one queue so a caller does not pay for the
+  other workloads sharing the installation. It counts what it reports, so poll
+  `queue_depth()` — which is bounded — and keep `stats()` for the dashboard. An
+  `on_error` / `onError` hook on the worker reports what the run loop survived (a
+  failed claim, a store write that blew up while finalizing) — without it those
+  are silent.
 
 - **Backpressure**, so a producer that outruns its workers is bounded by
   something other than disk. Give the client a depth limit and `submit` blocks
@@ -383,6 +399,11 @@ first — a rebuild only pays for the rows still there. On Postgres the same
 rebuild blocks writes to `cairnq_tasks` for its duration; there is no
 `CONCURRENTLY` available, because it cannot run inside the transaction the
 migration ledger needs.
+
+Migration `0009` is a gentler case of the same thing: it only *creates* an index,
+and a partial one covering terminal rows only, so it builds over the smaller half
+of the table and no older SDK reads it. The lock still has to be held while it
+builds, so a large database wants the same window — just a shorter one.
 
 Small databases — the desktop app, the single-host service, anything under a few
 hundred thousand rows — need none of this. The rebuild is milliseconds and the

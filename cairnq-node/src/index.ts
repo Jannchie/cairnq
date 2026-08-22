@@ -3,7 +3,7 @@ export type { CallOptions, ClientOptions, SubmitOptions, WaitOptions } from "./c
 export { QueueDepthGate } from "./backpressure.js";
 export type { BackpressureOptions, QueueDepthLimit } from "./backpressure.js";
 export { RetentionSweeper } from "./retention.js";
-export type { RetentionCutoffs, RetentionOptions } from "./retention.js";
+export type { RetentionCutoffs, RetentionOptions, RetentionRule } from "./retention.js";
 export { Worker } from "./worker.js";
 export type { BatchHandler, Handler, TypedHandler, WorkerOptions } from "./worker.js";
 export { TaskContext } from "./context.js";

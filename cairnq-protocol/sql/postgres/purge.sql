@@ -11,16 +11,22 @@
 -- live task. Locking the rows in the subselect freezes them terminal until the
 -- delete commits; a concurrent retry then re-evaluates against the deleted row
 -- and correctly finds nothing.
--- The status/name filters are optional (pass NULL to skip; `::text` pins the
--- param's type, as in list.sql): retention needs are tiered — a succeeded row
--- is spent once its result is consumed, while a failed one is worth keeping
--- for diagnosis — and without them the shortest-lived tier sets the retention
--- for every row.
--- params: older_than_ms, status, name, limit
+-- The queue/status/name filters are optional (pass NULL to skip; `::text` pins
+-- the param's type, as in list.sql): retention needs are tiered — a succeeded row is spent once its result is
+-- consumed, while a failed one is worth keeping for diagnosis — and without them
+-- the shortest-lived tier sets the retention for every row. `queue` is the same
+-- argument one level up: a single installation is how this project recommends
+-- two languages coordinate, so it routinely carries two workloads whose rows
+-- have nothing to do with each other's lifetimes — an RPC result read once and a
+-- durable job's log kept for a week. Migration 0009 adds the index that makes
+-- the queue filter read only its own queue's rows rather than skipping past
+-- every other queue's.
+-- params: older_than_ms, queue, status, name, limit
 delete from cairnq_tasks
 where id in (
     select id from cairnq_tasks
     where status in ('succeeded', 'failed', 'canceled')
+      and (:queue::text is null or queue = :queue)
       and (:status::text is null or status = :status)
       and (:name::text is null or name = :name)
       and completed_at_ms is not null

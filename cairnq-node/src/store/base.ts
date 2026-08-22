@@ -138,6 +138,14 @@ export function validatePurgeInput(input: PurgeInput): void {
 
 export interface PurgeInput {
   olderThanMs?: number;
+  /** Restrict the sweep to one queue. Absent means every queue.
+   *
+   * The same tiering argument as `status`, one level up: a single installation
+   * is how this project recommends two languages coordinate, so it routinely
+   * carries two workloads whose rows have nothing to do with each other's
+   * lifetimes — an RPC result read once, a durable job's log kept for a week.
+   * Without this the shorter-lived queue sets the retention for both. */
+  queue?: string;
   /** Restrict the sweep to one terminal status. Retention needs are tiered —
    * succeeded rows are spent once their result is consumed, failed ones are
    * worth keeping for diagnosis — and without this the shortest-lived tier
@@ -499,11 +507,15 @@ export abstract class TaskStore {
    * their ids. Nothing else removes rows, so a long-lived database needs this
    * called periodically. Bounded by `limit` to keep each sweep a short write;
    * call it in a loop until it returns fewer than `limit`.
+   *
+   * `queue` / `status` / `name` narrow the sweep, which is what makes tiered
+   * retention expressible at all — see PurgeInput.
    */
   async purge(input: PurgeInput = {}): Promise<string[]> {
     validatePurgeInput(input);
     const rows = await this.fetch("purge", {
       older_than_ms: input.olderThanMs ?? 0,
+      queue: input.queue ?? null,
       status: input.status ?? null,
       name: input.name ?? null,
       limit: input.limit ?? 1_000,
@@ -516,13 +528,28 @@ export abstract class TaskStore {
    * `(await stats()).default.queued` is the backlog of a queue. A queue appears
    * only while it has rows; terminal tasks keep counting until `purge` removes
    * them.
+   *
+   * `queue` restricts the aggregate to one queue, which is also what stops the
+   * caller paying for every other queue's rows: one installation carrying two
+   * workloads is the coordination this project recommends, and the unfiltered
+   * form reads the whole table. A named queue is always present in the result,
+   * zero-filled if it has no rows at all — asking about a specific queue and
+   * getting `undefined` back would make every caller write the same fallback.
+   *
+   * Filtered or not, this COUNTS, so it costs what it counts: a whole queue,
+   * terminal rows included. Right for a dashboard, wrong on an interval — poll
+   * `queueDepth`, which is bounded, and keep this for when the real numbers are
+   * the point.
    */
-  async stats(): Promise<Record<string, Record<TaskStatus, number>>> {
+  async stats(queue?: string): Promise<Record<string, Record<TaskStatus, number>>> {
+    const zeros = (): Record<TaskStatus, number> =>
+      Object.fromEntries(STATUSES.map((s) => [s, 0])) as Record<TaskStatus, number>;
     const out: Record<string, Record<TaskStatus, number>> = {};
-    for (const row of await this.fetch("stats", {})) {
-      const per = (out[row.queue] ??= Object.fromEntries(
-        STATUSES.map((s) => [s, 0]),
-      ) as Record<TaskStatus, number>);
+    // Seed before the query, not after: a named queue with no rows returns no
+    // rows to seed from, and that is exactly the case the promise is about.
+    if (queue != null) out[queue] = zeros();
+    for (const row of await this.fetch("stats", { queue: queue ?? null })) {
+      const per = (out[row.queue] ??= zeros());
       per[row.status as TaskStatus] = Number(row.count);
     }
     return out;

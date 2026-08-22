@@ -1,0 +1,30 @@
+{
+  "name": "purge_queue_filter",
+  "description": "purge's optional queue filter bounds a sweep to one queue — a single installation is how two languages are meant to coordinate, so it routinely carries workloads whose rows have nothing to do with each other's lifetimes, and without this the shortest-lived one would set the retention for both",
+  "steps": [
+    { "op": "submit", "args": { "name": "job", "payload": {}, "queue": "rpc" }, "save": "r1" },
+    { "op": "claim", "args": { "queues": ["rpc"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "succeed", "args": { "id": "$r1.id", "worker_id": "w1", "result": {} }, "expect": { "equals": { "status": "succeeded" } } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "queue": "jobs" }, "save": "j1" },
+    { "op": "claim", "args": { "queues": ["jobs"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "succeed", "args": { "id": "$j1.id", "worker_id": "w1", "result": {} }, "expect": { "equals": { "status": "succeeded" } } },
+
+    { "op": "submit", "args": { "name": "job", "payload": {}, "queue": "jobs" }, "save": "j2" },
+    { "op": "claim", "args": { "queues": ["jobs"], "worker_id": "w1", "lease_ms": 5000 }, "expect": { "length": 1 } },
+    { "op": "fail", "args": { "id": "$j2.id", "worker_id": "w1", "error": { "type": "E", "code": "e", "message": "boom", "retryable": false }, "retryable": false, "delay_ms": 0 }, "expect": { "equals": { "status": "failed" } } },
+    { "op": "sleep", "args": { "ms": 30 } },
+
+    { "op": "purge", "args": { "older_than_ms": 0, "queue": "rpc", "limit": 100 }, "expect": { "length": 1 } },
+    { "op": "get", "args": { "id": "$r1.id" }, "expect": { "isNull": ["id"] } },
+    { "op": "get", "args": { "id": "$j1.id" }, "expect": { "equals": { "status": "succeeded" } } },
+    { "op": "get", "args": { "id": "$j2.id" }, "expect": { "equals": { "status": "failed" } } },
+
+    { "op": "purge", "args": { "older_than_ms": 0, "queue": "jobs", "status": "failed", "limit": 100 }, "expect": { "length": 1 } },
+    { "op": "get", "args": { "id": "$j2.id" }, "expect": { "isNull": ["id"] } },
+    { "op": "get", "args": { "id": "$j1.id" }, "expect": { "equals": { "status": "succeeded" } } },
+
+    { "op": "purge", "args": { "older_than_ms": 0, "queue": "nosuchqueue", "limit": 100 }, "expect": { "length": 0 } },
+    { "op": "get", "args": { "id": "$j1.id" }, "expect": { "equals": { "status": "succeeded" } } }
+  ]
+}

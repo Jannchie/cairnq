@@ -148,15 +148,24 @@ export class CairnQ {
   /** Delete terminal tasks that finished more than `olderThanMs` ago and return
    * their ids. Nothing else in CairnQ removes rows, so a long-lived database
    * needs this on a schedule. Each call is bounded by `limit` to keep the write
-   * short; loop until it returns fewer than `limit`. */
+   * short; loop until it returns fewer than `limit`.
+   *
+   * `queue` / `status` / `name` narrow the sweep — one installation carrying two
+   * workloads needs a retention per workload, not one for the whole database. */
   purge(input?: PurgeInput): Promise<string[]> {
     return this._store.purge(input);
   }
 
   /** Task counts per queue, keyed by status and zero-filled across all statuses
-   * — `(await stats()).default.queued` is the backlog of a queue. */
-  stats(): Promise<Record<string, Record<TaskStatus, number>>> {
-    return this._store.stats();
+   * — `(await stats()).default.queued` is the backlog of a queue. `queue` narrows
+   * the aggregate to one queue, which is also what keeps a caller from paying for
+   * the other workloads sharing the installation; a named queue is always
+   * present, zero-filled if it has no rows.
+   *
+   * This counts rows, so it costs what it counts — use it for a dashboard, and
+   * poll `queueDepth()` instead, which is bounded. */
+  stats(queue?: string): Promise<Record<string, Record<TaskStatus, number>>> {
+    return this._store.stats(queue);
   }
 
   /**

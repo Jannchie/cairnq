@@ -268,6 +268,14 @@ Neither is a state transition; both are reads the SDK makes on the way up.
 (`stats.sql`). SDKs zero-fill the statuses a queue has no rows in; a queue with
 no rows at all does not appear. Terminal tasks keep counting until `purge`
 removes them, so the numbers describe the database, not just the live backlog.
+An optional `queue` narrows the aggregate to one queue — unfiltered it reads
+every row in the table, and one installation is how this protocol expects two
+languages to coordinate, so a caller should not have to pay for the other
+workload's backlog. A named queue is the one exception to "a queue with no rows
+does not appear": it is always present, zero-filled, because asking about a
+specific queue and getting nothing back would make every caller write the same
+fallback. Filtered or not, `stats` counts what it reports and so costs what it
+counts — it is the dashboard read, not the poll-loop read.
 
 `queue_depth` is the bounded one, and the read behind backpressure: it returns
 **headroom** — how many more tasks fit on one queue under a caller-supplied
@@ -313,13 +321,19 @@ long-lived database grows without bound unless the application calls it on a
 schedule. It deletes **terminal** tasks past a retention cutoff, bounded by a
 `limit` so a large backlog drains in short writes rather than one long one; a
 purged task's `key` pointer goes with it via `ON DELETE CASCADE`. Optional
-`status` / `name` filters bound a sweep to one terminal status or task name —
-retention needs are tiered (a succeeded row is spent once its result is consumed;
-a failed one is worth keeping for diagnosis), and without them the shortest-lived
-tier would set the retention for every row. Both SDKs build tiered retention on
-this: a per-status cutoff map runs one filtered purge per entry. Migration `0007`
-adds `(status, completed_at_ms)` so a filtered sweep is a bounded range seek
-rather than a scan that visits every retained row just to discard it.
+`queue` / `status` / `name` filters bound a sweep to one queue, one terminal
+status, or one task name — retention needs are tiered (a succeeded row is spent
+once its result is consumed; a failed one is worth keeping for diagnosis), and
+without them the shortest-lived tier would set the retention for every row.
+`queue` is that argument one level up: a single installation routinely carries
+two workloads whose rows have nothing to do with each other's lifetimes — an RPC
+result read once, a durable job's log kept for a week — and one cutoff for both
+is one of them being wrong. Both SDKs build tiered retention on this: a rule runs
+one filtered purge per entry, and a per-status cutoff map is the common case of
+that spelled shorter. Migrations `0007` `(status, completed_at_ms)` and `0009`
+`(queue, completed_at_ms)` over the terminal statuses are what a filtered sweep
+seeks, so it reads its own range rather than every retained row — `limit` bounds
+what comes back, never what is read.
 
 `get_status` / `get_status_by_key` are the **status-only probes** behind the wait
 loop: `id` and `status` alone, because a waiting caller asks nothing but "is it
@@ -623,7 +637,7 @@ contract that an existing SDK could get wrong.
 
 Ordinals are **one sequence shared by both dialects**, so a dialect may have no
 file at an ordinal — `0003` is the Postgres-only LISTEN/NOTIFY trigger, and SQLite
-goes 0001, 0002, 0004, 0005, 0006, 0007, 0008. A migration that closes an ordinal sets
+goes 0001, 0002, 0004, 0005, 0006, 0007, 0008, 0009. A migration that closes an ordinal sets
 `schema_version` to it in *every* dialect it ships in, so the two never report
 different numbers for the same schema. (`0003` predates this rule and sets nothing, which is why both dialects
 read 2 until 0004 takes them to 4.)

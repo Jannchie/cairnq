@@ -41,22 +41,34 @@ export async function allTerminal(client: CairnQ, ids: string[]): Promise<boolea
 }
 
 /** Claim the next queued task and succeed it, the way a worker elsewhere would. */
-export async function succeedNext(c: CairnQ, result: unknown = {}): Promise<void> {
-  const [task] = await c.store.claim({ queues: ["default"], workerId: "w1", leaseMs: 5_000 });
+export async function succeedNext(
+  c: CairnQ,
+  result: unknown = {},
+  queue = "default",
+): Promise<void> {
+  const [task] = await c.store.claim({ queues: [queue], workerId: "w1", leaseMs: 5_000 });
   await c.store.succeed({ taskId: task.id, workerId: "w1", result });
 }
 
 /** Run a task to `succeeded` — submitted here, finished as if by a worker. */
-export async function finishOne(c: CairnQ, name = "job"): Promise<string> {
-  const task = await c.submit(name, {});
-  await succeedNext(c);
+export async function finishOne(
+  c: CairnQ,
+  opts: { name?: string; queue?: string } = {},
+): Promise<string> {
+  const queue = opts.queue ?? "default";
+  const task = await c.submit(opts.name ?? "job", {}, { queue });
+  await succeedNext(c, {}, queue);
   return task.id;
 }
 
 /** Run a task to terminal `failed`. */
-export async function failOne(c: CairnQ, name = "job"): Promise<string> {
-  const task = await c.submit(name, {});
-  const [claimed] = await c.store.claim({ queues: ["default"], workerId: "w1", leaseMs: 5_000 });
+export async function failOne(
+  c: CairnQ,
+  opts: { name?: string; queue?: string } = {},
+): Promise<string> {
+  const queue = opts.queue ?? "default";
+  const task = await c.submit(opts.name ?? "job", {}, { queue });
+  const [claimed] = await c.store.claim({ queues: [queue], workerId: "w1", leaseMs: 5_000 });
   await c.store.fail({
     taskId: claimed.id,
     workerId: "w1",

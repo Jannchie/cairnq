@@ -189,6 +189,7 @@ class CairnQ:
         self,
         *,
         older_than_ms: int = 0,
+        queue: str | None = None,
         status: TaskStatus | None = None,
         name: str | None = None,
         limit: int = 1_000,
@@ -198,17 +199,24 @@ class CairnQ:
         database needs this on a schedule. Each call is bounded by `limit` to keep
         the write short; loop until it returns fewer than `limit`.
 
-        `status` / `name` restrict the sweep to one terminal status or task name
-        — retention needs are tiered, and without them the shortest-lived tier
-        sets the retention for every row."""
+        `queue` / `status` / `name` narrow the sweep — one installation carrying
+        two workloads needs a retention per workload, not one for the whole
+        database, and without these the shortest-lived tier sets the retention
+        for every row."""
         return await self._store.purge(
-            older_than_ms=older_than_ms, status=status, name=name, limit=limit
+            older_than_ms=older_than_ms, queue=queue, status=status, name=name, limit=limit
         )
 
-    async def stats(self) -> dict[str, dict[TaskStatus, int]]:
+    async def stats(self, queue: str | None = None) -> dict[str, dict[TaskStatus, int]]:
         """Task counts per queue, keyed by status and zero-filled across all
-        statuses — `stats()["default"]["queued"]` is the backlog of a queue."""
-        return await self._store.stats()
+        statuses — `stats()["default"]["queued"]` is the backlog of a queue.
+        `queue` narrows the aggregate to one queue, which is also what keeps a
+        caller from paying for the other workloads sharing the installation; a
+        named queue is always present, zero-filled if it has no rows.
+
+        This counts rows, so it costs what it counts — use it for a dashboard,
+        and poll `queue_depth()` instead, which is bounded."""
+        return await self._store.stats(queue)
 
     def watch(
         self,

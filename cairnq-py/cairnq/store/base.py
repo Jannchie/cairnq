@@ -462,6 +462,7 @@ class TaskStore(ABC):
         self,
         *,
         older_than_ms: int = 0,
+        queue: str | None = None,
         status: TaskStatus | None = None,
         name: str | None = None,
         limit: int = 1_000,
@@ -471,24 +472,51 @@ class TaskStore(ABC):
         needs this called periodically. Bounded by `limit` to keep each sweep a
         short write; call it in a loop until it returns fewer than `limit`.
 
-        `status` / `name` restrict the sweep to one terminal status or task name.
-        Retention needs are tiered — a succeeded row is spent once its result is
-        consumed, while a failed one is worth keeping for diagnosis — and without
-        them the shortest-lived tier sets the retention for every row."""
+        `queue` / `status` / `name` restrict the sweep to one queue, one terminal
+        status, or one task name. Retention needs are tiered — a succeeded row is
+        spent once its result is consumed, while a failed one is worth keeping
+        for diagnosis — and without them the shortest-lived tier sets the
+        retention for every row. `queue` is the same argument one level up: a
+        single installation is how this project recommends two languages
+        coordinate, so it routinely carries two workloads whose rows have nothing
+        to do with each other's lifetimes."""
         validate_purge_input(older_than_ms=older_than_ms, status=status, limit=limit)
         rows = await self._fetch(
             "purge",
-            {"older_than_ms": older_than_ms, "status": status, "name": name, "limit": limit},
+            {
+                "older_than_ms": older_than_ms,
+                "queue": queue,
+                "status": status,
+                "name": name,
+                "limit": limit,
+            },
         )
         return [r["id"] for r in rows]
 
-    async def stats(self) -> dict[str, dict[TaskStatus, int]]:
+    async def stats(self, queue: str | None = None) -> dict[str, dict[TaskStatus, int]]:
         """Task counts per queue, keyed by status and zero-filled across all
         statuses — `stats()["default"]["queued"]` is the backlog of a queue.
         A queue appears only while it has rows; terminal tasks keep counting
-        until `purge` removes them."""
+        until `purge` removes them.
+
+        `queue` restricts the aggregate to one queue, which is also what stops
+        the caller paying for every other queue's rows: one installation carrying
+        two workloads is the coordination this project recommends, and the
+        unfiltered form reads the whole table. A named queue is always present in
+        the result, zero-filled if it has no rows at all — asking about a
+        specific queue and getting a KeyError would make every caller write the
+        same fallback.
+
+        Filtered or not, this COUNTS, so it costs what it counts: a whole queue,
+        terminal rows included. Right for a dashboard, wrong on an interval —
+        poll `queue_depth`, which is bounded, and keep this for when the real
+        numbers are the point."""
         out: dict[str, dict[TaskStatus, int]] = {}
-        for row in await self._fetch("stats", {}):
+        # Seed before the query, not after: a named queue with no rows returns no
+        # rows to seed from, and that is exactly the case the promise is about.
+        if queue is not None:
+            out[queue] = dict.fromkeys(STATUSES, 0)
+        for row in await self._fetch("stats", {"queue": queue}):
             per = out.setdefault(row["queue"], dict.fromkeys(STATUSES, 0))
             per[row["status"]] = int(row["count"])
         return out

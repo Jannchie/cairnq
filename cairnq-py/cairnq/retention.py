@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from .models import TaskStatus
@@ -18,17 +18,47 @@ DEFAULT_LIMIT = 1_000
 
 
 @dataclass(frozen=True)
+class RetentionRule:
+    """One "these rows may go after this long" statement. Each field left out
+    widens what the rule covers; `older_than_ms` is the only required one.
+
+    A rule is one `purge` call's filters, so the fields are exactly `purge`'s —
+    deliberately, since a rule the sweeper can express but the store cannot
+    enforce would be a lie about what is being deleted.
+    """
+
+    older_than_ms: int
+    #: Only this queue. None means every queue.
+    queue: str | None = None
+    #: Only this terminal status. None means all three.
+    status: TaskStatus | None = None
+    #: Only this task name. None means every name.
+    name: str | None = None
+
+
+@dataclass(frozen=True)
 class Retention:
     """How long terminal tasks are kept, and how often that is enforced.
 
     `older_than_ms` is required: there is no safe default for how long someone
-    else's results stay readable. An int keeps every terminal status the same
-    time; retention needs are often tiered — a succeeded row is spent once its
-    result is consumed, while a failed one is worth keeping for diagnosis — so a
-    per-status mapping sets a cutoff per status instead:
-    `{"succeeded": 300_000, "failed": 86_400_000}`. A status left out of the
-    mapping is never swept — granular retention is an explicit statement of what
-    may go, not a default for what wasn't named.
+    else's results stay readable. Three forms, widening as the deployment does:
+
+    - An int keeps every terminal row the same time.
+    - A per-status mapping tiers by outcome — a succeeded row is spent once its
+      result is consumed, a failed one is worth keeping for diagnosis:
+      `{"succeeded": 300_000, "failed": 86_400_000}`. A status left out of the
+      mapping is never swept — granular retention is an explicit statement of
+      what may go, not a default for what wasn't named.
+    - A sequence of `RetentionRule` tiers by anything `purge` can filter on,
+      which is what a store shared by two workloads needs — the recommended way
+      for two languages to coordinate is one installation, and an RPC queue read
+      once has nothing in common with a durable queue kept for a week::
+
+          [RetentionRule(queue="rpc", older_than_ms=300_000),
+           RetentionRule(queue="jobs", status="failed", older_than_ms=604_800_000)]
+
+      Rules are independent, each its own sweep — nothing a rule does not match
+      is swept, and rules that overlap simply delete the same row once.
 
     `on_error` is called for a sweep that threw — the next sweep runs on schedule
     regardless, since a purge that failed because the database was busy is not a
@@ -36,31 +66,38 @@ class Retention:
     must not raise.
     """
 
-    older_than_ms: int | Mapping[TaskStatus, int]
+    older_than_ms: int | Mapping[TaskStatus, int] | Sequence[RetentionRule]
     interval_ms: int = DEFAULT_INTERVAL_MS
     limit: int = DEFAULT_LIMIT
     on_error: Callable[[BaseException], None] | None = None
 
     def __post_init__(self) -> None:
-        cutoffs = self.cutoffs()
-        # An empty mapping retains nothing and sweeps nothing — almost certainly
-        # a bug upstream, so refuse it rather than silently never purging.
-        if not cutoffs:
-            raise ValueError("retention older_than_ms must name at least one status")
+        rules = self.rules()
+        # An empty mapping or sequence retains nothing and sweeps nothing —
+        # almost certainly a bug upstream, so refuse it rather than silently
+        # never purging.
+        if not rules:
+            raise ValueError("retention older_than_ms must name at least one rule")
         if self.interval_ms < 1:
             raise ValueError(f"retention interval_ms must be >= 1, got {self.interval_ms}")
         # Fail fast on the store's own purge rules (terminal status, cutoff and
         # limit bounds): the sweep runs an hour from now, and its errors only
         # surface via on_error.
-        for status, cutoff in cutoffs:
-            validate_purge_input(older_than_ms=cutoff, status=status, limit=self.limit)
+        for rule in rules:
+            validate_purge_input(
+                older_than_ms=rule.older_than_ms, status=rule.status, limit=self.limit
+            )
 
-    def cutoffs(self) -> list[tuple[TaskStatus | None, int]]:
-        """The (status filter, cutoff) pairs one sweep purges — a lone unfiltered
-        pair for an int, one pair per status for a mapping."""
-        if isinstance(self.older_than_ms, Mapping):
-            return list(self.older_than_ms.items())
-        return [(None, self.older_than_ms)]
+    def rules(self) -> list[RetentionRule]:
+        """The rules one sweep purges. The int and the per-status mapping are the
+        sequence form's common cases spelled shorter, so they are widened here
+        rather than handled separately downstream."""
+        spec = self.older_than_ms
+        if isinstance(spec, int):
+            return [RetentionRule(older_than_ms=spec)]
+        if isinstance(spec, Mapping):
+            return [RetentionRule(older_than_ms=ms, status=s) for s, ms in spec.items()]
+        return list(spec)
 
 
 class RetentionSweeper:
@@ -130,10 +167,14 @@ class RetentionSweeper:
         drain on demand — after a backfill, or from a maintenance command."""
         limit = self._retention.limit
         deleted = 0
-        for status, older_than_ms in self._retention.cutoffs():
+        for rule in self._retention.rules():
             while True:
                 ids = await self._store.purge(
-                    older_than_ms=older_than_ms, status=status, limit=limit
+                    older_than_ms=rule.older_than_ms,
+                    queue=rule.queue,
+                    status=rule.status,
+                    name=rule.name,
+                    limit=limit,
                 )
                 deleted += len(ids)
                 if self._stop.is_set():
