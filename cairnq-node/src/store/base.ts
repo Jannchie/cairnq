@@ -174,10 +174,58 @@ export const COMMENT = /--[^\n]*/g;
 /** A `:name` placeholder. The lookbehind spares Postgres `::type` casts. */
 export const NAMED = /(?<!:):(\w+)/g;
 
+/**
+ * An optional filter: `(:p is null or col = :p)`, with the `::type` cast the
+ * Postgres dialect adds to pin the parameter's type. The back-reference is what
+ * keeps it from matching anything else — both halves must name the same
+ * parameter. claim's `(:names is null or name in (…))` deliberately does not
+ * match: a list-valued filter is a different problem, and claim_one_name.sql is
+ * its answer.
+ */
+const OPTIONAL_FILTER = /\(:(\w+)(?:::[\w[\]]+)? is null or (\S+) = :\1\)/g;
+
 // Statement text is loaded once at construction and never varies, so the parse is
 // memoized on it: every dialect's binding path runs on each query, and re-scanning
 // the SQL each time would put a regex sweep on the worker's poll loop.
 const paramCache = new Map<string, readonly string[]>();
+// Same argument for the specialized texts, which vary only by WHICH filters a
+// caller supplied — a small, bounded set per statement, reached within the first
+// few calls and constant thereafter.
+const specialCache = new Map<string, string>();
+
+/**
+ * The statement as it should run for these arguments: every optional filter the
+ * caller actually supplied rewritten to an equality.
+ *
+ * `(:p is null or col = :p)` cannot use an index. SQLite plans a statement when
+ * it is prepared, before any parameter has a value, so it must plan for both
+ * branches and settles for a scan; that is not a tuning detail but the whole
+ * difference between `list(root_id=…)` seeking cairnq_tasks_root_idx and reading
+ * the table. Postgres re-plans with the values for a statement's first
+ * executions and folds the branch away on its own, so this is a no-op there —
+ * but it costs nothing, and one behaviour is easier to reason about than two.
+ *
+ * Filters the caller did NOT supply are left alone rather than removed: a
+ * constant-true term costs a per-row evaluation the planner mostly discards, and
+ * leaving them keeps the parameter set identical to the file's, so the binding
+ * path below needs to know nothing about any of this.
+ */
+export function specialize(sql: string, params: Params): string {
+  let active = "";
+  for (const [, name] of sql.matchAll(OPTIONAL_FILTER)) {
+    if (params[name] != null) active += name + ",";
+  }
+  if (!active) return sql;
+  const key = active + sql;
+  let out = specialCache.get(key);
+  if (out === undefined) {
+    out = sql.replace(OPTIONAL_FILTER, (whole, name: string, column: string) =>
+      params[name] != null ? `${column} = :${name}` : whole,
+    );
+    specialCache.set(key, out);
+  }
+  return out;
+}
 
 /**
  * The parameter names a statement binds, in first-appearance order.
@@ -522,21 +570,7 @@ export abstract class TaskStore {
    */
   async purge(input: PurgeInput = {}): Promise<string[]> {
     validatePurgeInput(input);
-    // Each optional filter has an equality form, picked here — the same trade
-    // claimSession makes between claim and its specializations, for the same
-    // reason. `(:queue is null or queue = :queue)` is planned before any
-    // parameter has a value, so on SQLite it can use no index at all and the
-    // sweep walks every row past the cutoff, whichever queue it belongs to.
-    // See purge_one_queue.sql. `name` is not specialized: nothing indexes it.
-    const statement =
-      input.queue != null
-        ? input.status != null
-          ? "purge_one_queue_one_status"
-          : "purge_one_queue"
-        : input.status != null
-          ? "purge_one_status"
-          : "purge";
-    const rows = await this.fetch(statement, {
+    const rows = await this.fetch("purge", {
       older_than_ms: input.olderThanMs ?? 0,
       queue: input.queue ?? null,
       status: input.status ?? null,
@@ -571,11 +605,7 @@ export abstract class TaskStore {
     // Seed before the query, not after: a named queue with no rows returns no
     // rows to seed from, and that is exactly the case the promise is about.
     if (queue != null) out[queue] = zeros();
-    // Equality form when a queue was named — see stats_one_queue.sql: the
-    // optional filter cannot be indexed, so the "narrowed" form would read the
-    // whole table anyway and narrowing would buy nothing.
-    const statement = queue != null ? "stats_one_queue" : "stats";
-    for (const row of await this.fetch(statement, { queue: queue ?? null })) {
+    for (const row of await this.fetch("stats", { queue: queue ?? null })) {
       const per = (out[row.queue] ??= zeros());
       per[row.status as TaskStatus] = Number(row.count);
     }

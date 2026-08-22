@@ -17,10 +17,12 @@
  *
  * ONE thing an adapter does have to get right: enable the driver's
  * prepared-statement path if it is not already the default. The store issues a
- * small, FIXED set of statement texts — every one is loaded from a file at
- * startup and the `:name` -> `$n` rewrite is memoized on it, so the same handful
- * of strings is submitted for the life of the process, and nothing here ever
- * interpolates a value into SQL. That is exactly the shape a server-side
+ * small, FIXED set of statement texts — each is loaded from a file at startup,
+ * `specialize` may return one variant of it per set of optional filters a caller
+ * supplies, and the `:name` -> `$n` rewrite is memoized on the result. So the
+ * same handful of strings is submitted for the life of the process, reached
+ * within the first few calls, and nothing here ever interpolates a value into
+ * SQL. That is exactly the shape a server-side
  * prepared statement is for. A driver that instead describes each statement
  * before binding pays an extra round trip and a re-parse every time.
  *

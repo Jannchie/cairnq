@@ -41,6 +41,7 @@ import pytest
 
 from cairnq import CairnQ
 from cairnq._sql import load_statements
+from cairnq.store.base import specialize
 
 STATEMENTS = load_statements("sqlite")
 #: Enough rows, spread over several queues and statuses, that the planner
@@ -68,7 +69,7 @@ def planned(tmp_path_factory):
     conn.executemany(
         "insert into cairnq_tasks (id,name,queue,status,payload,priority,run_at_ms,"
         "worker_id,lease_until_ms,attempt,max_attempts,created_at_ms,updated_at_ms,"
-        "completed_at_ms) values (?,?,?,?,'{}',0,?,null,?,0,3,?,?,?)",
+        "completed_at_ms,root_id,correlation_id) values (?,?,?,?,'{}',0,?,null,?,0,3,?,?,?,?,?)",
         [
             (
                 f"id{i}",
@@ -80,6 +81,12 @@ def planned(tmp_path_factory):
                 i,
                 i,
                 i,
+                # Spread over enough distinct values that ANALYZE reports the
+                # index as selective. All-NULL columns make it useless and the
+                # planner correctly ignores it — which would test the fixture,
+                # not the statement.
+                f"r{i % 50}",
+                f"c{i % 50}",
             )
             for i in range(ROWS)
         ],
@@ -91,35 +98,56 @@ def planned(tmp_path_factory):
 
 
 def plan(conn: sqlite3.Connection, statement: str, params: dict) -> str:
-    """The planner's own description of how it will run this statement."""
-    sql = STATEMENTS[statement]
+    """The planner's own description of how it will run this statement — for the
+    text the store would actually submit, which is `specialize`'s output and not
+    the file's. Asking about the file would test something no caller ever runs."""
+    sql = specialize(STATEMENTS[statement], params)
     return " | ".join(r[3] for r in conn.execute("explain query plan " + sql, params))
 
 
 PURGE_BASE = {"before_ms": 10**12, "queue": None, "status": None, "name": None, "limit": 100}
+LIST_BASE = {
+    "status": None, "queue": None, "name": None,
+    "root_id": None, "correlation_id": None, "limit": 50, "offset": 0,
+}
 
-# Which index each purge shape must reach, and with which parameters. The point
-# of the specializations is that every filtered shape reads only its own range
-# instead of walking the whole retained backlog in completion order.
-PURGE_CASES = [
-    ("purge", {}, "cairnq_tasks_completed_idx"),
-    ("purge_one_status", {"status": "succeeded"}, "cairnq_tasks_status_completed_idx"),
-    ("purge_one_queue", {"queue": "rpc"}, "cairnq_tasks_queue_completed_idx"),
-    (
-        "purge_one_queue_one_status",
-        {"queue": "rpc", "status": "succeeded"},
-        "cairnq_tasks_queue_completed_idx",
-    ),
+# Every filtered shape these two statements can be asked for, and the index it
+# must reach. Unfiltered they are meant to scan; filtered, the whole point is to
+# read only the matching range instead of the table.
+FILTERED_CASES = [
+    ("purge", {"status": "succeeded"}, "cairnq_tasks_status_completed_idx", PURGE_BASE),
+    ("purge", {"queue": "rpc"}, "cairnq_tasks_queue_completed_idx", PURGE_BASE),
+    ("purge", {"queue": "rpc", "status": "succeeded"},
+     "cairnq_tasks_queue_completed_idx", PURGE_BASE),
+    ("stats", {"queue": "default"}, "cairnq_tasks_claim", {"queue": None}),
+    # list's filters are the oldest instance of the same defect: migration 0001
+    # shipped an index for each and none was read until specialize existed.
+    ("list", {"root_id": "r7"}, "cairnq_tasks_root_idx", LIST_BASE),
+    ("list", {"correlation_id": "c7"}, "cairnq_tasks_correlation_idx", LIST_BASE),
+    ("list", {"name": "job1"}, "cairnq_tasks_name_idx", LIST_BASE),
+    ("list", {"queue": "rpc"}, "cairnq_tasks_claim", LIST_BASE),
 ]
 
 
-@pytest.mark.parametrize("statement,params,index", PURGE_CASES, ids=[c[0] for c in PURGE_CASES])
-def test_purge_reaches_its_index(planned, statement, params, index):
-    got = plan(planned, statement, {**PURGE_BASE, **params})
-    assert index in got, f"{statement} no longer reads {index}: {got}"
-    # The ORDER BY decides WHICH rows a bounded sweep takes, so a sort here means
-    # the whole matching set is read to return `limit` of it.
-    assert "TEMP B-TREE" not in got, f"{statement} now sorts instead of reading in order: {got}"
+@pytest.mark.parametrize(
+    "statement,filters,index,base",
+    FILTERED_CASES,
+    ids=[f"{c[0]}:{'+'.join(c[1])}" for c in FILTERED_CASES],
+)
+def test_a_filtered_statement_reaches_its_index(planned, statement, filters, index, base):
+    got = plan(planned, statement, {**base, **filters})
+    assert index in got, f"{statement} {filters} no longer reads {index}: {got}"
+    assert "SCAN cairnq_tasks" not in got, (
+        f"{statement} {filters} reads the whole table, so the filter buys nothing: {got}"
+    )
+
+
+def test_purge_unfiltered_reads_in_completion_order(planned):
+    """The bounded-sweep property: `limit` can only stop early if the ORDER BY is
+    served by the index rather than by a sort over everything past the cutoff."""
+    got = plan(planned, "purge", PURGE_BASE)
+    assert "cairnq_tasks_completed_idx" in got, got
+    assert "TEMP B-TREE" not in got, f"purge now sorts instead of reading in order: {got}"
 
 
 def test_queue_depth_stays_bounded(planned):
@@ -131,13 +159,3 @@ def test_queue_depth_stays_bounded(planned):
     # the probe is a SEARCH on that prefix rather than a scan of the table is.
     assert "cairnq_tasks_claim" in got, got
     assert "SCAN cairnq_tasks" not in got, f"queue_depth now scans the table: {got}"
-
-
-def test_stats_filtered_to_one_queue_reads_only_that_queue(planned):
-    """The reason stats takes a queue at all. Unfiltered it aggregates the table;
-    filtered it should reach the (queue, status) prefix of the claim index."""
-    got = plan(planned, "stats_one_queue", {"queue": "default"})
-    assert "cairnq_tasks_claim" in got, got
-    assert "SCAN cairnq_tasks" not in got, (
-        f"stats(queue) reads the whole table, so narrowing it buys nothing: {got}"
-    )

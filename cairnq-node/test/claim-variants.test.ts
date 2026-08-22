@@ -53,25 +53,6 @@ const VARIANTS: Record<
       { equality: "and name = :name", optionalPattern: /:names/ },
     ],
   },
-  purge_one_queue: {
-    source: "purge",
-    swaps: [{ equality: "and queue = :queue", optionalPattern: /:queue(::text)? is null/ }],
-  },
-  purge_one_status: {
-    source: "purge",
-    swaps: [{ equality: "and status = :status", optionalPattern: /:status(::text)? is null/ }],
-  },
-  purge_one_queue_one_status: {
-    source: "purge",
-    swaps: [
-      { equality: "and queue = :queue", optionalPattern: /:queue(::text)? is null/ },
-      { equality: "and status = :status", optionalPattern: /:status(::text)? is null/ },
-    ],
-  },
-  stats_one_queue: {
-    source: "stats",
-    swaps: [{ equality: "where queue = :queue", optionalPattern: /:queue(::text)? is null/ }],
-  },
 };
 
 describe("every variant mirrors the statement it specializes", () => {

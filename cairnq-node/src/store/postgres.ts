@@ -6,6 +6,7 @@ import {
   type Fetch,
   NAMED,
   type Params,
+  specialize,
   statementParams,
   TaskStore,
   type WatchSignal,
@@ -488,7 +489,7 @@ export class PostgresStore extends TaskStore {
   // ------------------------------------------------------------ dialect seam
   protected async fetch(name: string, params: Params): Promise<any[]> {
     await this.ensure();
-    const { text, values } = toPositional(this.statements[name], params);
+    const { text, values } = toPositional(specialize(this.statements[name], params), params);
     return this.executor!.query(text, values);
   }
 
@@ -507,7 +508,7 @@ export class PostgresStore extends TaskStore {
   /** A Fetch that runs the protocol's statements on one particular session. */
   private boundFetch(s: PgSession): Fetch {
     return async (name, params) => {
-      const { text, values } = toPositional(this.statements[name], params);
+      const { text, values } = toPositional(specialize(this.statements[name], params), params);
       return s.query(text, values);
     };
   }

@@ -345,25 +345,32 @@ is one of them being wrong. Both SDKs build tiered retention on this: a rule run
 one filtered purge per entry, and a per-status cutoff map is the common case of
 that spelled shorter.
 
-Reaching those filters' indexes takes **specialized statements**, not just the
-indexes. `purge` ships four — `purge`, `purge_one_queue`, `purge_one_status`,
-`purge_one_queue_one_status` — and the SDK picks one per call, the same trade
-`claim` makes for the same kind of reason. An optional `(:p is null or col = :p)`
-filter is planned before the parameter has a value, so SQLite must plan both
-branches and reaches no index at all: with the optional form, migrations `0007`
-`(status, completed_at_ms)` and `0009` `(queue, completed_at_ms)` are never read
-and every filtered sweep walks the whole retained backlog in completion order,
-discarding what does not match. `limit` bounds what comes back, never what is
-read. With the equality form each shape seeks only its own range. `stats` has the
-same split (`stats` / `stats_one_queue`) for the same reason; `name` is left
-optional everywhere because no index covers it.
+Reaching those filters' indexes takes more than the indexes. `(:p is null or
+col = :p)` cannot use one: SQLite plans a statement when it is prepared, before
+any parameter has a value, so it must plan for both branches and settles for a
+scan. Every optional filter in the protocol had this — `purge`'s and `stats`'s,
+and `list`'s five, whose four indexes from `0001` had never been read since the
+day they shipped.
 
-Postgres does not share SQLite's constraint — it re-plans with the parameter
-values for a statement's first executions and folds the null branch away — but it
-ships every variant regardless, because both dialects carry the same statement
-set and a caller that had to know which dialect indexes which form would be a
-worse contract. The plans themselves are pinned by tests rather than by these
-paragraphs (`test_query_plans.py`).
+So the SDKs **specialize** instead: before running a statement, each rewrites the
+optional filters the caller actually supplied to equalities (`specialize` in each
+store's base, memoized on the text and on which filters are active — a small
+bounded set per statement). Filters the caller left out stay as they are; a
+constant-true term is cheap and leaving it keeps the parameter set identical to
+the file's. Postgres re-plans with the values for a statement's first executions
+and folds the branch away by itself, so specialization is a no-op there; it runs
+anyway, because one behaviour is easier to reason about than two.
+
+This is a different problem from the one `claim`'s variants solve. There the
+filter is list-valued (`name in (…)` over a JSON array or an array parameter) and
+no rewrite of the same text helps — the statement itself has to be a different
+one, which is why `claim_one_name.sql` and its siblings are files rather than a
+derivation. An optional filter needs only its own text back with one branch
+removed.
+
+`name` gains nothing from any of this in `purge`: no index covers it, so it is a
+residual predicate whichever form it takes. The plans are pinned by tests rather
+than by these paragraphs (`test_query_plans.py`).
 
 `get_status` / `get_status_by_key` are the **status-only probes** behind the wait
 loop: `id` and `status` alone, because a waiting caller asks nothing but "is it

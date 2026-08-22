@@ -131,6 +131,49 @@ LEASE_EXPIRED_ERROR_JSON = dump_json(
 COMMENT = re.compile(r"--[^\n]*")
 # A `:name` placeholder. The lookbehind spares Postgres `::type` casts.
 NAMED = re.compile(r"(?<!:):(\w+)")
+# An optional filter: `(:p is null or col = :p)`, with the `::type` cast the
+# Postgres dialect adds to pin the parameter's type. The back-reference is what
+# keeps it from matching anything else — both halves must name the same
+# parameter. claim's `(:names is null or name in (…))` deliberately does not
+# match: a list-valued filter is a different problem, and claim_one_name.sql is
+# its answer.
+OPTIONAL_FILTER = re.compile(r"\(:(\w+)(?:::[\w\[\]]+)? is null or (\S+) = :\1\)")
+
+
+@lru_cache(maxsize=None)
+def _specialized(sql: str, active: frozenset[str]) -> str:
+    return OPTIONAL_FILTER.sub(
+        lambda m: f"{m.group(2)} = :{m.group(1)}" if m.group(1) in active else m.group(0),
+        sql,
+    )
+
+
+def specialize(sql: str, params: dict[str, Any]) -> str:
+    """The statement as it should run for these arguments: every optional filter
+    the caller actually supplied rewritten to an equality.
+
+    `(:p is null or col = :p)` cannot use an index. SQLite plans a statement when
+    it is prepared, before any parameter has a value, so it must plan for both
+    branches and settles for a scan; that is not a tuning detail but the whole
+    difference between `list(root_id=…)` seeking cairnq_tasks_root_idx and
+    reading the table. Postgres re-plans with the values for a statement's first
+    executions and folds the branch away on its own, so this is a no-op there —
+    but it costs nothing, and one behaviour is easier to reason about than two.
+
+    Filters the caller did NOT supply are left alone rather than removed: a
+    constant-true term costs a per-row evaluation the planner mostly discards,
+    and leaving them keeps the parameter set identical to the file's, so the
+    binding paths need to know nothing about any of this.
+
+    Memoized on (text, which filters are active) — a small, bounded set per
+    statement, reached within the first few calls and constant thereafter.
+    """
+    active = frozenset(
+        name for name, _ in OPTIONAL_FILTER.findall(sql) if params.get(name) is not None
+    )
+    if not active:
+        return sql
+    return _specialized(sql, active)
 
 
 @lru_cache(maxsize=None)
@@ -490,18 +533,8 @@ class TaskStore(ABC):
         coordinate, so it routinely carries two workloads whose rows have nothing
         to do with each other's lifetimes."""
         validate_purge_input(older_than_ms=older_than_ms, status=status, limit=limit)
-        # Each optional filter has an equality form, picked here — the same trade
-        # _claim_session makes between claim and its specializations, for the
-        # same reason. `(:queue is null or queue = :queue)` is planned before any
-        # parameter has a value, so on SQLite it can use no index at all and the
-        # sweep walks every row past the cutoff, whichever queue it belongs to.
-        # See purge_one_queue.sql. `name` is not specialized: nothing indexes it.
-        if queue is not None:
-            statement = "purge_one_queue_one_status" if status else "purge_one_queue"
-        else:
-            statement = "purge_one_status" if status else "purge"
         rows = await self._fetch(
-            statement,
+            "purge",
             {
                 "older_than_ms": older_than_ms,
                 "queue": queue,
@@ -535,11 +568,7 @@ class TaskStore(ABC):
         # rows to seed from, and that is exactly the case the promise is about.
         if queue is not None:
             out[queue] = dict.fromkeys(STATUSES, 0)
-        # Equality form when a queue was named — see stats_one_queue.sql: the
-        # optional filter cannot be indexed, so the "narrowed" form would read
-        # the whole table anyway and narrowing would buy nothing.
-        statement = "stats_one_queue" if queue is not None else "stats"
-        for row in await self._fetch(statement, {"queue": queue}):
+        for row in await self._fetch("stats", {"queue": queue}):
             per = out.setdefault(row["queue"], dict.fromkeys(STATUSES, 0))
             per[row["status"]] = int(row["count"])
         return out

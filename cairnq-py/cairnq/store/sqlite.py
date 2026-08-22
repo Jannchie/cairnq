@@ -50,7 +50,14 @@ import aiosqlite
 
 from .._ids import now_ms
 from .._sql import load_migrations, load_statements
-from .base import COMMENT, Fetch, TaskStore, check_protocol_version, statement_params
+from .base import (
+    COMMENT,
+    Fetch,
+    TaskStore,
+    check_protocol_version,
+    specialize,
+    statement_params,
+)
 
 
 def _split_script(script: str) -> list[str]:
@@ -409,7 +416,7 @@ class SQLiteStore(TaskStore):
         return bound
 
     async def _run(self, name: str, params: dict[str, Any]) -> list[aiosqlite.Row]:
-        sql = self._sql[name]
+        sql = specialize(self._sql[name], params)
         cur = await self._conn.execute(sql, self._bind(sql, params))
         rows = await cur.fetchall()
         await cur.close()

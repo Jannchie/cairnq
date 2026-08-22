@@ -12,6 +12,7 @@ import {
   COMMENT,
   type Fetch,
   type Params,
+  specialize,
   statementParams,
   TaskStore,
 } from "./base.js";
@@ -231,7 +232,14 @@ function enableWal(db: DB): void {
  */
 export class SQLiteStore extends TaskStore {
   private db: DB | null = null;
-  private stmts: Record<string, Stmt> = {};
+  /**
+   * Prepared statements, keyed by the SQL they were prepared from rather than by
+   * statement name: `specialize` gives a statement one text per set of optional
+   * filters a caller supplies, and each of those is its own prepared plan — which
+   * is the entire point, since the plan is what the specialization changes.
+   * Bounded by the statement set times the filter combinations actually used.
+   */
+  private stmts = new Map<string, Stmt>();
   private readonly statements: Record<string, string>;
   /** This store's entry in `fileLocks` — see there for why it is per-database. */
   private readonly lockKey: string;
@@ -274,7 +282,7 @@ export class SQLiteStore extends TaskStore {
     if (this.db) {
       this.db.close();
       this.db = null;
-      this.stmts = {};
+      this.stmts.clear();
     }
   }
 
@@ -304,8 +312,10 @@ export class SQLiteStore extends TaskStore {
       if (!isBusy(err)) throw err;
     }
     this.nextStatsRefreshAt = Date.now() + STATS_REFRESH_INTERVAL_MS;
-    for (const [name, sql] of Object.entries(this.statements)) {
-      this.stmts[name] = db.prepare(sql);
+    // Warm the unfiltered texts, which every statement has and most callers use.
+    // The specialized ones prepare on first use; see `stmts`.
+    for (const sql of Object.values(this.statements)) {
+      this.stmts.set(sql, db.prepare(sql));
     }
     this.db = db;
     checkProtocolVersion(this.readProtocolVersion());
@@ -400,8 +410,13 @@ export class SQLiteStore extends TaskStore {
   }
 
   private runNow(name: string, params: Params): any[] {
-    const stmt = this.stmts[name];
-    const bound = this.bind(this.statements[name], params);
+    const sql = specialize(this.statements[name], params);
+    let stmt = this.stmts.get(sql);
+    if (!stmt) {
+      stmt = this.db!.prepare(sql);
+      this.stmts.set(sql, stmt);
+    }
+    const bound = this.bind(sql, params);
     // Nearly every protocol statement ends in RETURNING; upsert_key does not, and
     // better-sqlite3 refuses .all() on a statement that yields no rows.
     if (!stmt.reader) {

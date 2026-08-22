@@ -31,6 +31,7 @@ from .base import (
     TaskStore,
     WatchSignal,
     check_protocol_version,
+    specialize,
     statement_params,
 )
 
@@ -460,14 +461,14 @@ class PostgresStore(TaskStore):
     async def _fetch(self, name: str, params: dict[str, Any]) -> list[Any]:
         await self._ensure()
         assert self._executor is not None
-        text, values = to_positional(self._sql[name], params)
+        text, values = to_positional(specialize(self._sql[name], params), params)
         return await self._executor.query(text, values)
 
     def _bound_fetch(self, session: PgSession) -> Fetch:
         """A Fetch that runs the protocol's statements on one particular session."""
 
         async def fetch(name: str, params: dict[str, Any]) -> list[Any]:
-            text, values = to_positional(self._sql[name], params)
+            text, values = to_positional(specialize(self._sql[name], params), params)
             return await session.query(text, values)
 
         return fetch
