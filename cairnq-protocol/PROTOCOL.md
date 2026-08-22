@@ -127,8 +127,10 @@ A worker **leases** a task rather than popping it:
     than the fix changes it on some of them, and only the TypeScript SDK pins its
     version (better-sqlite3 bundles SQLite; the Python SDK links the
     interpreter's). Two things it does not fix: an empty
-    draw still walks the range (350us there), and `claimable_probe`, whose
-    two-armed `EXISTS` cannot use the index at all, is unchanged at ~2.2ms. These
+    draw still walks the range (350us there), and SQLite's `claimable_probe`, whose
+    two-armed `EXISTS` cannot use the index at all, is unchanged at ~2.2ms. (The
+    Postgres probe, added later, splits the arms into two `EXISTS` for exactly
+    this reason and does index.) These
     are SQLite numbers; the Postgres side is reasoned, not benchmarked.
   - The rows a claim *returns* are not in claim order: the order decides which
     rows are taken, and `RETURNING` then follows the UPDATE's own visit order.
@@ -288,11 +290,22 @@ concurrency, so the backlog worth pushing back on is work nobody has picked up.
 Delayed tasks (`run_at_ms` in the future) count — they are queued work that will
 run, and excluding them would let an unbounded pile of them through a gate.
 
-`claim` first runs a read-only `claimable_probe` (SQLite only); only if it reports
-work does it open the `BEGIN IMMEDIATE` write transaction (recover expired leases +
-claim). This keeps idle workers off SQLite's single write lock. Postgres skips the
-probe: its readers don't block writers, and `FOR UPDATE SKIP LOCKED` makes
-concurrent claims non-contending.
+`claim` first runs a read-only `claimable_probe`; only if it reports work does it
+open the claim transaction (recover expired leases + claim). Both dialects ship
+one, for different reasons. On SQLite it keeps idle workers off the single write
+lock — the reason the probe exists at all. On Postgres readers don't block
+writers and `FOR UPDATE SKIP LOCKED` makes concurrent claims non-contending, so
+nothing is being protected; what the probe saves there is the poll itself. An
+empty poll otherwise opens a transaction, runs `recover_leases`, and then runs
+one claim statement per self-limiting name, so a worker declaring a dozen such
+names spends a dozen statements to learn there is nothing to do — and on Postgres
+the empty poll is the common case exactly because LISTEN wakes the worker for the
+other one. The Postgres statement is two separate `EXISTS` rather than one select
+with an `OR`, so each arm can choose its own index (`cairnq_tasks_claim_idx` for
+the queued arm, `cairnq_tasks_lease_idx` for the lease arm); the SQLite twin's
+single two-armed `EXISTS` is the shape that cannot. Neither probe makes an empty
+poll free: the queued arm still walks its range when every row in it is backing
+off. What it removes is the transaction and the other statements.
 
 The write transaction may run a claim statement **more than once**, each with its
 own name filter and `limit` — that is how a worker gives each task name its own

@@ -662,8 +662,3 @@ class SQLiteStore(TaskStore):
                 self._lock.release()
                 await wait(exc)
 
-    async def _has_claimable_work(self, params: dict[str, Any]) -> bool:
-        # Read-only probe first: an idle worker never takes SQLite's single write
-        # lock, so idle workers don't serialize against each other.
-        rows = await self._fetch("claimable_probe", params)
-        return bool(rows and rows[0]["has_work"])

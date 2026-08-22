@@ -644,10 +644,4 @@ export class SQLiteStore extends TaskStore {
     });
   }
 
-  protected async hasClaimableWork(params: Params): Promise<boolean> {
-    // Read-only probe first: an idle worker never takes SQLite's single write
-    // lock, so idle workers don't serialize against each other.
-    const rows = await this.fetch("claimable_probe", params);
-    return Boolean(rows[0]?.has_work);
-  }
 }

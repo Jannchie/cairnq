@@ -71,8 +71,10 @@ export function toPositional(
  * policy, and time taken from the DB clock (`now()`) instead of from the SDK,
  * which is what makes this backend multi-host — unlike SQLite it coordinates API
  * and worker processes across machines, with no shared clock to agree on. claim
- * uses FOR UPDATE SKIP LOCKED and needs no claimable_probe, because PG readers
- * don't block writers. JSON columns are jsonb (bound as JSON text, read back as
+ * uses FOR UPDATE SKIP LOCKED, so unlike SQLite it does not need
+ * `claimable_probe` to keep idle workers off a write lock — it runs one anyway,
+ * to keep an empty poll from costing a transaction plus a statement per
+ * self-limiting name. JSON columns are jsonb (bound as JSON text, read back as
  * objects by rowToTask).
  *
  * What it deliberately does NOT own is the connection. Given a DSN it builds a

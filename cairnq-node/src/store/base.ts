@@ -299,12 +299,21 @@ export abstract class TaskStore {
   protected warmPush?(): void;
 
   /**
-   * Whether it is worth opening the claim transaction at all. SQLite gates its
-   * single write lock behind a read-only probe; Postgres readers don't block
-   * writers, so it just says yes.
+   * Whether it is worth opening the claim transaction at all — the read-only
+   * `claimable_probe`, which every dialect ships.
+   *
+   * Both dialects want it, for different reasons: SQLite so an idle worker never
+   * takes its single write lock and idle workers stop serializing against each
+   * other, Postgres so an empty poll costs one statement instead of a
+   * transaction plus `recover_leases` plus one claim statement per
+   * self-limiting name. Neither reason is dialect-specific enough to live in a
+   * dialect: what differs is the SQL, which is where the protocol keeps dialect
+   * differences already. A backend whose probe would cost more than the claim it
+   * guards overrides this with `return true`.
    */
-  protected async hasClaimableWork(_params: Params): Promise<boolean> {
-    return true;
+  protected async hasClaimableWork(params: Params): Promise<boolean> {
+    const rows = await this.fetch("claimable_probe", params);
+    return Boolean(rows[0]?.has_work);
   }
 
   // ------------------------------------------------------------ wake channel

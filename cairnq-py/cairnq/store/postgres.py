@@ -4,8 +4,10 @@ Everything protocol-shaped lives in TaskStore; this file is only what Postgres
 does differently: an asyncpg pool, `:name` -> `$n` translation, and time taken
 from the DB clock (`now()`) instead of from the SDK, which is what makes this
 backend multi-host — unlike SQLite it coordinates API and worker processes across
-machines, with no shared clock to agree on. claim uses FOR UPDATE SKIP LOCKED and
-needs no claimable_probe, because PG readers don't block writers.
+machines, with no shared clock to agree on. claim uses FOR UPDATE SKIP LOCKED, so
+unlike SQLite it does not need claimable_probe to keep idle workers off a write
+lock — it runs one anyway, to keep an empty poll from costing a transaction plus
+a statement per self-limiting name.
 
 asyncpg is an optional dependency (install ``cairnq[postgres]``); it is imported
 lazily in __init__ so the rest of the SDK works without it."""
