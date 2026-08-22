@@ -340,12 +340,53 @@ SQLite accepts it, so keep NUL characters out of payloads that need portability.
   read-only probe gates each poll); busy ones still contend. This is built for
   low-write, long-running AI work — not as a high-throughput message queue.
 - **A contended SQLite write waits, but does not block.** Losing the write lock
-  costs up to `busyTimeoutMs` (5s default) before the write fails — and the
-  process stays responsive throughout, in both SDKs.
+  costs up to `busyTimeoutMs` (5s default) before the write fails. Both SDKs spend
+  that wait as an awaited backoff rather than inside the driver, so the process
+  stays responsive throughout *and* the store keeps serving reads — under WAL a
+  reader never needed that lock in the first place.
 - **Nothing is deleted for you.** Terminal tasks accumulate until you call
   `purge` — budget for a retention sweep on a long-lived database.
 - **Full trust on the store.** There is no in-database authorization — any process
   that can open it has full access. Protect the file with OS permissions.
+
+## Upgrading
+
+Migrations run themselves. The first process to open a database after an upgrade
+applies whatever is new, and the check and the apply share one write transaction,
+so several processes cold-starting together cannot both decide a migration is
+unapplied. There is nothing to run by hand and no separate migration command.
+
+Two things are worth knowing before rolling one out.
+
+**Mixed versions are fine, on purpose.** `protocol_version` is the only thing an
+SDK refuses to run against; `schema_version` deliberately is not, so an older SDK
+against a newly migrated database keeps working — occasionally slower, never
+wrong. That is what makes a rolling upgrade possible: bring the API process and
+the workers across in whatever order suits you. (Downgrading is the same
+mechanism: migrations are not reversible, and an older SDK simply runs against
+the newer schema.)
+
+**A migration that rebuilds an index holds the write lock while it builds.** That
+is the one window an upgrade can be felt in, and it grows with the table — which
+is another reason to run [retention](#what-you-get) rather than keeping every
+terminal row forever. Migration `0008` is the current example, and measured on a
+warm local SSD it rebuilds both claim indexes in about **6s for a 1M-row, 500MB
+SQLite database** (~2.5s and ~3.4s respectively — the migration records the split;
+proportionally less below that, and a cold or networked disk is worse).
+
+During that window every other process's writes wait — and on SQLite they wait
+only as long as `busyTimeoutMs` / `busy_timeout_ms` (5s by default) before
+failing, so on a database that large the default is *not* enough to sit the
+rebuild out. On a big database, then: upgrade in a window where a paused submit
+is affordable, or raise the busy timeout for the processes that stay up, or purge
+first — a rebuild only pays for the rows still there. On Postgres the same
+rebuild blocks writes to `cairnq_tasks` for its duration; there is no
+`CONCURRENTLY` available, because it cannot run inside the transaction the
+migration ledger needs.
+
+Small databases — the desktop app, the single-host service, anything under a few
+hundred thousand rows — need none of this. The rebuild is milliseconds and the
+upgrade is invisible.
 
 ## Layout
 

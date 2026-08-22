@@ -21,6 +21,13 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: cairnq-node/pnpm-lock.yaml
+      # The two packages publish together under one `v*` tag, so they must carry
+      # one version. RELEASING.md says this script "exits non-zero on drift, so it
+      # also works as a CI guard" — this step is what makes that sentence true;
+      # drift would otherwise surface at publish time, on a tag already pushed.
+      # It rides in this job rather than taking a runner of its own: it needs a
+      # checkout and node, which are already here, and it takes milliseconds.
+      - run: node ../scripts/bump-version.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
