@@ -102,16 +102,40 @@ class PostgresStore(TaskStore):
         # LISTEN is off for good: the store was closed, or the server accepted
         # a connection but refused LISTEN (e.g. a transaction-mode pooler) —
         # deterministic, so retrying would fail the same way every time.
-        self._listener_unavailable = False
         # A failure to even connect is transient (network blip, server
         # restarting): retry, but not before this loop-clock time, backing off
-        # so a down server is not hammered from the poll loop.
-        self._listener_retry_at = 0.0
-        self._listener_backoff_ms = LISTENER_RETRY_MS
+        # so a down server is not hammered from the poll loop. These three are
+        # re-armed together by _reset_listener_state().
+        self._reset_listener_state()
+        # Bumped by close(). A connect() that started before the bump must not
+        # publish what it built: close() does not take the init lock, so an
+        # in-flight connect outlives it and would otherwise install an executor —
+        # and, worse, a LISTEN connection — on a store nobody will close again.
+        self._generation = 0
         # Queues notified while nobody was waiting; consumed by the next
         # claim_wake so a wake that lands between polls is not lost. The event
         # broadcasts "some queue was notified"; waiters filter for themselves.
         self._pending_queues: set[str] = set()
+        # The queues some caller has actually waited on — the only ones worth
+        # buffering into _pending_queues.
+        #
+        # Without it that buffer is a leak: every cairnq_queued notification
+        # lands in it, and only claim_wake consumes, and only the queues it
+        # names. A client-side handle never calls claim_wake at all, and a worker
+        # only ever names its own queues — so a deployment whose queue names
+        # carry an identity ("user:1234") grows the set forever. This one is
+        # bounded by what this process claims from, which is its own config.
+        #
+        # Registered from claim_session as well as from claim_wake, so a
+        # worker's queues are known from its first claim rather than from its
+        # first empty poll: a notification landing between those two would
+        # otherwise be dropped, costing a poll interval exactly when work has
+        # just arrived.
+        #
+        # The bound holds because a worker's queue list is its configuration. A
+        # caller driving claim_wake/claim with per-tenant queue names directly
+        # still accumulates one entry per distinct name it passes.
+        self._wakeable_queues: set[str] = set()
         self._queued_event = asyncio.Event()
         self._done_waiters: dict[str, set[asyncio.Event]] = {}
         # watch() subscribers. Separate from the wake events: a waiter is
@@ -128,6 +152,7 @@ class PostgresStore(TaskStore):
         async with self._init_lock:
             if self._executor is not None:
                 return
+            generation = self._generation
             executor = self._provided or await create_pool_executor(
                 self._dsn or "",
                 min_size=self._min_size,
@@ -146,8 +171,18 @@ class PostgresStore(TaskStore):
                     with contextlib.suppress(Exception):
                         await executor.close()
                 raise
+            # Closed while we were connecting: this executor has no owner, so
+            # drop it rather than publishing it. Nothing below may run — clearing
+            # _listener_unavailable here is exactly how a closed store would end
+            # up with a listener holding a connection forever.
+            if generation != self._generation:
+                if self._provided is None:
+                    with contextlib.suppress(Exception):
+                        await executor.close()
+                raise RuntimeError("store was closed while connecting")
             # Publish only a fully-migrated, version-checked executor.
             self._executor = executor
+            self._reset_listener_state()
             # Warm the LISTEN connection in the background so the first idle
             # sleep is already wakeable. Fire-and-forget: failure means polling.
             self._listener_ready()
@@ -235,7 +270,21 @@ class PostgresStore(TaskStore):
                         [name],
                     )
 
+    def _reset_listener_state(self) -> None:
+        """A fresh connection gets a fresh verdict on LISTEN.
+
+        Every path here connects lazily, so a store used again after close simply
+        reconnects — and without this it would reconnect permanently degraded to
+        polling, having decided "no push channel" about a connection that no
+        longer exists. Called from __init__ for the initial state and from
+        connect() for every later one, so the three fields cannot be re-armed by
+        halves. Only ever safe under connect()'s generation check."""
+        self._listener_unavailable = False
+        self._listener_retry_at = 0.0
+        self._listener_backoff_ms = LISTENER_RETRY_MS
+
     async def close(self) -> None:
+        self._generation += 1  # disown any connect still in flight
         self._listener_unavailable = True  # no revival after close
         stop, self._listener = self._listener, None
         if stop is not None:
@@ -253,7 +302,11 @@ class PostgresStore(TaskStore):
             await executor.close()
 
     # ----------------------------------------------------------- wake channel
+    def _register_wakeable(self, queues: list[str]) -> None:
+        self._wakeable_queues.update(queues)
+
     async def claim_wake(self, queues: list[str], timeout_ms: int) -> None:
+        self._register_wakeable(queues)
         if not self._listener_ready():
             await super().claim_wake(queues, timeout_ms)
             return
@@ -348,7 +401,9 @@ class PostgresStore(TaskStore):
 
     def _on_notification(self, channel: str, payload: str | None) -> None:
         if channel == QUEUED_CHANNEL and payload:
-            self._pending_queues.add(payload)
+            # Buffered only for a queue someone waits on — see _wakeable_queues.
+            if payload in self._wakeable_queues:
+                self._pending_queues.add(payload)
             self._queued_event.set()
             self._publish(WatchSignal(reason="queued", queue=payload))
         elif channel == DONE_CHANNEL and payload:

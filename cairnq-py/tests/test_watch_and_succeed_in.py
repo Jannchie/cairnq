@@ -163,6 +163,67 @@ async def test_watch_drops_queues_it_was_not_asked_about():
         stop()
 
 
+# close() does not take the init lock — it only drops the handle to whatever
+# connect() is doing. That connect resumes afterwards, and if it publishes what it
+# built, a store nobody will close again ends up owning a LISTEN connection.
+async def test_does_not_install_a_listener_for_a_store_closed_while_connecting():
+    listens = 0
+    gate = asyncio.Event()
+
+    async def listen(_channels, _on_notify, _on_close):
+        nonlocal listens
+        listens += 1
+        return lambda: None
+
+    executor = _executor(listen=listen)
+
+    async def slow_execute(_sql: str) -> None:
+        # Stands in for the migration round-trips: connect is mid-flight here.
+        await gate.wait()
+
+    executor.execute = slow_execute
+    store = PostgresStore(executor)
+
+    connecting = asyncio.create_task(store.connect())
+    await asyncio.sleep(0)  # let connect reach the gate
+    await store.close()
+    gate.set()
+    with pytest.raises(RuntimeError, match="closed while connecting"):
+        await connecting
+
+    # Nothing subscribed, and nothing can start one later either.
+    assert listens == 0
+    store.watch(lambda _s: None, poll_ms=60_000)()
+    await asyncio.sleep(0.02)
+    assert listens == 0
+
+
+# claim_wake's buffer, which watch() shares a listener with. A notification that
+# lands between two polls has to survive until the next claim_wake asks — but only
+# for a queue somebody actually waits on, or the buffer is a leak that grows with
+# every distinct queue name the database ever sees.
+async def test_buffers_a_wake_for_a_waited_queue_and_only_for_those():
+    store, captured = await _pushing_store()
+    # Establishes both the subscription and what this process waits on.
+    await store.claim_wake(["render"], 1)
+    await _settled(store)
+
+    captured["notify"]("cairnq_queued", "ingest")
+    captured["notify"]("cairnq_queued", "user:1234")
+    # Nothing waits on those, so nothing is remembered about them.
+    assert store._pending_queues == set()
+
+    captured["notify"]("cairnq_queued", "render")
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    # Buffered while nobody was waiting, so this returns on the notification
+    # rather than waiting out its timeout.
+    await store.claim_wake(["render"], 60_000)
+    assert loop.time() - started_at < 1.0
+
+    await store.close()
+
+
 async def test_watch_keeps_signalling_where_there_is_no_push_channel(client):
     # SQLite has no channel; the consumer must still be told to re-read.
     seen: list[WatchSignal] = []

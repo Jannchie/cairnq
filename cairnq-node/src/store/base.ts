@@ -276,6 +276,13 @@ export abstract class TaskStore {
   protected subscribePush?(onSignal: (signal: WatchSignal) => void): () => void;
 
   /**
+   * Tell a store with a push channel which queues this process will wait on, so
+   * it can buffer their notifications and ignore everyone else's. Optional: a
+   * store without a push channel has nothing to buffer.
+   */
+  protected registerWakeable?(queues: string[]): void;
+
+  /**
    * Nudge the push channel back up if it has dropped. Called from `watch`'s
    * timer, which is the only thing keeping a client-side subscriber alive: a
    * process that never claims never calls claimWake, so without this a listener
@@ -640,9 +647,12 @@ export abstract class TaskStore {
    * `plan` runs with the write lock held, so it must await nothing but that
    * callback.
    *
-   * `names` is the union `plan` might ask for — the probe and the recovery are
-   * filtered by it. Returns undefined when the probe finds nothing claimable, in
-   * which case `plan` never runs and no transaction is opened.
+   * `names` is the union `plan` might ask for, and it filters the probe's
+   * queued-work arm. Lease recovery is deliberately NOT filtered by it — nor is
+   * the probe's expired-lease arm — because reclaiming a dead worker's task is
+   * every worker's job, whatever names it happens to handle. Returns undefined
+   * when the probe finds nothing claimable, in which case `plan` never runs and
+   * no transaction is opened.
    */
   async claimSession<T>(
     input: { queues: string[]; workerId: string; leaseMs?: number; names: string[] | null },
@@ -664,6 +674,9 @@ export abstract class TaskStore {
       limit: 1,
       lease_expired_error: LEASE_EXPIRED_ERROR_JSON,
     };
+    // Before the probe: a push-channel store has to know what this caller waits
+    // on from its FIRST claim, not from its first empty poll.
+    this.registerWakeable?.(input.queues);
     if (!(await this.hasClaimableWork(base))) return undefined;
     return this.tx(async (fetch) => {
       await fetch("recover_leases", base);

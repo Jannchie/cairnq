@@ -95,6 +95,61 @@ describe("watch", () => {
     }
   });
 
+  // close() does not await a connect that is still in flight — it only drops the
+  // handle to it. That connect resumes afterwards, and if it publishes what it
+  // built, a store nobody will close again ends up owning a LISTEN connection
+  // whose socket keeps the process alive by itself.
+  it("does not install a listener for a store closed while it was connecting", async () => {
+    const fake = listeningExecutor();
+    let releaseMigrations!: () => void;
+    const gate = new Promise<void>((r) => (releaseMigrations = r));
+    const slow: PgExecutor = {
+      ...fake.executor,
+      // Stands in for the migration round-trips: connect is mid-flight here.
+      async exec(): Promise<void> {
+        await gate;
+      },
+    };
+    const store = new PostgresStore(slow);
+
+    const connecting = store.connect();
+    await store.close();
+    releaseMigrations();
+    await expect(connecting).rejects.toThrow(/closed while connecting/);
+
+    // Nothing subscribed, and nothing can start one later either.
+    expect(fake.subscriptions).toBe(0);
+    store.watch({ pollMs: 60_000 }, () => {})();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fake.subscriptions).toBe(0);
+  });
+
+  // claimWake's buffer, which watch() shares a listener with. A notification that
+  // lands between two polls has to survive until the next claimWake asks — but
+  // only for a queue somebody actually waits on, or the buffer is a leak that
+  // grows with every distinct queue name the database ever sees.
+  it("buffers a wake for a queue that is waited on, and only for those", async () => {
+    const fake = listeningExecutor();
+    const store = new PostgresStore(fake.executor);
+    await store.connect();
+    // Establishes both the subscription and what this process waits on.
+    await store.claimWake(["render"], 1);
+
+    await fake.emit("cairnq_queued", "ingest");
+    await fake.emit("cairnq_queued", "user:1234");
+    // Nothing waits on those, so nothing is remembered about them.
+    expect([...(store as unknown as { pendingQueues: Set<string> }).pendingQueues]).toEqual([]);
+
+    await fake.emit("cairnq_queued", "render");
+    const startedAt = Date.now();
+    // Buffered while nobody was waiting, so this returns on the notification
+    // rather than waiting out its timeout.
+    await store.claimWake(["render"], 60_000);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+
+    await store.close();
+  });
+
   it("keeps signalling on the timer where there is no push channel at all", async () => {
     vi.useFakeTimers();
     try {

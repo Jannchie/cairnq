@@ -87,6 +87,14 @@ export class PostgresStore extends TaskStore {
   /** Set once migrations have run and the protocol version checked out. */
   private executor: PgExecutor | null = null;
   private connecting: Promise<void> | null = null;
+  /**
+   * Bumped by close(). A doConnect that started before the bump must not publish
+   * what it built: close() nulls `connecting` but does not await it, so an
+   * in-flight connect outlives the close and would otherwise install an executor
+   * — and, worse, a LISTEN connection — on a store nobody will close again. That
+   * connection's socket keeps the process alive on its own.
+   */
+  private generation = 0;
   private readonly statements: Record<string, string>;
 
   // ------------------------------------------------------- LISTEN/NOTIFY state
@@ -106,9 +114,31 @@ export class PostgresStore extends TaskStore {
    * hammered from the poll loop. */
   private listenerRetryAt = 0;
   private listenerBackoffMs = LISTENER_RETRY_MS;
+  // NB: these three are re-armed together by resetListenerState().
   /** Queues notified while nobody was waiting; consumed by the next claimWake
    * so a wake that lands between polls is not lost. */
   private readonly pendingQueues = new Set<string>();
+  /**
+   * The queues some caller has actually waited on — the only ones worth
+   * buffering into `pendingQueues`.
+   *
+   * Without it that buffer is a leak: every `cairnq_queued` notification lands in
+   * it, and only claimWake consumes, and only the queues it names. A client-side
+   * handle never calls claimWake at all, and a worker only ever names its own
+   * queues — so a deployment whose queue names carry an identity (`user:1234`)
+   * grows the set forever. This one is bounded by what this process claims from,
+   * which is its own configuration.
+   *
+   * Registered from `claimSession` as well as from `claimWake`, so a worker's
+   * queues are known from its first claim rather than from its first empty poll:
+   * a notification landing between those two would otherwise be dropped, costing
+   * a poll interval exactly when work has just arrived.
+   *
+   * The bound holds because a worker's queue list is its configuration. A caller
+   * driving `claimWake`/`claim` with per-tenant queue names directly still
+   * accumulates one entry per distinct name it passes.
+   */
+  private readonly wakeableQueues = new Set<string>();
   /** Wake callbacks by key: "queued" (broadcast) or "done:<task id>". */
   private readonly waiters = new Map<string, Set<() => void>>();
   /** watch() subscribers. Separate from `waiters`: a waiter is one-shot and
@@ -135,6 +165,7 @@ export class PostgresStore extends TaskStore {
   }
 
   async close(): Promise<void> {
+    this.generation++; // disown any connect still in flight
     this.listenerUnavailable = true; // no revival after close
     this.dropListener();
     const executor = this.executor;
@@ -159,7 +190,24 @@ export class PostgresStore extends TaskStore {
     await this.connecting;
   }
 
+  /**
+   * A fresh connection gets a fresh verdict on LISTEN.
+   *
+   * Every path here connects lazily, so a store used again after close simply
+   * reconnects — and without this it would reconnect permanently degraded to
+   * polling, having decided "no push channel" about a connection that no longer
+   * exists. Called from the constructor for the initial state and from doConnect
+   * for every later one, so the three fields cannot be re-armed by halves. Only
+   * ever safe under doConnect's generation check.
+   */
+  private resetListenerState(): void {
+    this.listenerUnavailable = false;
+    this.listenerRetryAt = 0;
+    this.listenerBackoffMs = LISTENER_RETRY_MS;
+  }
+
   private async doConnect(): Promise<void> {
+    const generation = this.generation;
     const executor =
       this.provided ??
       (await createPoolExecutor(this.dsn!, { max: this.opts.max, schema: this.opts.schema }));
@@ -174,7 +222,16 @@ export class PostgresStore extends TaskStore {
       if (!this.provided) await executor.close().catch(() => {});
       throw e;
     }
+    // Closed while we were connecting: this executor has no owner, so drop it
+    // rather than publishing it. Nothing below may run — clearing
+    // `listenerUnavailable` here is exactly how a closed store would end up with
+    // a listener holding a socket forever.
+    if (generation !== this.generation) {
+      if (!this.provided) await executor.close().catch(() => {});
+      throw new Error("store was closed while connecting");
+    }
     this.executor = executor; // publish only a fully-migrated, version-checked executor
+    this.resetListenerState();
     // Warm the LISTEN subscription in the background so the first idle sleep is
     // already wakeable. Fire-and-forget: failure just means polling.
     this.listenerReady();
@@ -274,7 +331,12 @@ export class PostgresStore extends TaskStore {
   }
 
   // ------------------------------------------------------------ wake channel
+  protected registerWakeable(queues: string[]): void {
+    for (const q of queues) this.wakeableQueues.add(q);
+  }
+
   async claimWake(queues: string[], timeoutMs: number): Promise<void> {
+    this.registerWakeable(queues);
     if (!this.listenerReady()) return super.claimWake(queues, timeoutMs);
     const deadline = Date.now() + timeoutMs;
     for (;;) {
@@ -385,7 +447,8 @@ export class PostgresStore extends TaskStore {
   private onNotification(channel: string, payload: string | undefined): void {
     let key: string;
     if (channel === QUEUED_CHANNEL && payload) {
-      this.pendingQueues.add(payload);
+      // Buffered only for a queue someone waits on — see wakeableQueues.
+      if (this.wakeableQueues.has(payload)) this.pendingQueues.add(payload);
       key = "queued";
       this.publish({ reason: "queued", queue: payload });
     } else if (channel === DONE_CHANNEL && payload) {

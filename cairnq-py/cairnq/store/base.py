@@ -239,7 +239,14 @@ class TaskStore(ABC):
 
     @abstractmethod
     def _transaction(self) -> AbstractAsyncContextManager[Fetch]:
-        """Run several statements atomically; yields a Fetch bound to the txn."""
+        """Run several statements atomically; yields a Fetch bound to the txn.
+
+        The block is entered once: a backend that retries (SQLite does, on
+        write-lock contention) retries only what happens before the transaction
+        exists, so nothing inside the block is ever replayed. The TypeScript twin
+        takes a callback and DOES replay it, so anything shared between the two —
+        `claim_session`'s `plan`, above all — must still be written to survive
+        running twice: derive nothing in it that the caller cannot derive again."""
 
     def _subscribe_push(
         self, on_signal: Callable[[WatchSignal], None]
@@ -248,6 +255,11 @@ class TaskStore(ABC):
         unsubscribe. A store without a push channel returns None and `watch`
         degrades to its timer alone."""
         return None
+
+    def _register_wakeable(self, queues: list[str]) -> None:
+        """Tell a store with a push channel which queues this process will wait
+        on, so it can buffer their notifications and ignore everyone else's. A
+        store without a push channel has nothing to buffer."""
 
     def _warm_push(self) -> None:
         """Nudge the push channel back up if it has dropped. Called from
@@ -620,9 +632,12 @@ class TaskStore(ABC):
         `plan` runs with the write lock held, so it must await nothing but that
         callback.
 
-        `names` is the union `plan` might ask for — the probe and the recovery are
-        filtered by it. Returns None when the probe finds nothing claimable, in
-        which case `plan` never runs and no transaction is opened."""
+        `names` is the union `plan` might ask for, and it filters the probe's
+        queued-work arm. Lease recovery is deliberately NOT filtered by it — nor
+        is the probe's expired-lease arm — because reclaiming a dead worker's task
+        is every worker's job, whatever names it happens to handle. Returns None
+        when the probe finds nothing claimable, in which case `plan` never runs
+        and no transaction is opened."""
         # A list-valued filter cannot be read in claim order, so the planner sorts
         # every claimable row to take LIMIT of them and the claim's cost grows
         # with the backlog while it holds the transaction. Both filters therefore
@@ -641,6 +656,9 @@ class TaskStore(ABC):
             "limit": 1,
             "lease_expired_error": LEASE_EXPIRED_ERROR_JSON,
         }
+        # Before the probe: a push-channel store has to know what this caller
+        # waits on from its FIRST claim, not from its first empty poll.
+        self._register_wakeable(queues)
         if not await self._has_claimable_work(base):
             return None
         # Recovery must share the claim's transaction: a lease reclaimed here has
