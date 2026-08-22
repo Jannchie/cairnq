@@ -41,7 +41,7 @@ from ..errors import (
     UnsupportedBackend,
     error_envelope,
 )
-from ..models import STATUSES, TERMINAL, Task, TaskRef, TaskStatus
+from ..models import STATUSES, Task, TaskRef, TaskStatus, is_terminal_status
 
 # Runs one named protocol statement and returns its rows.
 Fetch = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
@@ -66,7 +66,7 @@ def _reusable(conflict: Conflict, status: TaskStatus) -> bool:
     """
     if conflict == "replace":
         return False
-    if status not in TERMINAL:
+    if not is_terminal_status(status):
         return True
     return conflict == "reuse-succeeded" and status == "succeeded"
 
@@ -114,7 +114,7 @@ def validate_purge_input(
         raise ValueError(f"limit must be >= 1, got {limit}")
     # Terminal only: purge never deletes live work, so accepting `queued` here
     # would be accepting a filter that silently matches nothing.
-    if status is not None and status not in TERMINAL:
+    if status is not None and not is_terminal_status(status):
         raise ValueError(f"status must be terminal, got {status!r}")
 
 
@@ -386,7 +386,7 @@ class TaskStore(ABC):
                     # live: a terminal task has nothing to stop, and cancelling it
                     # would rewrite a settled row (and hand a `canceled` back to
                     # whoever is waiting on it).
-                    if rows[0]["status"] not in TERMINAL:
+                    if not is_terminal_status(rows[0]["status"]):
                         await fetch("cancel", {"id": existing[0]["task_id"]})
             rows = await fetch("insert_task", ins)
             await fetch("upsert_key", {"key": key, "task_id": task_id})

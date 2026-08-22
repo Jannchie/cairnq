@@ -53,7 +53,7 @@ class TaskRef:
 
     @property
     def is_terminal(self) -> bool:
-        return self.status in TERMINAL
+        return is_terminal_status(self.status)
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ class Task:
 
     @property
     def is_terminal(self) -> bool:
-        return self.status in TERMINAL
+        return is_terminal_status(self.status)
 
     @property
     def cancel_requested(self) -> bool:

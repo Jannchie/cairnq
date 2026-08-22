@@ -31,56 +31,9 @@ def members_of(cls: type) -> set[str]:
 
 
 def names(entries: list) -> list[str]:
-    return [e["member"] for e in entries]
-
-
-@pytest.mark.parametrize("cls_name", sorted(CLASSES))
-def test_has_every_shared_member(cls_name: str):
-    declared = SURFACE["classes"][cls_name]
-    missing = sorted(set(declared["shared"]) - members_of(CLASSES[cls_name]))
-    assert not missing, (
-        f"declared in surface.json but absent from cairnq-py: {missing}"
-    )
-
-
-@pytest.mark.parametrize("cls_name", sorted(CLASSES))
-def test_exemptions_still_describe_reality(cls_name: str):
-    declared = SURFACE["classes"][cls_name]
-    actual = members_of(CLASSES[cls_name])
-    assert not [m for m in names(declared["only_py"]) if m not in actual]
-    # A member listed as Node-only that turns up here means the asymmetry was
-    # closed and the exemption outlived its reason.
-    leaked = sorted(m for m in names(declared["only_node"]) if m in actual)
-    assert not leaked, (
-        f"exists in cairnq-py but surface.json still calls it Node-only: {leaked}"
-    )
-
-
-@pytest.mark.parametrize("cls_name", sorted(CLASSES))
-def test_declares_every_member_it_exposes(cls_name: str):
-    declared = SURFACE["classes"][cls_name]
-    # `internal` is NOT honored here. It exists only because TypeScript's
-    # `private` is erased at runtime, so the Node gate cannot tell a private
-    # method from a public one on its own. Python marks its own with a leading
-    # underscore, which members_of already drops — and honoring the list anyway
-    # would turn it into an escape hatch that silences BOTH gates, which is
-    # exactly the load-bearing direction surface.json exists to keep loud.
-    known = set(declared["shared"]) | set(names(declared["only_py"]))
-    undeclared = sorted(members_of(CLASSES[cls_name]) - known)
-    assert not undeclared, (
-        "add these to cairnq-protocol/surface.json — to `shared` (and implement "
-        "them in cairnq-node), to `only_py` with a reason, or rename them with a "
-        f"leading underscore if they are internal: {undeclared}"
-    )
-
-
-# --- the module gate ---
-# `classes` above covers the members of the three classes a caller drives; this
-# covers what the package exports at all. The failure mode it exists for is the
-# same one — a capability shipped on one side only — one level up, where the
-# class gate cannot see it.
-
-MODULES = SURFACE["modules"]
+    """The members an exemption list covers. An entry names one (`member`) or the
+    several that share one reason (`members`) — see surface.json."""
+    return [m for e in entries for m in (e.get("members") or [e["member"]])]
 
 
 def exported() -> set[str]:
@@ -93,26 +46,50 @@ def exported() -> set[str]:
     return set(cairnq.__all__)
 
 
-def test_exports_everything_shared():
-    missing = sorted(set(MODULES["shared"]) - exported())
-    assert not missing, f"declared in surface.json but not exported by cairnq-py: {missing}"
+#: Every surface the gate knows about: the three classes a caller drives, plus
+#: what the package exports at all. They assert the same three directions, so
+#: they run through the same tests — the module surface is not a special case,
+#: it is one more (declared, actual) pair.
+SURFACES = {
+    **{name: (SURFACE["classes"][name], members_of(cls)) for name, cls in CLASSES.items()},
+    "modules": (SURFACE["modules"], exported()),
+}
 
 
-def test_module_exemptions_still_describe_reality():
-    actual = exported()
-    assert not [m for m in names(MODULES["only_py"]) if m not in actual]
-    leaked = sorted(m for m in names(MODULES["only_node"]) if m in actual)
+@pytest.mark.parametrize("which", sorted(SURFACES))
+def test_has_every_shared_member(which: str):
+    declared, actual = SURFACES[which]
+    missing = sorted(set(declared["shared"]) - actual)
+    assert not missing, f"declared in surface.json but absent from cairnq-py: {missing}"
+
+
+@pytest.mark.parametrize("which", sorted(SURFACES))
+def test_exemptions_still_describe_reality(which: str):
+    declared, actual = SURFACES[which]
+    assert not [m for m in names(declared["only_py"]) if m not in actual]
+    # A member listed as Node-only that turns up here means the asymmetry was
+    # closed and the exemption outlived its reason.
+    leaked = sorted(m for m in names(declared["only_node"]) if m in actual)
     assert not leaked, (
-        f"exported by cairnq-py but surface.json still calls it Node-only: {leaked}"
+        f"exists in cairnq-py but surface.json still calls it Node-only: {leaked}"
     )
 
 
-def test_declares_every_export_it_publishes():
-    known = set(MODULES["shared"]) | set(names(MODULES["only_py"]))
-    undeclared = sorted(exported() - known)
+@pytest.mark.parametrize("which", sorted(SURFACES))
+def test_declares_every_member_it_exposes(which: str):
+    declared, actual = SURFACES[which]
+    # `internal` is NOT honored here. It exists only because TypeScript's
+    # `private` is erased at runtime, so the Node gate cannot tell a private
+    # method from a public one on its own. Python marks its own with a leading
+    # underscore, which members_of already drops — and honoring the list anyway
+    # would turn it into an escape hatch that silences BOTH gates, which is
+    # exactly the load-bearing direction surface.json exists to keep loud.
+    known = set(declared["shared"]) | set(names(declared["only_py"]))
+    undeclared = sorted(actual - known)
     assert not undeclared, (
-        "add these to cairnq-protocol/surface.json `modules` — to `shared` (and "
-        f"export them from cairnq-node), or to `only_py` with a reason: {undeclared}"
+        "add these to cairnq-protocol/surface.json — to `shared` (and implement "
+        "them in cairnq-node), to `only_py` with a reason, or rename them with a "
+        f"leading underscore if they are internal: {undeclared}"
     )
 
 

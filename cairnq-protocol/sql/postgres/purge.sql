@@ -21,6 +21,20 @@
 -- durable job's log kept for a week. Migration 0009 adds the index that makes
 -- the queue filter read only its own queue's rows rather than skipping past
 -- every other queue's.
+-- Three specializations exist for the two filters that DO have indexes —
+-- purge_one_queue.sql, purge_one_status.sql, purge_one_queue_one_status.sql —
+-- and the SDK picks one per call. This file's optional form is the one it uses
+-- when neither filter is set, because `(:p is null or col = :p)` is planned
+-- before the parameter has a value: SQLite must plan both branches, reaches no
+-- index at all, and walks every row past the cutoff in completion order.
+--
+-- Both dialects ship every variant. Postgres does not need them — it re-plans
+-- with the parameter values for a statement's first executions and folds the
+-- null branch away — but a caller that had to know which dialect indexes which
+-- form would be a worse contract than four extra files.
+--
+-- :name has no specialization: no index covers it, so it is a residual predicate
+-- either way and an equality form would buy nothing.
 -- params: older_than_ms, queue, status, name, limit
 delete from cairnq_tasks
 where id in (
