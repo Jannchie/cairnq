@@ -23,7 +23,20 @@
     "",
     "`only_node` / `only_py` are the deliberate asymmetries. Each carries a reason.",
     "An entry here is a claim that the difference is idiomatic rather than a gap —",
-    "if it is a gap, the fix is to close it, not to list it."
+    "if it is a gap, the fix is to close it, not to list it.",
+    "",
+    "`classes` gates the members of the three classes a caller drives. `modules` gates",
+    "what each SDK EXPORTS at all — the types, factories, predicates and errors reachable",
+    "from `import { … } from \"cairnq\"` / `from cairnq import …`. The two gates cover",
+    "different drift: 0.9.0's four Node-only additions were class members, but the same",
+    "mistake one level up (a helper, an error, an options type shipped on one side only)",
+    "was invisible until this section existed. `modules` was added later than `classes`",
+    "and its first pass found one real gap (`is_terminal_status`, which Python simply",
+    "lacked) alongside 27 idiomatic differences — which is the ratio the file expects.",
+    "",
+    "TypeScript names are canonicalized before comparing: a name starting with a capital",
+    "is a type or class and is already identical in both languages, anything else is",
+    "camelCase converted to snake_case. Python's declared surface is its `__all__`."
   ],
 
   "classes": {
@@ -79,5 +92,162 @@
         }
       ]
     }
+  },
+
+  "modules": {
+    "shared": [
+      "AlreadyExists",
+      "CairnQ",
+      "CairnQError",
+      "Conflict",
+      "DEFAULT_WATCH_POLL_MS",
+      "EventLoopBlocked",
+      "ListenUnavailable",
+      "LostLease",
+      "PgExecutor",
+      "PgSession",
+      "PostgresStore",
+      "ProtocolVersionMismatch",
+      "QueueDepthGate",
+      "QueueDepthLimit",
+      "QueueFull",
+      "RetentionRule",
+      "RetentionSweeper",
+      "SQLiteStore",
+      "STATUSES",
+      "SchemaMismatch",
+      "SerializationError",
+      "Task",
+      "TaskCanceled",
+      "TaskContext",
+      "TaskDef",
+      "TaskError",
+      "TaskFailed",
+      "TaskRef",
+      "TaskStatus",
+      "TaskStore",
+      "TaskTimeout",
+      "UnsupportedBackend",
+      "WatchSignal",
+      "Worker",
+      "create_pool_executor",
+      "is_terminal_status"
+    ],
+    "only_node": [
+      {
+        "member": "BackpressureOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "BatchHandler",
+        "reason": "A handler's signature is a named type in TypeScript and structural in Python, which types it inline on task() / register(). Nothing is exported because nothing needs a name."
+      },
+      {
+        "member": "CallOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "ClientOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "FailReason",
+        "reason": "The shape ctx.fail() accepts, as a named type. Python types the same argument inline on the method and exports nothing."
+      },
+      {
+        "member": "Handler",
+        "reason": "A handler's signature is a named type in TypeScript and structural in Python, which types it inline on task() / register(). Nothing is exported because nothing needs a name."
+      },
+      {
+        "member": "ListInput",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "PurgeInput",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "RetentionCutoffs",
+        "reason": "The per-status cutoff map as a named type. Python spells the same argument Mapping[TaskStatus, int] inline on Retention.older_than_ms."
+      },
+      {
+        "member": "RetentionOptions",
+        "reason": "The TypeScript half of the retention option bundle; Python's mirror is the Retention dataclass listed under only_py, which is the same fields validated in __post_init__ instead of in the sweeper's constructor."
+      },
+      {
+        "member": "Row",
+        "reason": "The row shape an executor hands back. Python's PgSession protocol types it inline as dict[str, Any], so there is no separate name to export."
+      },
+      {
+        "member": "SubmitInput",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "SubmitOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "TaskContextOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "TerminalStatus",
+        "reason": "A statically narrowed status type. Python has no static narrowing to export; the same constraint is enforced at runtime by validate_purge_input, and is_terminal_status answers it for a value."
+      },
+      {
+        "member": "TypedHandler",
+        "reason": "A handler's signature is a named type in TypeScript and structural in Python, which types it inline on task() / register(). Nothing is exported because nothing needs a name."
+      },
+      {
+        "member": "WaitOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "WatchOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "WorkerOptions",
+        "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
+      },
+      {
+        "member": "cancel_requested",
+        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
+      },
+      {
+        "member": "define_task",
+        "reason": "Python's TaskDef is a dataclass, so TaskDef(\"name\") constructs one directly. TypeScript's is an interface carrying phantom type parameters, which need a function call for the compiler to infer them."
+      },
+      {
+        "member": "is_canceled",
+        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
+      },
+      {
+        "member": "is_failed",
+        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
+      },
+      {
+        "member": "is_queued",
+        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
+      },
+      {
+        "member": "is_running",
+        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
+      },
+      {
+        "member": "is_succeeded",
+        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
+      },
+      {
+        "member": "is_terminal",
+        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
+      }
+    ],
+    "only_py": [
+      {
+        "member": "Retention",
+        "reason": "The mirror of TypeScript's RetentionOptions: Python states option bundles as frozen dataclasses so they can validate in __post_init__, TypeScript states them as interfaces and validates where they are consumed."
+      }
+    ]
   }
 }

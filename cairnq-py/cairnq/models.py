@@ -26,6 +26,13 @@ _MS_COLUMNS = (
 )
 TERMINAL: tuple[TaskStatus, ...] = ("succeeded", "failed", "canceled")
 
+
+def is_terminal_status(status: TaskStatus) -> bool:
+    """Whether a bare status is one a task stops at. `Task.is_terminal` answers
+    this for a task; this answers it for a status that arrived on its own — from
+    `get_status`, a `WatchSignal`, or a caller's own storage."""
+    return status in TERMINAL
+
 P = TypeVar("P")
 R = TypeVar("R")
 

@@ -26,9 +26,10 @@ interface Declared {
   only_py: Exemption[];
 }
 
-const surface: { classes: Record<string, Declared> } = JSON.parse(
-  readFileSync(join(findProtocolRoot(), "surface.json"), "utf-8"),
-);
+const surface: {
+  classes: Record<string, Declared>;
+  modules: Omit<Declared, "internal">;
+} = JSON.parse(readFileSync(join(findProtocolRoot(), "surface.json"), "utf-8"));
 
 const CLASSES: Record<string, new (...args: never[]) => unknown> = {
   CairnQ: CairnQ as never,
@@ -39,6 +40,49 @@ const CLASSES: Record<string, new (...args: never[]) => unknown> = {
 /** snake_case, the declaration's canonical form. */
 function canonical(name: string): string {
   return name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
+/**
+ * The same, for a module export rather than a class member. A name starting with
+ * a capital is a type or a class, which both languages already spell the same
+ * way; only the lowercase ones (functions, `defineTask`) are camelCase to
+ * convert. Running those through `canonical` too would turn `CairnQ` into
+ * `_cair_n_q`.
+ */
+function canonicalExport(name: string): string {
+  return /^[A-Z]/.test(name) ? name : canonical(name);
+}
+
+/**
+ * Everything `cairnq` exports, read from index.ts's SOURCE rather than by
+ * importing it.
+ *
+ * `import * as` would see only the value exports: TypeScript erases the type
+ * ones, and those are most of the surface worth gating (every `*Options`, every
+ * handler signature, `PurgeInput`). Reading the barrel file is what makes the
+ * types visible to a runtime test.
+ */
+function moduleExports(): string[] {
+  const src = readFileSync(join(import.meta.dirname, "../src/index.ts"), "utf-8");
+  const statement = /export\s+(?:type\s+)?\{([^}]*)\}\s*from\s*"[^"]*";/g;
+  const found = [...src.matchAll(statement)].flatMap((m) =>
+    m[1]
+      .split(",")
+      .map((n) => n.trim())
+      .filter(Boolean)
+      // `export { a as b }` publishes b.
+      .map((n) => n.split(" as ").pop()!.trim()),
+  );
+  // A form this parser does not understand would silently shrink the surface
+  // and make the gate pass by seeing less, so refuse to run rather than lie.
+  const leftover = src.replace(statement, "");
+  if (/\bexport\b/.test(leftover)) {
+    throw new Error(
+      `index.ts has an export form surface.test.ts cannot parse, so the module ` +
+        `gate would silently skip it:\n${leftover.trim()}`,
+    );
+  }
+  return [...new Set(found.map(canonicalExport))].sort();
 }
 
 /**
@@ -108,6 +152,49 @@ describe("the declaration itself", () => {
           expect(typeof entry, `${cls}.${side}: entries need a reason`).toBe("object");
           expect(entry.reason.length).toBeGreaterThan(20);
         }
+      }
+    }
+  });
+});
+
+// The module gate. `classes` above covers the members of the three classes a
+// caller drives; this covers what the package exports at all. The failure mode
+// it exists for is the same one — a capability shipped on one side only — one
+// level up, where the class gate cannot see it.
+describe("the module surface matches the declaration", () => {
+  const declared = surface.modules;
+  const actual = new Set(moduleExports());
+
+  it("exports everything both SDKs are supposed to share", () => {
+    expect(
+      declared.shared.filter((m) => !actual.has(m)),
+      "declared in surface.json but not exported by cairnq-node",
+    ).toEqual([]);
+  });
+
+  it("exports what is claimed as Node-only, and nothing claimed as Python-only", () => {
+    expect(names(declared.only_node).filter((m) => !actual.has(m))).toEqual([]);
+    expect(
+      names(declared.only_py).filter((m) => actual.has(m)),
+      "exported by cairnq-node but surface.json still calls it Python-only",
+    ).toEqual([]);
+  });
+
+  it("declares every export it publishes", () => {
+    const known = new Set([...declared.shared, ...names(declared.only_node)]);
+    const undeclared = [...actual].filter((m) => !known.has(m));
+    expect(
+      undeclared,
+      "add these to cairnq-protocol/surface.json `modules` — to `shared` (and " +
+        "export them from cairnq-py), or to `only_node` with a reason",
+    ).toEqual([]);
+  });
+
+  it("gives a reason for every deliberate asymmetry", () => {
+    for (const side of ["only_node", "only_py"] as const) {
+      for (const entry of declared[side]) {
+        expect(typeof entry, `modules.${side}: entries need a reason`).toBe("object");
+        expect(entry.reason.length).toBeGreaterThan(20);
       }
     }
   });

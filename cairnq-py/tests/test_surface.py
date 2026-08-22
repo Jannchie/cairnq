@@ -72,3 +72,54 @@ def test_declares_every_member_it_exposes(cls_name: str):
         "them in cairnq-node), to `only_py` with a reason, or rename them with a "
         f"leading underscore if they are internal: {undeclared}"
     )
+
+
+# --- the module gate ---
+# `classes` above covers the members of the three classes a caller drives; this
+# covers what the package exports at all. The failure mode it exists for is the
+# same one — a capability shipped on one side only — one level up, where the
+# class gate cannot see it.
+
+MODULES = SURFACE["modules"]
+
+
+def exported() -> set[str]:
+    """Python's declared public surface: `__all__`. Not `dir(cairnq)`, which also
+    holds the names __init__ imported to build those (PackageNotFoundError, the
+    submodules) — `__all__` is the list the package is asserting, and asserting
+    against the assertion is what makes forgetting to update it visible."""
+    import cairnq
+
+    return set(cairnq.__all__)
+
+
+def test_exports_everything_shared():
+    missing = sorted(set(MODULES["shared"]) - exported())
+    assert not missing, f"declared in surface.json but not exported by cairnq-py: {missing}"
+
+
+def test_module_exemptions_still_describe_reality():
+    actual = exported()
+    assert not [m for m in names(MODULES["only_py"]) if m not in actual]
+    leaked = sorted(m for m in names(MODULES["only_node"]) if m in actual)
+    assert not leaked, (
+        f"exported by cairnq-py but surface.json still calls it Node-only: {leaked}"
+    )
+
+
+def test_declares_every_export_it_publishes():
+    known = set(MODULES["shared"]) | set(names(MODULES["only_py"]))
+    undeclared = sorted(exported() - known)
+    assert not undeclared, (
+        "add these to cairnq-protocol/surface.json `modules` — to `shared` (and "
+        f"export them from cairnq-node), or to `only_py` with a reason: {undeclared}"
+    )
+
+
+def test_every_declared_export_actually_resolves():
+    """`__all__` is a claim about what `from cairnq import X` will produce, and a
+    name listed there but never imported raises only at the caller's import."""
+    import cairnq
+
+    broken = sorted(n for n in cairnq.__all__ if not hasattr(cairnq, n))
+    assert not broken, f"named in __all__ but not importable from cairnq: {broken}"

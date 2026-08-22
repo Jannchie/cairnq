@@ -26,7 +26,7 @@ from .errors import (
     TaskFailed,
     TaskTimeout,
 )
-from .models import STATUSES, Task, TaskDef, TaskRef, TaskStatus
+from .models import STATUSES, Task, TaskDef, TaskRef, TaskStatus, is_terminal_status
 from .retention import Retention, RetentionRule, RetentionSweeper
 from .store import Conflict, PostgresStore, SQLiteStore, TaskStore
 from .worker import Worker
@@ -47,6 +47,7 @@ __all__ = [
     "TaskRef",
     "TaskStatus",
     "STATUSES",
+    "is_terminal_status",
     "Conflict",
     "TaskStore",
     "SQLiteStore",
