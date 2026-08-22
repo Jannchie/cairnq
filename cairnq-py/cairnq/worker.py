@@ -773,7 +773,7 @@ class Worker:
         """Record a claimed task this worker cannot run. Reachable only if a name
         is unregistered mid-run — the claim filters on the registered names — so
         it does not start a handler or a heartbeat for a task it will not run."""
-        with contextlib.suppress(Exception):
+        try:
             await self._safe_fail(
                 self._context(task),
                 error_envelope(
@@ -784,6 +784,12 @@ class Worker:
                 ),
                 retryable=False,
             )
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            # Reported rather than swallowed, as in the TS twin: this is a store
+            # write that failed while finalizing a task, which on_error exists to
+            # surface. Swallowing it leaves the task to sit until its lease
+            # expires with nothing anywhere saying why.
+            self._report(exc, phase="execute", task_id=task.id)
 
     async def _run_call(self, reg: _Registration, tasks: list[Task]) -> None:
         """Run one handler call to completion — one task, or a whole batch. Never

@@ -129,7 +129,16 @@ async def create_pool_executor(
         # resolves in the right schema — migrations included. Setting it to a
         # schema that does not exist yet is legal; the CREATE below is what makes
         # it resolve.
-        server_settings={"search_path": schema} if schema else {},
+        #
+        # A startup parameter is what the TypeScript twin wanted and could not
+        # have — `pg` lets a DSN's own `?options=` replace it, so that SDK sets
+        # search_path per connection instead. See pg-pool.ts.
+        #
+        # Quoted, like the CREATE below and like that `set search_path`: search_path is a GUC list, and an unquoted item is folded
+        # to lower case. PLAIN_IDENT admits upper case, so `schema="MySchema"`
+        # would create "MySchema" and then resolve to `myschema` — a store that
+        # fails _check_schema for a configuration that is spelled correctly.
+        server_settings={"search_path": f'"{schema}"'} if schema else {},
     )
     if schema:
         # Created here rather than from the migrations (which name no schema, by
