@@ -10,24 +10,41 @@ multi-statement transactions (submit-with-key, recover+claim) from interleaving 
 the shared connection. It is only ever held for short DB work — never while a task
 handler runs.
 
-Cross-process contention is absorbed by busy_timeout, which is right here and wrong
-in the TypeScript twin: aiosqlite waits on its own connection thread, so the event
-loop never stalls, while better-sqlite3 would block the only thread there is (that
-SDK sets busy_timeout = 0 and retries instead). Restoring symmetry here would move
-the wait onto the event loop for no gain, and this seam is a context manager rather
-than a callback, so it could not re-run an attempt anyway."""
+Cross-process contention is absorbed by retrying in Python, not by busy_timeout —
+the same policy as the TypeScript twin, for a reason that survives aiosqlite
+running the wait off the event loop. The connection thread is this store's ONLY
+path to the database, so a write parked in busy_timeout holds it against every
+other operation in the process: the reads, the worker's poll, another task's
+heartbeat, all stalled behind a lock they were never waiting for. Under WAL a
+reader cannot lose the write lock at all, so it should never have been queued
+there. busy_timeout therefore goes to 0 (fail immediately) and the wait becomes an
+awaited backoff that re-queues per attempt — the budget is the same either way
+(`busy_timeout_ms`), and the connection stays free for everyone else during it.
+
+The open path keeps a real busy_timeout: the WAL switch, the migrations and the
+statistics bootstrap all run before anything else can be waiting, under the
+caller's connect().
+
+One thing does give up its wait rather than trading it for a retry: the 60s
+statistics refresh (_maybe_refresh_statistics) writes when PRAGMA optimize decides
+to re-analyze, and its caller suppresses the error. On a contended database it now
+loses that write lock immediately instead of waiting the budget out, so a refresh
+can be skipped — the next interval tries again, and the bootstrap under the real
+timeout has already guaranteed sqlite_stat1 exists. Best-effort upkeep is what it
+was; this makes it cheaper to skip rather than more likely to block."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import json
+import random
 import re
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import aiosqlite
 
@@ -58,6 +75,11 @@ def _split_script(script: str) -> list[str]:
 
 _WAL_RETRY_DELAY_S = 0.05
 _WAL_RETRY_BUDGET_S = 5.0
+
+_T = TypeVar("_T")
+
+_BUSY_RETRY_BASE_S = 0.001
+_BUSY_RETRY_MAX_DELAY_S = 0.05
 
 # How often a live connection revisits its planner statistics.
 #
@@ -115,6 +137,23 @@ async def _refresh_statistics(conn: aiosqlite.Connection) -> None:
         await conn.execute("ANALYZE cairnq_tasks")
 
 
+def _is_busy(exc: BaseException) -> bool:
+    """Whether this error is SQLite refusing to wait for the write lock.
+
+    Only SQLITE_BUSY qualifies — SQLITE_LOCKED is same-connection table
+    contention, which the store lock prevents and a retry could not resolve
+    anyway. `sqlite_errorname` is exact but only exists from Python 3.11, so an
+    older interpreter falls back to the message sqlite3 builds from the same
+    code ("database is locked"), which SQLITE_LOCKED words differently
+    ("database table is locked")."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    name = getattr(exc, "sqlite_errorname", None)
+    if name is not None:
+        return str(name).startswith("SQLITE_BUSY")
+    return str(exc).startswith("database is locked")
+
+
 def _is_memory(path: str) -> bool:
     """Whether this path names an in-memory database rather than a file."""
     return path == ":memory:" or "mode=memory" in path
@@ -144,7 +183,7 @@ async def _enable_wal(conn: aiosqlite.Connection) -> None:
             if row is not None and str(row[0]).lower() == "wal":
                 return
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc) and "busy" not in str(exc):
+            if not _is_busy(exc):
                 raise
         if asyncio.get_running_loop().time() >= deadline:
             raise sqlite3.OperationalError(
@@ -207,6 +246,13 @@ class SQLiteStore(TaskStore):
         self._flushing = False
         # Held so the fire-and-forget flusher cannot be garbage collected mid-batch.
         self._flusher: asyncio.Task[None] | None = None
+        # Bumped by close(). A connect() that started before the bump must not
+        # publish what it opened: close() does not take the init lock, so an
+        # in-flight connect outlives it and would otherwise install a live
+        # connection — and its thread, and its WAL lock — on a store nobody will
+        # close again. The same guard as the Postgres store's, for the same
+        # reason; see TaskStore.close.
+        self._generation = 0
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
@@ -215,13 +261,17 @@ class SQLiteStore(TaskStore):
         async with self._init_lock:
             if self._conn is not None:
                 return
+            generation = self._generation
             memory = _is_memory(self._path)
             if not memory:
                 Path(self._path).parent.mkdir(parents=True, exist_ok=True)
             conn = await aiosqlite.connect(self._path, isolation_level=None)
             conn.row_factory = aiosqlite.Row
-            # busy_timeout first, so every later statement waits out contention
-            # instead of failing instantly.
+            # A real busy_timeout for the open path alone: the WAL switch and the
+            # migrations below are synchronous by nature and run before anything
+            # else can be waiting on this connection. Everything past connect()
+            # awaits its own retry instead — see _with_lock and the module
+            # docstring.
             await conn.execute(f"pragma busy_timeout = {self._busy_timeout_ms}")
             # WAL exists so several processes can share one file. An in-memory
             # database is private to this connection, so there is nothing to
@@ -242,9 +292,20 @@ class SQLiteStore(TaskStore):
                 # to a concurrent writer must not fail the connect — the next one
                 # gets another chance.
                 pass
+            # Only now: the statistics bootstrap above is on the open path too,
+            # and it writes (ANALYZE). Dropping the timeout before it would leave
+            # the one refresh that cannot be retried — its caller suppresses the
+            # error — to lose a contended write lock instantly and silently, on
+            # exactly the busy databases whose planner most needs the statistics.
+            await conn.execute("pragma busy_timeout = 0")
             self._next_stats_refresh_at = (
                 asyncio.get_running_loop().time() + _STATS_REFRESH_INTERVAL_S
             )
+            # Closed while we were opening: this connection has no owner, so
+            # shut it down rather than publishing it.
+            if generation != self._generation:
+                await conn.close()
+                raise RuntimeError("store was closed while connecting")
             self._conn = conn
             check_protocol_version(await self.protocol_version())
         # Outside the init lock, and after the version check: retention is a
@@ -287,6 +348,7 @@ class SQLiteStore(TaskStore):
                 await conn.execute("COMMIT")
 
     async def close(self) -> None:
+        self._generation += 1  # disown any connect still in flight
         # Let an in-flight group commit finish first: it is holding writes whose
         # callers are still awaiting them, and closing the connection underneath it
         # would turn those into connection errors for work that was about to land.
@@ -353,6 +415,54 @@ class SQLiteStore(TaskStore):
         await cur.close()
         return rows
 
+    def _busy_backoff(self) -> Callable[[BaseException], Awaitable[None]]:
+        """One busy-retry policy, handed out as a step: await it with the error
+        an attempt raised, and it either sleeps a jittered, growing delay or
+        re-raises — once the budget (`busy_timeout_ms`) is spent, or as soon as
+        the error is anything other than SQLITE_BUSY.
+
+        Two loops need it and only one of them can be a wrapper: _with_lock takes
+        the lock per attempt, while _begin must come back still holding it. What
+        differs between them is the lock, so that is all they should differ in;
+        the budget, the base delay, the cap and the jitter are one policy and
+        live here. The TypeScript twin has a single withLock for the same reason
+        it has a single policy."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._busy_timeout_ms / 1000
+        delay = _BUSY_RETRY_BASE_S
+
+        async def wait(exc: BaseException) -> None:
+            nonlocal delay
+            if not _is_busy(exc) or loop.time() >= deadline:
+                raise exc
+            # Jitter so several losers don't wake together and collide again.
+            await asyncio.sleep(delay * (0.5 + random.random()))
+            delay = min(delay * 2, _BUSY_RETRY_MAX_DELAY_S)
+
+        return wait
+
+    async def _with_lock(self, fn: Callable[[], Awaitable[_T]]) -> _T:
+        """Serialize an operation against this database, waiting out a lost write
+        lock on a jittered backoff (see _busy_backoff). Replaces busy_timeout's
+        blocking wait — see the module docstring.
+
+        Each attempt re-takes the lock rather than backing off while holding it:
+        the contention left to retry is cross-process, and under WAL a *reader*
+        never sees SQLITE_BUSY at all — so waiting in place would stall this
+        process's reads (including the worker's own poll) on a lock they were
+        never waiting for.
+
+        Retrying is safe because an attempt is one statement: nothing partially
+        applied survives it. `fn` may therefore run more than once and must not
+        carry effects of its own."""
+        wait = self._busy_backoff()
+        while True:
+            try:
+                async with self._lock:
+                    return await fn()
+            except BaseException as exc:
+                await wait(exc)
+
     async def _maybe_refresh_statistics(self) -> None:
         """Revisit this connection's planner statistics, at most once per
         _STATS_REFRESH_INTERVAL_S.
@@ -396,11 +506,19 @@ class SQLiteStore(TaskStore):
         # as before: wrapping a single statement in BEGIN/COMMIT would add two
         # statements to every write on an idle store.
         if len(self._pending) == 1:
-            only = self._pending.pop()
+            only = self._pending[0]
             try:
-                only.resolve(await self._run(only.name, only.params))
+                rows = await self._run(only.name, only.params)
             except BaseException as exc:  # noqa: BLE001 - handed to its own waiter
+                # Leave it pending on a lost write lock: _with_lock re-runs this
+                # flusher, and consuming it here would drop the write instead.
+                if _is_busy(exc):
+                    raise
+                self._pending.pop(0)
                 only.reject(exc)
+                return
+            self._pending.pop(0)
+            only.resolve(rows)
             return
 
         batch: list[_Pending] = []
@@ -432,6 +550,11 @@ class SQLiteStore(TaskStore):
             # BEGIN itself failed, so the batch was never taken and is still queued.
             if not batch:
                 batch, self._pending = self._pending, []
+            if _is_busy(exc):
+                # Back to the head of the queue, ahead of later arrivals, so the
+                # retry preserves the order the writes were issued in.
+                self._pending = batch + self._pending
+                raise
             for write in batch:
                 write.reject(exc)
             return
@@ -456,12 +579,14 @@ class SQLiteStore(TaskStore):
         flusher."""
         try:
             while self._pending:
-                async with self._lock:
-                    await self._flush()
+                await self._with_lock(self._flush)
         except BaseException as exc:  # noqa: BLE001 - nothing above may be silent
             # _flush delivers every outcome to its own waiter, so reaching here means
-            # something outside it failed — losing the connection under a close, say.
-            # A fire-and-forget task must not swallow that: the writes still queued
+            # either something outside it failed (losing the connection under a
+            # close, say) or _with_lock spent the whole retry budget on a write lock
+            # it never got — and _flush puts its batch back before raising that, so
+            # those writes are still queued with nobody else coming for them. A
+            # fire-and-forget task must not swallow either: the writes still queued
             # would wait forever for a flusher that is already gone.
             stranded, self._pending = self._pending, []
             for write in stranded:
@@ -480,8 +605,7 @@ class SQLiteStore(TaskStore):
         await self._maybe_refresh_statistics()
         # Reads keep their own turn on the lock — see _is_write_statement.
         if not self._writes[name]:
-            async with self._lock:
-                return await self._run(name, params)
+            return await self._with_lock(lambda: self._run(name, params))
         pending = _Pending(name, params, asyncio.get_running_loop().create_future())
         self._pending.append(pending)
         self._schedule_flush()
@@ -494,20 +618,49 @@ class SQLiteStore(TaskStore):
         operation can slip a statement into it."""
         await self._ensure()
         await self._maybe_refresh_statistics()
-        async with self._lock:
-            await self._conn.execute("BEGIN IMMEDIATE")
+        # Returns holding the lock, which this block owns until it exits: the
+        # transaction is open from here, and a gap in which anything else could
+        # take a turn is a statement landing inside someone else's transaction.
+        await self._begin()
+        try:
+            yield self._run
+            # Inside the try, not in an else: with busy_timeout at 0 a COMMIT can
+            # fail too, and a failed COMMIT that skipped the rollback would leave
+            # the shared connection inside an open write transaction — every later
+            # operation would then run in it, holding SQLite's write lock for the
+            # life of the process. The TypeScript twin has always committed inside
+            # its try; _flush handles its own COMMIT the same way.
+            await self._conn.execute("COMMIT")
+        except BaseException:
+            # Shielded and BaseException-suppressed: a cancellation landing during
+            # the rollback must not abandon the shared connection inside an open
+            # write transaction — every later operation would then run inside it,
+            # holding SQLite's write lock.
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(self._conn.execute("ROLLBACK"))
+            raise
+        finally:
+            self._lock.release()
+
+    async def _begin(self) -> None:
+        """Open the write transaction, waiting out a lost write lock, and return
+        with the store lock HELD for the caller to release.
+
+        The retry is _with_lock's, split open for the one case that cannot use it:
+        the attempt succeeds into a state — an open transaction — that must not
+        outlive its turn on the lock. What is retried is the BEGIN alone, which
+        with busy_timeout at 0 is where a lost write lock surfaces, and it fails
+        before the transaction exists, so nothing the caller does inside the block
+        is ever replayed."""
+        wait = self._busy_backoff()
+        while True:
+            await self._lock.acquire()
             try:
-                yield self._run
-            except BaseException:
-                # Shielded and BaseException-suppressed: a cancellation landing
-                # during the rollback must not abandon the shared connection
-                # inside an open write transaction — every later operation
-                # would then run inside it, holding SQLite's write lock.
-                with contextlib.suppress(BaseException):
-                    await asyncio.shield(self._conn.execute("ROLLBACK"))
-                raise
-            else:
-                await self._conn.execute("COMMIT")
+                await self._conn.execute("BEGIN IMMEDIATE")
+                return
+            except BaseException as exc:
+                self._lock.release()
+                await wait(exc)
 
     async def _has_claimable_work(self, params: dict[str, Any]) -> bool:
         # Read-only probe first: an idle worker never takes SQLite's single write
