@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { CairnQ } from "../src/index.js";
 import { RetentionSweeper } from "../src/retention.js";
+import type { TaskStore } from "../src/store/base.js";
 import { failOne, finishOne, freshDbPath, sleep, waitFor } from "./helpers.js";
 
 let open: CairnQ[] = [];
@@ -122,6 +123,32 @@ describe("retention", () => {
     await waitFor(async () => (await c.get(done)) === null);
     expect(await c.get(done)).toBeNull();
     expect((await c.get(failed))?.status).toBe("failed");
+  });
+
+  it("stops promptly after an on-demand sweep, not an interval later", async () => {
+    // sweep() is public and documented as the way to drain on demand, and its
+    // between-batches yield is a sleep of its own. When those sleeps shared one
+    // slot with the scheduled loop's, the manual one overwrote and then cleared
+    // it — stop() had nothing left to wake and close() blocked for the whole
+    // interval. An hour, at the default.
+    let firstBatch = true;
+    const store = {
+      purge: async () => {
+        // A drain long enough to yield between batches: the loop only sleeps
+        // when a batch came back full.
+        const ids = firstBatch ? Array.from({ length: 1_000 }, (_, i) => String(i)) : [];
+        firstBatch = false;
+        return ids;
+      },
+    } as unknown as TaskStore;
+
+    const sweeper = new RetentionSweeper(store, { olderThanMs: 0, intervalMs: 3_600_000 });
+    sweeper.start();
+    await sweeper.sweep();
+
+    const startedAt = Date.now();
+    await sweeper.stop();
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
   it("refuses a per-status map that names nothing, or a live status", () => {

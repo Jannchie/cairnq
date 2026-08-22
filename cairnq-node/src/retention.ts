@@ -55,8 +55,18 @@ export class RetentionSweeper {
   private active = false;
   /** Set by stop(), so a drain in progress can cut itself short too. */
   private stopping = false;
-  /** Resolves the current sleep early, so stop() need not wait out an interval. */
-  private wake: (() => void) | null = null;
+  /**
+   * Resolved by stop(); every sleep races it. One signal rather than a handle to
+   * the current sleep, because there can be more than one: `sweep()` is public
+   * and meant to be called directly for an on-demand drain, and its
+   * between-batches yield is a sleep of its own. A single handle let that sleep
+   * overwrite the scheduled loop's — and then clear it — leaving stop() nothing
+   * to wake and close() blocked until the whole interval (an hour, by default)
+   * ran out. Same shape as Worker's `stopped$`, and as the Python twin's
+   * asyncio.Event.
+   */
+  private stopSignal!: Promise<void>;
+  private wake!: () => void;
   /** The loop itself, awaited by stop() so no purge outlives the store. */
   private loop: Promise<void> | null = null;
   private readonly intervalMs: number;
@@ -83,6 +93,7 @@ export class RetentionSweeper {
     if (!cutoffs.length) {
       throw new Error("retention.olderThanMs must name at least one status");
     }
+    this.arm();
     this.purgeInputs = cutoffs.map(([status, ms]) => ({
       olderThanMs: ms,
       status,
@@ -97,14 +108,21 @@ export class RetentionSweeper {
     if (this.active) return;
     this.active = true;
     this.stopping = false;
+    // A stopped sweeper can be started again, and the old signal is spent.
+    this.arm();
     this.loop = this.run();
+  }
+
+  /** Mint a fresh stop signal. */
+  private arm(): void {
+    this.stopSignal = new Promise<void>((resolve) => (this.wake = resolve));
   }
 
   /** Stop sweeping and wait for the sweep in flight, if any. */
   async stop(): Promise<void> {
     this.stopping = true;
     this.active = false;
-    this.wake?.();
+    this.wake();
     await this.loop;
     this.loop = null;
   }
@@ -152,15 +170,13 @@ export class RetentionSweeper {
   /** Sleep, interruptible by stop(). Unref'd: retention is housekeeping, and a
    * pending sweep must never be the reason a process refuses to exit. */
   private sleep(ms: number): Promise<void> {
-    return new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, ms);
+    let timer: NodeJS.Timeout;
+    const nap = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
       timer.unref?.();
-      this.wake = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-    }).finally(() => {
-      this.wake = null;
     });
+    // Clear the timer whichever side wins, so a stop is never followed by a
+    // leftover sweep timer.
+    return Promise.race([nap, this.stopSignal]).finally(() => clearTimeout(timer));
   }
 }
