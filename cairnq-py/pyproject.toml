@@ -42,6 +42,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cairnq"]
+# `cairnq/py.typed` (PEP 561) rides along with the package directory, no
+# `include` needed — verified against the built wheel, and pinned by
+# tests/test_typed_marker.py. Without that marker every annotation in this
+# package is invisible to mypy, which skips an installed package that does not
+# claim to be typed and gives the caller `Any`.
 # _protocol is vendored by scripts/vendor-protocol.mjs at publish time and is
 # gitignored; force-include it in the wheel when present.
 artifacts = ["cairnq/_protocol/**"]
