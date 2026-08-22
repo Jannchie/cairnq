@@ -297,8 +297,9 @@ describe("ctx.succeedIn — settlement and the caller's writes in one transactio
 
 describe("schema option", () => {
   it("refuses a schema name that could rewrite the statement it is quoted into", async () => {
-    // cairnq interpolates the schema (a `set search_path` takes no parameters),
-    // so the identifier is checked rather than trusted.
+    // cairnq interpolates the schema — into `set search_path` and into
+    // `create schema`, neither of which takes a bound parameter — so the
+    // identifier is checked rather than trusted.
     for (const bad of ['pub"lic', "a; drop table cairnq_tasks", "1st", "with space", ""]) {
       await expect(createPoolExecutor("postgres://x/y", { schema: bad })).rejects.toThrow(
         /plain identifier/,

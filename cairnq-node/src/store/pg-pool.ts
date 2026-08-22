@@ -87,14 +87,40 @@ export async function createPoolExecutor(
   const pool = new pg.Pool({ connectionString: dsn, max: opts.max });
   if (schema) {
     // Queued on the connection before it is handed out, so every statement this
-    // pool ever runs — migrations included — resolves in the right schema. Pooled
-    // connections come and go, which is why this is per-connection rather than a
-    // one-off at startup.
+    // pool ever runs — migrations included — resolves in the right schema.
+    // Pooled connections come and go, which is why this is per-connection rather
+    // than a one-off at startup.
+    //
+    // Deliberately NOT the `options: '-c search_path=...'` connection parameter,
+    // which reads like the tidier answer: `pg` builds its config as
+    // `Object.assign({}, config, parse(connectionString))`, so a DSN carrying its
+    // own `?options=` (a statement_timeout, say — and cairnq's own SchemaMismatch
+    // message recommends putting `search_path` there) silently REPLACES it, and
+    // the pool then resolves somewhere else entirely. A startup parameter is also
+    // a narrower compatibility surface than a plain statement behind a pooler.
+    //
+    // The Python twin does get to be a startup parameter (asyncpg's
+    // `server_settings`), so there a bad schema fails the connection atomically
+    // and needs no handler below. That asymmetry is the driver's, not a drift.
     pool.on("connect", (client) => {
-      void client.query(`set search_path to "${schema}"`);
+      // The rejection must be handled: `void` on a query that rejects is an
+      // unhandled rejection, which by default takes the process down. And it
+      // must not be swallowed either — a connection whose search_path never
+      // landed would go on serving statements against the wrong schema for its
+      // whole life, which no error anywhere would explain. Ending it is what
+      // makes that loud: this client is about to be handed to a caller, whose
+      // first statement then fails instead of quietly writing to `public`.
+      client.query(`set search_path to "${schema}"`).catch(() => {
+        // `end` is the underlying Client's; the pool hands the connect event a
+        // PoolClient whose `release` does not exist yet at this point. A client
+        // ended here is dropped from the pool when its holder releases it
+        // (pg-pool checks `_queryable`), so this costs a connection, not a slot.
+        void (client as unknown as PG.Client).end().catch(() => {
+          // Already gone. The pool discards it either way.
+        });
+      });
     });
-  }
-  if (schema) {
+
     // Created once, here, rather than from the connect handler (which would ask
     // for CREATE privilege on every new connection) or from the migrations
     // (which name no schema, by design). Without it the first `create table`
