@@ -8,9 +8,9 @@
 -- longer read rows in claim order; it materializes every claimable row into a
 -- temp B-tree just to take LIMIT of them. Cost then grows with the queued
 -- backlog, inside the write transaction, on every claim: measured at 21us / 239us
--- / 1792us for a backlog of 50 / 2000 / 20000. The equality form keeps
--- cairnq_tasks_claim_idx in claim order, needs only a partial sort for the id
--- tie-break, and stays flat at ~12us.
+-- / 1792us for a backlog of 50 / 2000 / 20000. The equality form reads
+-- cairnq_tasks_claim_idx in claim order — the whole ORDER BY, id tie-break
+-- included, since migration 0008 — so it needs no sort at all and stays flat.
 --
 -- params: queue, names (JSON array text or null), now_ms, worker_id,
 --         lease_until_ms, limit
@@ -27,10 +27,13 @@ where id in (
       and queue = :queue
       and (:names is null or name in (select value from json_each(:names)))
       and run_at_ms <= :now_ms
-    -- id breaks created_at_ms ties (same-millisecond submits), so claim order
-    -- is deterministic: FIFO at millisecond granularity; within one millisecond
+    -- Ordered by when a task became DUE, not when it was created: see migration
+    -- 0008 for why, for what it costs a mixed-version fleet, and for which of
+    -- these four statements the index can serve without a sort.
+    -- id breaks run_at_ms ties (same-millisecond submits), so claim order is
+    -- deterministic: FIFO at millisecond granularity; within one millisecond
     -- the id's random half decides, stably but not in submit order.
-    order by priority desc, created_at_ms asc, id asc
+    order by priority desc, run_at_ms asc, id asc
     limit :limit
 )
 returning *;

@@ -104,10 +104,35 @@ A worker **leases** a task rather than popping it:
   RETURNING *` run inside `BEGIN IMMEDIATE` — the SQLite equivalent of
   `FOR UPDATE SKIP LOCKED`. `SQLITE_BUSY` is waited out rather than surfaced (each
   SDK does that differently — see "Concurrency, limits & security"). Claim order is
-  deterministic in both dialects: `priority desc, created_at_ms asc, id asc` —
-  FIFO at millisecond granularity, with same-millisecond ties broken stably by
-  the id (its random half decides, not submit order). `list` breaks its
+  deterministic in both dialects: `priority desc, run_at_ms asc, id asc` — FIFO
+  at millisecond granularity, with same-millisecond ties broken stably by the id
+  (its random half decides, not submit order). `list` breaks its
   `created_at_ms desc` ties the same way.
+  - **By `run_at_ms`, not `created_at_ms`.** The two are the same number for a
+    task that was never delayed or retried (`insert_task` sets
+    `run_at_ms = now + delay`), so ordinary FIFO is unchanged; they differ only
+    for a task whose delivery was deferred, and there this orders by when it
+    became *due*. That is both the fairer answer — a task that failed and backed
+    off does not cut ahead of everything submitted while it waited — and the only
+    order that puts the claimable rows at the *front* of the index range. Under
+    the old ordering a not-yet-due row sorted *ahead* of every claimable one, so
+    each draw walked the whole backoff pile inside the claim transaction.
+    Migration `0008` also appends `id` to both claim indexes, so the tie-break no
+    longer has to be sorted separately. Measured through `claim_one_queue` against
+    20k queued rows backing off, one claim of one task: **1166us -> 22us** on
+    SQLite 3.39.4, **3378us -> 116us** on 3.47.1, **1100us -> 72us** on 3.53.4.
+    The plans differ by version — 3.39 loses the sorter, 3.53 keeps one and
+    reaches the rows by skip-scan — so the ordering is what the win has in common,
+    not one particular plan. The absolute cost swings more between SQLite versions
+    than the fix changes it on some of them, and only the TypeScript SDK pins its
+    version (better-sqlite3 bundles SQLite; the Python SDK links the
+    interpreter's). Two things it does not fix: an empty
+    draw still walks the range (350us there), and `claimable_probe`, whose
+    two-armed `EXISTS` cannot use the index at all, is unchanged at ~2.2ms. These
+    are SQLite numbers; the Postgres side is reasoned, not benchmarked.
+  - The rows a claim *returns* are not in claim order: the order decides which
+    rows are taken, and `RETURNING` then follows the UPDATE's own visit order.
+    Draw one at a time if the order matters to the caller.
 - **`claim` ships as two statements, one per queue arity.** A caller watching a
   single queue uses `claim_one_queue.sql`, which filters `queue = :queue`;
   several queues use `claim.sql` and its list-valued filter. They are the same
@@ -598,7 +623,7 @@ contract that an existing SDK could get wrong.
 
 Ordinals are **one sequence shared by both dialects**, so a dialect may have no
 file at an ordinal — `0003` is the Postgres-only LISTEN/NOTIFY trigger, and SQLite
-goes 0001, 0002, 0004, 0005, 0006, 0007. A migration that closes an ordinal sets
+goes 0001, 0002, 0004, 0005, 0006, 0007, 0008. A migration that closes an ordinal sets
 `schema_version` to it in *every* dialect it ships in, so the two never report
 different numbers for the same schema. (`0003` predates this rule and sets nothing, which is why both dialects
 read 2 until 0004 takes them to 4.)

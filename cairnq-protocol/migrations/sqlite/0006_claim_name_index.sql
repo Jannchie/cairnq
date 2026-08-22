@@ -20,6 +20,8 @@
 -- bloom filter over the subquery and falls back to cairnq_tasks_claim_idx
 -- (measured 1446us, i.e. no improvement at all). That is why the per-name
 -- statements exist as separate files rather than the shared one being reused.
+-- The measurements above belong to the shape defined here; migration 0008
+-- rebuilds it around run_at_ms and carries the current numbers.
 create index if not exists cairnq_tasks_claim_name_idx
     on cairnq_tasks (queue, status, name, priority desc, created_at_ms);
 

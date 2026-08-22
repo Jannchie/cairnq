@@ -23,10 +23,13 @@ from (
       and queue = :queue
       and name = :name
       and run_at_ms <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-    -- id breaks created_at_ms ties (same-millisecond submits), so claim order
-    -- is deterministic: FIFO at millisecond granularity; within one millisecond
+    -- Ordered by when a task became DUE, not when it was created: see migration
+    -- 0008 for why, for what it costs a mixed-version fleet, and for which of
+    -- these four statements the index can serve without a sort.
+    -- id breaks run_at_ms ties (same-millisecond submits), so claim order is
+    -- deterministic: FIFO at millisecond granularity; within one millisecond
     -- the id's random half decides, stably but not in submit order.
-    order by priority desc, created_at_ms asc, id asc
+    order by priority desc, run_at_ms asc, id asc
     limit :limit
     for update skip locked
 ) sel

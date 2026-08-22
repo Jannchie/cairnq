@@ -19,6 +19,8 @@
 -- existing large cairnq_tasks this takes a write lock for the build. Deploying
 -- into a busy database is the case to watch; build it by hand with CONCURRENTLY
 -- first if that matters, and this statement then becomes a no-op.
+-- The measurements above belong to the shape defined here; migration 0008
+-- rebuilds it around run_at_ms and carries the current numbers.
 create index if not exists cairnq_tasks_claim_name_idx
     on cairnq_tasks (queue, status, name, priority desc, created_at_ms);
 

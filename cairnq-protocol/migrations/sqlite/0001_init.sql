@@ -48,6 +48,8 @@ create table if not exists cairnq_tasks (
 -- queue+status then the ORDER BY columns is what lets claim_one_queue.sql read
 -- rows in claim order; claim.sql's list-valued queue filter has to merge several
 -- ranges of this index, so it sorts instead.
+-- The shape as first shipped; migration 0008 rebuilds it around run_at_ms and
+-- says why.
 create index if not exists cairnq_tasks_claim_idx
     on cairnq_tasks (queue, status, priority desc, created_at_ms);
 create index if not exists cairnq_tasks_status_idx on cairnq_tasks (status);
