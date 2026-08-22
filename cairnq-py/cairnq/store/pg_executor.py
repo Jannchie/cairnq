@@ -15,6 +15,18 @@ produced them: cairnq normalizes both column types the drivers disagree about
 has to reconfigure its driver — and none has to change how the application's OWN
 columns come back in order to satisfy cairnq.
 
+ONE thing an adapter does have to get right: enable the driver's
+prepared-statement path if it is not already the default. The store issues a
+small, FIXED set of statement texts — every one is loaded from a file at startup
+and the ``:name`` -> ``$n`` rewrite is memoized on it, so the same handful of
+strings is submitted for the life of the process, and nothing here ever
+interpolates a value into SQL. That is exactly the shape a server-side prepared
+statement is for, and the worker's poll loop reruns those texts forever. A driver
+that instead describes each statement before binding pays an extra round trip and
+a re-parse on every call. The reference implementation happens not to be affected
+— asyncpg prepares and caches by default — which is why this is stated here
+rather than left to be discovered.
+
 Mirrors ``PgExecutor`` in the TypeScript SDK, method for method.
 """
 

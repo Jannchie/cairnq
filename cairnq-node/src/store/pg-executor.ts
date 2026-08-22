@@ -14,6 +14,21 @@
  * about (jsonb decoded or not, int8 as text or number) in `rowToTask`, so no
  * adapter has to reconfigure its driver — and none has to change how the
  * application's OWN columns come back in order to satisfy cairnq.
+ *
+ * ONE thing an adapter does have to get right: enable the driver's
+ * prepared-statement path if it is not already the default. The store issues a
+ * small, FIXED set of statement texts — every one is loaded from a file at
+ * startup and the `:name` -> `$n` rewrite is memoized on it, so the same handful
+ * of strings is submitted for the life of the process, and nothing here ever
+ * interpolates a value into SQL. That is exactly the shape a server-side
+ * prepared statement is for, and the worker's poll loop reruns those texts
+ * forever. A driver that instead describes each statement before binding pays an
+ * extra round trip and a re-parse on every call: measured on one such adapter
+ * (postgres.js, whose `unsafe()` defaults to `prepare: false`), the same hot
+ * path went 137ms -> 17ms per round trip once preparation was turned on. The
+ * reference implementation happens not to be affected — `pg` uses the extended
+ * protocol by default — which is why this is stated here rather than left to be
+ * discovered.
  */
 
 /** A row as the driver hands it back: column name -> value. */
