@@ -30,6 +30,35 @@ const VARIANTS: Record<string, { equality: string; listPattern: RegExp }[]> = {
   ],
 };
 
+// purge and stats specialize for a different reason than claim — an optional
+// `(:p is null or col = :p)` filter is planned before the parameter has a value,
+// so SQLite must plan both branches and reaches no index — but the drift they
+// create is identical, so they are pinned the same way. See purge_one_queue.sql.
+const OPTIONAL_FILTER_VARIANTS: Record<
+  string,
+  { source: string; swaps: { equality: string; listPattern: RegExp }[] }
+> = {
+  purge_one_queue: {
+    source: "purge",
+    swaps: [{ equality: "and queue = :queue", listPattern: /:queue(::text)? is null/ }],
+  },
+  purge_one_status: {
+    source: "purge",
+    swaps: [{ equality: "and status = :status", listPattern: /:status(::text)? is null/ }],
+  },
+  purge_one_queue_one_status: {
+    source: "purge",
+    swaps: [
+      { equality: "and queue = :queue", listPattern: /:queue(::text)? is null/ },
+      { equality: "and status = :status", listPattern: /:status(::text)? is null/ },
+    ],
+  },
+  stats_one_queue: {
+    source: "stats",
+    swaps: [{ equality: "where queue = :queue", listPattern: /:queue(::text)? is null/ }],
+  },
+};
+
 describe("claim variants mirror claim", () => {
   for (const dialect of ["sqlite", "postgres"]) {
     for (const [variant, swaps] of Object.entries(VARIANTS)) {
@@ -49,6 +78,29 @@ describe("claim variants mirror claim", () => {
         for (const [n, i] of differing.entries()) {
           expect(one[i].trim()).toBe(swaps[n].equality);
           expect(many[i]).toMatch(swaps[n].listPattern);
+        }
+      });
+    }
+  }
+});
+
+describe("optional-filter variants mirror their source", () => {
+  for (const dialect of ["sqlite", "postgres"]) {
+    for (const [variant, { source, swaps }] of Object.entries(OPTIONAL_FILTER_VARIANTS)) {
+      it(`${variant} differs from ${source} on exactly its filters (${dialect})`, () => {
+        const statements = loadStatements(dialect);
+        const optional = body(statements[source]);
+        const equality = body(statements[variant]);
+
+        expect(equality).toHaveLength(optional.length);
+        const differing = optional
+          .map((line, i) => (line === equality[i] ? null : i))
+          .filter((i): i is number => i !== null);
+
+        expect(differing).toHaveLength(swaps.length);
+        for (const [n, i] of differing.entries()) {
+          expect(equality[i].trim()).toBe(swaps[n].equality);
+          expect(optional[i]).toMatch(swaps[n].listPattern);
         }
       });
     }

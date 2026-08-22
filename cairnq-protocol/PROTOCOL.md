@@ -330,10 +330,27 @@ two workloads whose rows have nothing to do with each other's lifetimes — an R
 result read once, a durable job's log kept for a week — and one cutoff for both
 is one of them being wrong. Both SDKs build tiered retention on this: a rule runs
 one filtered purge per entry, and a per-status cutoff map is the common case of
-that spelled shorter. Migrations `0007` `(status, completed_at_ms)` and `0009`
-`(queue, completed_at_ms)` over the terminal statuses are what a filtered sweep
-seeks, so it reads its own range rather than every retained row — `limit` bounds
-what comes back, never what is read.
+that spelled shorter.
+
+Reaching those filters' indexes takes **specialized statements**, not just the
+indexes. `purge` ships four — `purge`, `purge_one_queue`, `purge_one_status`,
+`purge_one_queue_one_status` — and the SDK picks one per call, the same trade
+`claim` makes for the same kind of reason. An optional `(:p is null or col = :p)`
+filter is planned before the parameter has a value, so SQLite must plan both
+branches and reaches no index at all: with the optional form, migrations `0007`
+`(status, completed_at_ms)` and `0009` `(queue, completed_at_ms)` are never read
+and every filtered sweep walks the whole retained backlog in completion order,
+discarding what does not match. `limit` bounds what comes back, never what is
+read. With the equality form each shape seeks only its own range. `stats` has the
+same split (`stats` / `stats_one_queue`) for the same reason; `name` is left
+optional everywhere because no index covers it.
+
+Postgres does not share SQLite's constraint — it re-plans with the parameter
+values for a statement's first executions and folds the null branch away — but it
+ships every variant regardless, because both dialects carry the same statement
+set and a caller that had to know which dialect indexes which form would be a
+worse contract. The plans themselves are pinned by tests rather than by these
+paragraphs (`test_query_plans.py`).
 
 `get_status` / `get_status_by_key` are the **status-only probes** behind the wait
 loop: `id` and `status` alone, because a waiting caller asks nothing but "is it

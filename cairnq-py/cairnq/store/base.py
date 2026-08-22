@@ -481,8 +481,18 @@ class TaskStore(ABC):
         coordinate, so it routinely carries two workloads whose rows have nothing
         to do with each other's lifetimes."""
         validate_purge_input(older_than_ms=older_than_ms, status=status, limit=limit)
+        # Each optional filter has an equality form, picked here — the same trade
+        # _claim_session makes between claim and its specializations, for the
+        # same reason. `(:queue is null or queue = :queue)` is planned before any
+        # parameter has a value, so on SQLite it can use no index at all and the
+        # sweep walks every row past the cutoff, whichever queue it belongs to.
+        # See purge_one_queue.sql. `name` is not specialized: nothing indexes it.
+        if queue is not None:
+            statement = "purge_one_queue_one_status" if status else "purge_one_queue"
+        else:
+            statement = "purge_one_status" if status else "purge"
         rows = await self._fetch(
-            "purge",
+            statement,
             {
                 "older_than_ms": older_than_ms,
                 "queue": queue,
@@ -516,7 +526,11 @@ class TaskStore(ABC):
         # rows to seed from, and that is exactly the case the promise is about.
         if queue is not None:
             out[queue] = dict.fromkeys(STATUSES, 0)
-        for row in await self._fetch("stats", {"queue": queue}):
+        # Equality form when a queue was named — see stats_one_queue.sql: the
+        # optional filter cannot be indexed, so the "narrowed" form would read
+        # the whole table anyway and narrowing would buy nothing.
+        statement = "stats_one_queue" if queue is not None else "stats"
+        for row in await self._fetch(statement, {"queue": queue}):
             per = out.setdefault(row["queue"], dict.fromkeys(STATUSES, 0))
             per[row["status"]] = int(row["count"])
         return out

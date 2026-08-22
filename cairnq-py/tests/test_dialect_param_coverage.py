@@ -93,8 +93,14 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     await store.cancel(task.id)
     await store.retry(task.id, reset_attempt=False)
     await store.stats()
+    await store.stats("default")
     await store.queue_depth("default", 10)
+    # Every filter combination: each picks a different statement, so calling one
+    # shape would leave the other three unbound and unchecked.
+    await store.purge(older_than_ms=0, limit=10)
     await store.purge(older_than_ms=0, status="succeeded", name="job", limit=10)
+    await store.purge(older_than_ms=0, queue="default", limit=10)
+    await store.purge(older_than_ms=0, queue="default", status="succeeded", limit=10)
 
 
 @pytest.fixture

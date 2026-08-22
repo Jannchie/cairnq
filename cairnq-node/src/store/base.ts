@@ -513,7 +513,21 @@ export abstract class TaskStore {
    */
   async purge(input: PurgeInput = {}): Promise<string[]> {
     validatePurgeInput(input);
-    const rows = await this.fetch("purge", {
+    // Each optional filter has an equality form, picked here — the same trade
+    // claimSession makes between claim and its specializations, for the same
+    // reason. `(:queue is null or queue = :queue)` is planned before any
+    // parameter has a value, so on SQLite it can use no index at all and the
+    // sweep walks every row past the cutoff, whichever queue it belongs to.
+    // See purge_one_queue.sql. `name` is not specialized: nothing indexes it.
+    const statement =
+      input.queue != null
+        ? input.status != null
+          ? "purge_one_queue_one_status"
+          : "purge_one_queue"
+        : input.status != null
+          ? "purge_one_status"
+          : "purge";
+    const rows = await this.fetch(statement, {
       older_than_ms: input.olderThanMs ?? 0,
       queue: input.queue ?? null,
       status: input.status ?? null,
@@ -548,7 +562,11 @@ export abstract class TaskStore {
     // Seed before the query, not after: a named queue with no rows returns no
     // rows to seed from, and that is exactly the case the promise is about.
     if (queue != null) out[queue] = zeros();
-    for (const row of await this.fetch("stats", { queue: queue ?? null })) {
+    // Equality form when a queue was named — see stats_one_queue.sql: the
+    // optional filter cannot be indexed, so the "narrowed" form would read the
+    // whole table anyway and narrowing would buy nothing.
+    const statement = queue != null ? "stats_one_queue" : "stats";
+    for (const row of await this.fetch(statement, { queue: queue ?? null })) {
       const per = (out[row.queue] ??= zeros());
       per[row.status as TaskStatus] = Number(row.count);
     }
