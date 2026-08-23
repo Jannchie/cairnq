@@ -30,14 +30,12 @@
     "from `import { … } from \"cairnq\"` / `from cairnq import …`. The two gates cover",
     "different drift: 0.9.0's four Node-only additions were class members, but the same",
     "mistake one level up (a helper, an error, an options type shipped on one side only)",
-    "was invisible until this section existed. `modules` was added later than `classes`",
-    "and its first pass found one real gap (`is_terminal_status`, which Python simply",
-    "lacked) alongside 27 idiomatic differences — which is the ratio the file expects.",
+    "was invisible until this section existed.",
     "",
     "In `modules`, an exemption groups the members ONE reason covers (`members`,",
-    "plural) rather than repeating that reason per member — 27 Node-only exports are",
-    "six claims, not 27. `classes` keeps the singular `member` because each of its",
-    "exemptions is argued on its own. Both gates read either shape.",
+    "plural) rather than repeating that reason per member. `classes` keeps the",
+    "singular `member` because each of its exemptions is argued on its own. Both",
+    "gates read either shape.",
     "",
     "TypeScript names are canonicalized before comparing: a name starting with a capital",
     "is a type or class and is already identical in both languages, anything else is",
@@ -48,9 +46,8 @@
     "CairnQ": {
       "shared": [
         "call", "cancel", "cancel_by_key", "close", "connect", "get", "get_by_key",
-        "get_status", "get_status_by_key", "list", "postgres", "purge",
-        "queue_depth", "retry", "retry_by_key", "sqlite", "stats", "store",
-        "submit", "wait", "wait_by_key", "watch"
+        "list", "postgres", "purge", "queue_depth", "retry", "retry_by_key",
+        "sqlite", "store", "submit", "wait", "wait_by_key"
       ],
       "internal": [],
       "only_node": [],
@@ -65,8 +62,8 @@
       "internal": [
         "attempt", "close_if_owned", "context", "deliveries", "fail_no_handler",
         "idle", "install_signals", "loop", "outcome_of", "report", "run_call",
-        "safe_fail", "schedule", "settle_each", "sleep_or_stop", "source_calls",
-        "start_heartbeat", "succeed_one"
+        "safe_fail", "settle_each", "sleep_or_stop", "start_heartbeat",
+        "succeed_one"
       ],
       "only_node": [],
       "only_py": [
@@ -105,19 +102,13 @@
       "CairnQ",
       "CairnQError",
       "Conflict",
-      "DEFAULT_WATCH_POLL_MS",
-      "EventLoopBlocked",
       "ListenUnavailable",
       "LostLease",
       "PgExecutor",
       "PgSession",
       "PostgresStore",
       "ProtocolVersionMismatch",
-      "QueueDepthGate",
-      "QueueDepthLimit",
       "QueueFull",
-      "RetentionRule",
-      "RetentionSweeper",
       "SQLiteStore",
       "STATUSES",
       "SchemaMismatch",
@@ -134,7 +125,6 @@
       "TaskStore",
       "TaskTimeout",
       "UnsupportedBackend",
-      "WatchSignal",
       "Worker",
       "create_pool_executor",
       "is_terminal_status"
@@ -142,16 +132,13 @@
     "only_node": [
       {
         "members": [
-          "BackpressureOptions",
           "CallOptions",
           "ClientOptions",
           "ListInput",
           "PurgeInput",
           "SubmitInput",
           "SubmitOptions",
-          "TaskContextOptions",
           "WaitOptions",
-          "WatchOptions",
           "WorkerOptions"
         ],
         "reason": "TypeScript needs a named type for the options object a call takes; Python passes keyword arguments and needs no name for them. Same parameters, each declared where its language declares parameters."
@@ -172,18 +159,6 @@
       },
       {
         "members": [
-          "RetentionCutoffs"
-        ],
-        "reason": "The per-status cutoff map as a named type. Python spells the same argument Mapping[TaskStatus, int] inline on Retention.older_than_ms."
-      },
-      {
-        "members": [
-          "RetentionOptions"
-        ],
-        "reason": "The TypeScript half of the retention option bundle; Python's mirror is the Retention dataclass listed under only_py, which is the same fields validated in __post_init__ instead of in the sweeper's constructor."
-      },
-      {
-        "members": [
           "Row"
         ],
         "reason": "The row shape an executor hands back. Python's PgSession protocol types it inline as dict[str, Any], so there is no separate name to export."
@@ -196,30 +171,11 @@
       },
       {
         "members": [
-          "cancel_requested",
-          "is_canceled",
-          "is_failed",
-          "is_queued",
-          "is_running",
-          "is_succeeded",
-          "is_terminal"
-        ],
-        "reason": "Python carries this as a property on Task/TaskRef (task.is_terminal); a TypeScript Task is a plain interface built from a DB row and cannot carry methods, so the same predicates are free functions. Same capability, each in its language's shape."
-      },
-      {
-        "members": [
           "define_task"
         ],
         "reason": "Python's TaskDef is a dataclass, so TaskDef(\"name\") constructs one directly. TypeScript's is an interface carrying phantom type parameters, which need a function call for the compiler to infer them."
       }
     ],
-    "only_py": [
-      {
-        "members": [
-          "Retention"
-        ],
-        "reason": "The mirror of TypeScript's RetentionOptions: Python states option bundles as frozen dataclasses so they can validate in __post_init__, TypeScript states them as interfaces and validates where they are consumed."
-      }
-    ]
+    "only_py": []
   }
 }

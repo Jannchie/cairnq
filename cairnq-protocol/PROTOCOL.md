@@ -278,7 +278,7 @@ statement snapshots). Pinned by `key_reuse_after_purge`.
 ## Operations
 
 Client-side (API role): `submit`, `get`, `get_by_key`, `get_status`,
-`get_status_by_key`, `list`, `stats`, `queue_depth`, `cancel`, `cancel_by_key`,
+`get_status_by_key`, `list`, `queue_depth`, `cancel`, `cancel_by_key`,
 `retry`, `retry_by_key`, `purge`, plus SDK-orchestrated `wait` / `wait_by_key` /
 `call` (polling loops over the statements above, not statements of their own).
 Worker-side: `claim` (and its
@@ -290,25 +290,11 @@ Connect-time, run by both SDKs before any of the above: `protocol_version` (the
 version guard) and `installations` (the schema guard — see "Schema" below).
 Neither is a state transition; both are reads the SDK makes on the way up.
 
-`stats` is the one aggregate read: task counts grouped by queue and status
-(`stats.sql`). SDKs zero-fill the statuses a queue has no rows in; a queue with
-no rows at all does not appear. Terminal tasks keep counting until `purge`
-removes them, so the numbers describe the database, not just the live backlog.
-An optional `queue` narrows the aggregate to one queue — unfiltered it reads
-every row in the table, and one installation is how this protocol expects two
-languages to coordinate, so a caller should not have to pay for the other
-workload's backlog. A named queue is the one exception to "a queue with no rows
-does not appear": it is always present, zero-filled, because asking about a
-specific queue and getting nothing back would make every caller write the same
-fallback. Filtered or not, `stats` counts what it reports and so costs what it
-counts — it is the dashboard read, not the poll-loop read.
-
 `queue_depth` is the bounded one, and the read behind backpressure: it returns
 **headroom** — how many more tasks fit on one queue under a caller-supplied
 `max_depth` — rather than a depth. Wrapping the count in a `LIMIT :max_depth`
 subquery is what makes it affordable to ask often: it reads at most `max_depth`
-index entries off `cairnq_tasks_claim_idx`, where `stats` aggregates the whole
-table. Headroom saturates at 0 rather than going negative. It counts `queued`
+index entries off `cairnq_tasks_claim_idx` instead of aggregating the table. Headroom saturates at 0 rather than going negative. It counts `queued`
 only: a running task already has a worker and is bounded by that worker's
 concurrency, so the backlog worth pushing back on is work nobody has picked up.
 Delayed tasks (`run_at_ms` in the future) count — they are queued work that will
@@ -372,7 +358,7 @@ that spelled shorter.
 Reaching those filters' indexes takes more than the indexes. `(:p is null or
 col = :p)` cannot use one: SQLite plans a statement when it is prepared, before
 any parameter has a value, so it must plan for both branches and settles for a
-scan. Every optional filter in the protocol had this — `purge`'s and `stats`'s,
+scan. Every optional filter in the protocol had this — `purge`'s,
 and `list`'s five, whose four indexes from `0001` had never been read since the
 day they shipped.
 
@@ -467,7 +453,7 @@ record. Consequences worth stating:
   for the widest batch lets a queue holding unbatched work start that many calls.
   Which names get their own draw is the part both SDKs must agree on, because a
   user comparing them can observe it: **a name draws separately if it sets
-  `batch` or a per-name `concurrency`; every other name shares one draw.** The
+  `batch` or joins a `resource`; every other name shares one draw.** The
   draws run **in one transaction**, after a single `recover_leases`, so the split
   costs one statement per draw, not one transaction per draw, and the read-only
   probe still keeps an idle worker out of a write transaction entirely.
@@ -680,14 +666,6 @@ CairnQ targets same-host coordination. Know the edges:
   turns concurrent submits into lock contention — a steep price for a bound whose
   whole purpose is approximate. Size the limit for the pushback you want, not as
   a capacity assertion.
-- **A worker's byte budget bounds what is already executing.** `max_in_flight_bytes`
-  is consulted between claims, never during one, and a claim commits to its rows
-  before any payload's size is known. So one poll can overshoot it: each draw
-  takes at most `claim_batch` rows (or one whole `batch`, whichever is larger —
-  a `claim_batch` below a name's batch size would otherwise stall that name), and
-  a poll may make one draw per name. Lower `claim_batch`, or the batch sizes, to
-  tighten it. A single payload larger than the entire budget still runs — alone,
-  rather than deadlocking the worker.
 - **No in-database authorization.** Unlike a Postgres role model, any process that
   can open the SQLite file has full read/write access and executes SQL directly.
   Protect the file with OS permissions; treat DB access as full trust.
