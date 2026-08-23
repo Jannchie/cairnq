@@ -21,8 +21,82 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The gate. Both publish jobs run their own SDK's suite, but those skip every
+  # Postgres test when no DSN is present — so without this the only thing that
+  # ever executes PostgresStore lives in ci.yml, a workflow publish has no
+  # dependency on. A `v*` tag pushed alongside main could therefore publish
+  # before, or instead of, any live-Postgres run: 0.12.0 shipped five brand-new
+  # Postgres statement files that way, and only a hand-ordered push (main first,
+  # wait for CI, then the tag) kept them from going out unexecuted.
+  #
+  # A publish workflow should validate what it is about to ship rather than
+  # trust that something else did, so this is a copy of ci.yml's postgres job
+  # rather than a cross-workflow dependency — which would also not work for
+  # workflow_dispatch, where there may be no CI run to wait on at all. It costs
+  # about a minute and it gates the dry run too, since validating is what a dry
+  # run is for.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cairnq
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CAIRNQ_TEST_PG_DSN: postgresql://postgres:postgres@localhost:5432/cairnq
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: cairnq-node/pnpm-lock.yaml
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - run: pnpm install --frozen-lockfile
+        working-directory: cairnq-node
+      - run: uv sync --extra dev --extra postgres
+        working-directory: cairnq-py
+      # The suites SKIP rather than fail when the DSN is missing or wrong, which
+      # is exactly how a green job can mean "nothing ran". Prove the connection
+      # first, so a typo'd or dropped env var is loud here instead of silent
+      # three steps down.
+      - name: Prove the DSN reaches a real Postgres
+        working-directory: cairnq-py
+        run: |
+          uv run python -c "
+          import asyncio, os, asyncpg
+          dsn = os.environ['CAIRNQ_TEST_PG_DSN']
+          async def main():
+              conn = await asyncpg.connect(dsn)
+              print('server_version:', await conn.fetchval('show server_version'))
+              await conn.close()
+          asyncio.run(main())
+          "
+      # The live smoke plus the full conformance suite, which runs every scenario
+      # against Postgres too when a DSN is present — that is what holds the two
+      # dialects to the same behavior.
+      - run: pnpm exec vitest run test/postgres.live.test.ts test/conformance.test.ts
+        working-directory: cairnq-node
+      - run: uv run pytest tests/test_postgres_live.py tests/test_conformance.py -q
+        working-directory: cairnq-py
+
   npm:
     runs-on: ubuntu-latest
+    needs: postgres
     permissions:
       id-token: write # OIDC trusted publishing + provenance attestation
       contents: read
@@ -63,6 +137,7 @@ jobs:
 
   pypi:
     runs-on: ubuntu-latest
+    needs: postgres
     permissions:
       id-token: write # OIDC trusted publishing
       contents: read

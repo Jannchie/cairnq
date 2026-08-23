@@ -18,13 +18,29 @@ tag.
    git tag v0.3.0
    git push origin main --tags
    ```
-3. The `v*` tag triggers the workflow. It runs each SDK's tests, builds, vendors
-   the protocol, **verifies the tag equals the package version**, and publishes
-   `cairnq` to npm and PyPI.
+3. The `v*` tag triggers the workflow. It gates on a live-Postgres run, then per
+   SDK runs the tests, builds, vendors the protocol, **verifies the tag equals
+   the package version**, and publishes `cairnq` to npm and PyPI.
+
+Pushing `main` and the tag together is fine — that is what the gate is for. It
+was not always: each publish job runs only its own SDK's suite, and those SKIP
+every Postgres test when no DSN is set, so the only thing executing
+`PostgresStore` used to live in `ci.yml`, which publish has no dependency on.
+0.12.0 shipped five brand-new Postgres statement files under that arrangement,
+and nothing but hand-ordering the pushes (main, wait for CI, then the tag) kept
+them from being published unexecuted. `publish.yml` now spins up its own
+`postgres:16` and both publish jobs `needs:` it, so a publish validates what it
+is about to ship instead of trusting that something else did.
+
+The gate proves the DSN connects before running anything, because a missing or
+misspelled `CAIRNQ_TEST_PG_DSN` makes the suites skip rather than fail — a green
+job that ran nothing is the failure mode being guarded against, so it has to be
+loud.
 
 To validate without publishing: Actions → **Publish** → *Run workflow*. It
-defaults to `dry_run` (test + build + `npm pack` / `uv build`, no upload).
-Untick `dry_run` to publish from a manual run.
+defaults to `dry_run` (gate + test + build + `npm pack` / `uv build`, no upload).
+The gate runs for a dry run too — validating is what a dry run is for. Untick
+`dry_run` to publish from a manual run.
 
 ## The repo has to stay public
 
