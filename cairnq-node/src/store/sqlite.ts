@@ -334,6 +334,13 @@ export class SQLiteStore extends TaskStore {
         this.db = null;
         this.stmts.clear();
       }
+      // An in-memory database's lock guards nothing once its connection is gone:
+      // the key is minted per store (see lockKey), so no other store can be
+      // queued behind it. Left in place, a process that opens many short-lived
+      // in-memory stores — a test suite, a per-request scratch queue — grows
+      // fileLocks by one settled promise per store, forever. A file's key is NOT
+      // dropped: other stores may still be serializing on it.
+      if (this.lockKey.startsWith("memory#")) fileLocks.delete(this.lockKey);
     } finally {
       this.closing = false;
     }

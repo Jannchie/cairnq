@@ -105,6 +105,24 @@ export function dumpJson(value: unknown): string {
   // exhaustive over everything rejectMangled rejects. Measured on a null-free
   // payload the three checks cost ~20% of the encode, against ~130% for running
   // the replacer unconditionally.
+  //
+  // The second pass builds a whole string and throws it away, so a hit costs
+  // 2.4x the encode (211us against 87us on a 42KB payload) where a validating
+  // WALK would cost 28us. It stays a second stringify anyway, twice over: a walk
+  // would have to reproduce seven of JSON.stringify's traversal semantics by
+  // hand — toJSON applied before the replacer sees a value, boxed primitives,
+  // sparse arrays, own-enumerable ordering, getters called once each, and a
+  // cycle guard the native pass does not need here but a walk would (an impure
+  // getter can introduce a cycle the first pass did not see, where stringify
+  // throws and a walk recurses forever) — and a divergence between the two is
+  // either a false rejection or the silent-data-loss bug coming back. It is also
+  // the wrong thing to optimise: every dumpJson sits next to a durable write, so
+  // 124us is noise beside the transaction it precedes. Revisit only with a
+  // profile showing this in double digits of submit latency, and pair any walk
+  // with a differential test asserting the two agree over generated values.
+  //
+  // The `{}` trace cannot be narrowed, either: an emptied-out Map and a
+  // legitimate empty object are byte-identical in the output.
   if (text.includes("null") || text.includes("{}") || text.includes('{"0":')) {
     JSON.stringify(value, rejectMangled);
   }
@@ -272,7 +290,9 @@ export function specialize(sql: string, params: Params): string {
     if (params[name] != null) active += name + ",";
   }
   if (!active) return sql;
-  const key = active + sql;
+  // "\u0000" delimits: the names run together with no separator otherwise, and
+  // ("a," + "b,SELECT") and ("a,b," + "SELECT") would be one cache entry.
+  const key = active + "\u0000" + sql;
   let out = specialCache.get(key);
   if (out === undefined) {
     out = sql.replace(OPTIONAL_FILTER, (whole, name: string, column: string) =>
