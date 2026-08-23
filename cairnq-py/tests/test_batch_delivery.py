@@ -25,8 +25,12 @@ async def _drain(client, ids, worker):
     return {i: await client.get(i) for i in ids}
 
 
-async def test_a_batch_handler_is_called_once_for_the_whole_batch(client, db_path):
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=8)
+# Both dialects: a batched worker draws with the one-queue/one-name claim
+# specialisations, and those are four separate statements per dialect. A batch
+# that silently came back short on one of them would look like a quiet queue.
+async def test_a_batch_handler_is_called_once_for_the_whole_batch(backend):
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=8)
     calls: list[int] = []
 
     @worker.task("embed", batch=8)
@@ -43,8 +47,9 @@ async def test_a_batch_handler_is_called_once_for_the_whole_batch(client, db_pat
     assert {t.result["n"] for t in tasks.values()} == {0, 1, 2, 3, 4}
 
 
-async def test_a_batch_is_chunked_by_its_registered_size(client, db_path):
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=8)
+async def test_a_batch_is_chunked_by_its_registered_size(backend):
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=8)
     calls: list[int] = []
 
     @worker.task("embed", batch=3)
@@ -60,10 +65,11 @@ async def test_a_batch_is_chunked_by_its_registered_size(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_returning_nothing_succeeds_the_whole_batch_with_no_result(client, db_path):
+async def test_returning_nothing_succeeds_the_whole_batch_with_no_result(backend):
     """The common shape: the handler wrote its output to a database, so there is
     no per-task result to carry back."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=4)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=4)
 
     @worker.task("index", batch=4)
     async def index(items):
@@ -76,8 +82,9 @@ async def test_returning_nothing_succeeds_the_whole_batch_with_no_result(client,
     assert all(t.result is None for t in tasks.values())
 
 
-async def test_raising_fails_every_unsettled_task_retryably(client, db_path):
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=4, retry_backoff_ms=0)
+async def test_raising_fails_every_unsettled_task_retryably(backend):
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=4, retry_backoff_ms=0)
 
     @worker.task("flaky", batch=4)
     async def flaky(items):
@@ -92,8 +99,9 @@ async def test_raising_fails_every_unsettled_task_retryably(client, db_path):
     assert all(t.attempt == 1 for t in tasks.values())
 
 
-async def test_a_retryable_batch_failure_is_re_attempted_per_task(client, db_path):
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=4, retry_backoff_ms=0)
+async def test_a_retryable_batch_failure_is_re_attempted_per_task(backend):
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=4, retry_backoff_ms=0)
     attempts: list[int] = []
 
     @worker.task("flaky", batch=4)
@@ -109,10 +117,11 @@ async def test_a_retryable_batch_failure_is_re_attempted_per_task(client, db_pat
     assert all(t.attempt == 2 for t in tasks.values())
 
 
-async def test_raising_a_non_retryable_TaskError_fails_the_rest_permanently(client, db_path):
+async def test_raising_a_non_retryable_TaskError_fails_the_rest_permanently(backend):
     """The `abort_for_credit_depletion` shape: one condition ends the whole batch
     and nothing should be retried."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=4, retry_backoff_ms=0)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=4, retry_backoff_ms=0)
 
     @worker.task("translate", batch=4)
     async def translate(items):
@@ -127,10 +136,11 @@ async def test_raising_a_non_retryable_TaskError_fails_the_rest_permanently(clie
     assert all(t.attempt == 1 for t in tasks.values())
 
 
-async def test_a_handler_can_settle_some_tasks_and_let_the_rest_ride(client, db_path):
+async def test_a_handler_can_settle_some_tasks_and_let_the_rest_ride(backend):
     """The real shape from a production batch handler: a few tasks fail for their
     own reasons, the rest succeed by the handler simply returning."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=8, retry_backoff_ms=0)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=8, retry_backoff_ms=0)
 
     @worker.task("embed", batch=8)
     async def embed(items):
@@ -155,10 +165,11 @@ async def test_a_handler_can_settle_some_tasks_and_let_the_rest_ride(client, db_
     assert by_n[0].result == {"n": 0}
 
 
-async def test_settling_twice_is_a_no_op(client, db_path):
+async def test_settling_twice_is_a_no_op(backend):
     """Handlers built on ack/nack queues all carry a `finalized_ids` set to
     guarantee this. Holding it in the context is the point."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=4)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=4)
 
     @worker.task("once", batch=4)
     async def once(items):
@@ -176,8 +187,9 @@ async def test_settling_twice_is_a_no_op(client, db_path):
     assert all(t.result == {"first": True} for t in tasks.values())
 
 
-async def test_an_explicitly_failed_task_is_retried_when_retryable(client, db_path):
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, retry_backoff_ms=0)
+async def test_an_explicitly_failed_task_is_retried_when_retryable(backend):
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, retry_backoff_ms=0)
     seen: list[int] = []
 
     @worker.task("retryable", batch=4)
@@ -194,9 +206,10 @@ async def test_an_explicitly_failed_task_is_retried_when_retryable(client, db_pa
     assert tasks[ids[0]].status == "succeeded"
 
 
-async def test_batch_and_single_handlers_share_one_worker(client, db_path):
+async def test_batch_and_single_handlers_share_one_worker(backend):
     """A claim comes back mixed by name; each name is delivered its own way."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=8)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=8)
     batched: list[int] = []
     singles: list[str] = []
 
@@ -218,10 +231,11 @@ async def test_batch_and_single_handlers_share_one_worker(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_batch_of_one_is_still_a_batch_call(client, db_path):
+async def test_batch_of_one_is_still_a_batch_call(backend):
     """batch=1 is a real configuration — work that saturates the machine (a
     Docling parse) is registered this way, and must still get the list form."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20)
     shapes: list[int] = []
 
     @worker.task("parse", batch=1)
@@ -235,17 +249,18 @@ async def test_batch_of_one_is_still_a_batch_call(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_the_batch_heartbeat_keeps_every_lease_alive(client, db_path):
+async def test_the_batch_heartbeat_keeps_every_lease_alive(backend):
     """A handler outliving its lease must not have its tasks recovered under it —
     and one beat has to cover the whole batch, not one task at a time."""
+    client = await backend.client()
     # Margins, not luck: the point is that ONE beat covers the whole batch, and
     # the handler outlives its lease several times over. A loaded CI runner can
     # delay a beat past a 200ms lease without anything being wrong with the
     # worker, which fails this for a reason it is not testing. Longer lease, same
     # beat-to-lease ratio, same number of lifetimes slept. Mirrors the margins in
     # batch-delivery.test.ts.
-    worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
+    worker = backend.worker(
+        poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
     )
 
     @worker.task("slow", batch=4)
@@ -261,15 +276,16 @@ async def test_the_batch_heartbeat_keeps_every_lease_alive(client, db_path):
     assert all(t.attempt == 1 for t in tasks.values())
 
 
-async def test_a_settled_task_stops_being_heartbeaten(client, db_path):
+async def test_a_settled_task_stops_being_heartbeaten(backend):
     """Renewing a lease on a terminal row is a write against something nobody
     owns; the beat has to drop tasks the handler already finished."""
+    client = await backend.client()
     # Same margin reasoning as the case above. A lease expiring here does not
     # just delay the test, it changes what it measures: the surviving task gets
     # recovered and redelivered as a batch of its own, whose items[0] settles
     # early too, and the assertion below counts two.
-    worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
+    worker = backend.worker(
+        poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
     )
 
     @worker.task("half", batch=4)
@@ -285,9 +301,10 @@ async def test_a_settled_task_stops_being_heartbeaten(client, db_path):
     assert len(early) == 1
 
 
-async def test_max_run_ms_bounds_the_whole_batch_call(client, db_path):
-    worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=4, max_run_ms=150, retry_backoff_ms=0
+async def test_max_run_ms_bounds_the_whole_batch_call(backend):
+    client = await backend.client()
+    worker = backend.worker(
+        poll_interval_ms=20, concurrency=4, max_run_ms=150, retry_backoff_ms=0
     )
 
     @worker.task("hang", batch=4)
@@ -301,17 +318,19 @@ async def test_max_run_ms_bounds_the_whole_batch_call(client, db_path):
     assert all(t.error["code"] == "handler_timeout" for t in tasks.values())
 
 
-async def test_registering_a_non_positive_batch_is_rejected(db_path):
-    worker = Worker.sqlite(db_path)
+async def test_registering_a_non_positive_batch_is_rejected(backend):
+    client = await backend.client()
+    worker = backend.worker()
     with pytest.raises(ValueError, match="batch must be >= 1"):
         worker.register("x", lambda items: None, batch=0)
 
 
-async def test_a_cancel_reaches_a_batch_task_through_the_heartbeat(client, db_path):
+async def test_a_cancel_reaches_a_batch_task_through_the_heartbeat(backend):
     """Cancellation rides along on the write the worker was making anyway — in a
     batch that write is the shared beat, so it must carry each row back."""
-    worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=4, lease_ms=400, heartbeat_interval_ms=30
+    client = await backend.client()
+    worker = backend.worker(
+        poll_interval_ms=20, concurrency=4, lease_ms=400, heartbeat_interval_ms=30
     )
     observed: dict[str, bool] = {}
 
@@ -337,11 +356,12 @@ async def _is_running(client, task_id) -> bool:
     return task is not None and task.running
 
 
-async def test_a_single_task_handler_can_settle_early(client, db_path):
+async def test_a_single_task_handler_can_settle_early(backend):
     """succeed()/fail() are on TaskContext, not on anything batch-shaped, so they
     work in single-task delivery too — there they mean "settle now". The worker
     must then not complete the task a second time over the handler's decision."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20)
 
     @worker.task("early")
     async def early(ctx, payload):
@@ -355,8 +375,9 @@ async def test_a_single_task_handler_can_settle_early(client, db_path):
     assert tasks[ids[0]].result == {"decided_by": "handler"}
 
 
-async def test_a_single_task_handler_can_fail_itself_permanently(client, db_path):
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, retry_backoff_ms=0)
+async def test_a_single_task_handler_can_fail_itself_permanently(backend):
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, retry_backoff_ms=0)
 
     @worker.task("doomed")
     async def doomed(ctx, payload):
@@ -370,12 +391,13 @@ async def test_a_single_task_handler_can_fail_itself_permanently(client, db_path
     assert tasks[ids[0]].attempt == 1  # permanent, despite max_attempts=5
 
 
-async def test_a_batched_name_does_not_start_calls_for_an_unbatched_one(client, db_path):
+async def test_a_batched_name_does_not_start_calls_for_an_unbatched_one(backend):
     """Regression: the claim used to be one statement over every registered name,
     so sizing it for the widest batch let a `batch=64` registration pull 64 rows
     of unrelated work and turn each into its own call on a worker configured for
     one. Each name now draws its own quota."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=1)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=1)
     live = 0
     peak = 0
 
@@ -398,11 +420,12 @@ async def test_a_batched_name_does_not_start_calls_for_an_unbatched_one(client, 
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_concurrency_bounds_calls_not_tasks(client, db_path):
+async def test_concurrency_bounds_calls_not_tasks(backend):
     """concurrency counts handler calls: a call holding 4 tasks is one of them.
     Counting tasks instead is what used to weld batch size to concurrency — a
     full batch was unreachable unless concurrency was raised to match it."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=2)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=2)
     calls = 0
     peak_calls = 0
     widest = 0
@@ -425,10 +448,11 @@ async def test_concurrency_bounds_calls_not_tasks(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_a_batch_fills_at_the_default_concurrency(client, db_path):
+async def test_a_batch_fills_at_the_default_concurrency(backend):
     """The headline of the change: batch size is no longer capped by concurrency,
     so `batch=8` on a default worker delivers 8 rather than 1."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20)
     sizes: list[int] = []
 
     @worker.task("embed", batch=8)
@@ -442,10 +466,11 @@ async def test_a_batch_fills_at_the_default_concurrency(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_per_name_concurrency_caps_calls_for_that_name(client, db_path):
+async def test_per_name_concurrency_caps_calls_for_that_name(backend):
     """The worker budget allows 6 calls; `embed` may only ever run 2 of them, so
     one expensive name cannot take the whole worker."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=6)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=6)
     live = 0
     peak = 0
 
@@ -464,8 +489,9 @@ async def test_per_name_concurrency_caps_calls_for_that_name(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_per_name_concurrency_without_batching(client, db_path):
-    worker = Worker.sqlite(db_path, poll_interval_ms=20, concurrency=8)
+async def test_per_name_concurrency_without_batching(backend):
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20, concurrency=8)
     live = 0
     peak = 0
 
@@ -484,11 +510,12 @@ async def test_per_name_concurrency_without_batching(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_a_name_is_not_starved_behind_another_names_backlog(client, db_path):
+async def test_a_name_is_not_starved_behind_another_names_backlog(backend):
     """One slot, two backlogs. The claim serves groups in the order given, so
     without rotating that order `embed` would hold the slot until its 40 tasks
     were done and `other` would not run at all."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=5, concurrency=1)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=5, concurrency=1)
     done = {"embed": 0, "other": 0}
 
     @worker.task("embed", batch=4)
@@ -509,13 +536,14 @@ async def test_a_name_is_not_starved_behind_another_names_backlog(client, db_pat
     assert done["other"] == 8
 
 
-async def test_settling_during_a_beat_is_not_read_as_lease_loss(client, db_path):
+async def test_settling_during_a_beat_is_not_read_as_lease_loss(backend):
     """Regression: the beat renews only rows still `running`, so a task the
     handler settled while the beat was in flight comes back absent — which the
     loop read as "another worker took it" and flagged the context lease-lost.
     A handler checking `lost_lease` was told to bail out after a clean succeed."""
-    worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=4, lease_ms=300, heartbeat_interval_ms=10
+    client = await backend.client()
+    worker = backend.worker(
+        poll_interval_ms=20, concurrency=4, lease_ms=300, heartbeat_interval_ms=10
     )
     flagged: dict[str, list[bool]] = {}
 
@@ -534,11 +562,12 @@ async def test_settling_during_a_beat_is_not_read_as_lease_loss(client, db_path)
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_a_single_task_handler_that_settles_early_is_not_flagged_either(client, db_path):
+async def test_a_single_task_handler_that_settles_early_is_not_flagged_either(backend):
     """The same rule through the single-task path, which shares the loop: it used
     to heartbeat a terminal row every beat and flag the context on the first one."""
-    worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, lease_ms=300, heartbeat_interval_ms=10
+    client = await backend.client()
+    worker = backend.worker(
+        poll_interval_ms=20, lease_ms=300, heartbeat_interval_ms=10
     )
     flagged: dict[str, bool] = {}
 
@@ -555,13 +584,14 @@ async def test_a_single_task_handler_that_settles_early_is_not_flagged_either(cl
     assert tasks[ids[0]].status == "succeeded"
 
 
-async def test_writing_after_settling_does_not_look_like_a_lost_lease(client, db_path):
+async def test_writing_after_settling_does_not_look_like_a_lost_lease(backend):
     """`settled` gates every write through the context, not just the settlement
     ones. Without that, `progress()` after a `succeed()` reaches the store, fails
     the ownership check on a terminal row, and reports LostLease — telling the
     handler another worker took its task when it had simply already finished it,
     and flipping `lost_lease` on the way out."""
-    worker = Worker.sqlite(db_path, poll_interval_ms=20)
+    client = await backend.client()
+    worker = backend.worker(poll_interval_ms=20)
     seen: dict[str, Any] = {}
 
     @worker.task("early")

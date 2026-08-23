@@ -4,29 +4,24 @@
 // real data leaks disk until someone remembers to schedule it. These pin what the
 // built-in sweep does — and, as much, what it refuses to do: purge on startup,
 // hold the write lock for a whole backlog, or outlive the store it writes to.
-import { afterEach, describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 
 import { CairnQ } from "../src/index.js";
 import { RetentionSweeper } from "../src/retention.js";
 import type { TaskStore } from "../src/store/base.js";
+import { describeBackends } from "./backends.js";
 import { failOne, finishOne, freshDbPath, sleep, waitFor } from "./helpers.js";
 
-let open: CairnQ[] = [];
+// Both dialects: purge is the statement whose optional filters `specialize`
+// rewrites, and the two dialects reach an index by different routes — SQLite
+// needs the rewrite because it plans before the parameters have values, Postgres
+// re-plans and folds the branch itself. A tiered sweep that quietly matched
+// nothing on one of them would look exactly like a sweep with nothing to do.
+describeBackends("retention", (backend) => {
+  const client = (opts: Parameters<typeof backend.client>[0] = {}) => backend.client(opts);
 
-afterEach(async () => {
-  await Promise.all(open.map((c) => c.close()));
-  open = [];
-});
-
-function client(opts: Parameters<typeof CairnQ.sqlite>[1] = {}): CairnQ {
-  const c = CairnQ.sqlite(freshDbPath(), opts);
-  open.push(c);
-  return c;
-}
-
-describe("retention", () => {
   it("deletes terminal tasks past the cutoff, on its own", async () => {
-    const c = client({ retention: { olderThanMs: 0, intervalMs: 20 } });
+    const c = await client({ retention: { olderThanMs: 0, intervalMs: 20 } });
     const done = await finishOne(c);
     const live = await c.submit("job", {});
 
@@ -36,19 +31,22 @@ describe("retention", () => {
     expect((await c.get(live.id))?.status).toBe("queued");
   });
 
-  it("starts without an explicit connect", async () => {
+  // Builds its own handle rather than taking one from the fixture: the fixture
+  // connects, and connecting is the thing under test. SQLite-only for the same
+  // reason — lazy connect is a TaskStore property, not a dialect one, and a
+  // Postgres arm would only re-prove it against a slower backend.
+  it.runIf(backend.name === "sqlite")("starts without an explicit connect", async () => {
     // connect() is optional — every operation connects lazily — so retention
     // that only ran for callers who remembered to call it would be a silent leak
     // in the feature that exists to prevent one.
     const c = CairnQ.sqlite(freshDbPath(), { retention: { olderThanMs: 0, intervalMs: 20 } });
-    open.push(c);
     const done = await finishOne(c); // first store touch: no connect() above
     await waitFor(async () => (await c.get(done)) === null);
     expect(await c.get(done)).toBeNull();
   });
 
   it("keeps tasks that have not aged out", async () => {
-    const c = client({ retention: { olderThanMs: 3_600_000, intervalMs: 20 } });
+    const c = await client({ retention: { olderThanMs: 3_600_000, intervalMs: 20 } });
     const done = await finishOne(c);
     await sleep(80);
     expect(await c.get(done)).not.toBeNull();
@@ -57,14 +55,14 @@ describe("retention", () => {
   it("does not purge on startup", async () => {
     // A process that restarts often would otherwise issue a write burst on every
     // boot — exactly when the store is busiest.
-    const c = client({ retention: { olderThanMs: 0, intervalMs: 60_000 } });
+    const c = await client({ retention: { olderThanMs: 0, intervalMs: 60_000 } });
     const done = await finishOne(c);
     await sleep(50);
     expect(await c.get(done)).not.toBeNull();
   });
 
   it("drains a backlog larger than one statement", async () => {
-    const c = client();
+    const c = await client();
     const ids: string[] = [];
     for (let i = 0; i < 7; i++) ids.push(await finishOne(c));
 
@@ -76,7 +74,7 @@ describe("retention", () => {
 
   it("reports a failed sweep and keeps sweeping", async () => {
     const errors: unknown[] = [];
-    const c = client({
+    const c = await client({
       retention: { olderThanMs: 0, intervalMs: 20, onError: (e) => errors.push(e) },
     });
     const store = c.store;
@@ -97,26 +95,26 @@ describe("retention", () => {
   });
 
   it("stops on close, without leaving a purge behind it", async () => {
-    const c = CairnQ.sqlite(freshDbPath(), { retention: { olderThanMs: 0, intervalMs: 10 } });
+    const c = await client({ retention: { olderThanMs: 0, intervalMs: 10 } });
     const done = await finishOne(c);
     await waitFor(async () => (await c.get(done)) === null);
     await c.close();
     // close() awaited the sweep in flight, so nothing here can be mid-write
     // against a store that is already gone.
-    const reopened = client();
+    const reopened = await client();
     expect(await reopened.get(done)).toBeNull();
   });
 
-  it("refuses a cutoff or interval that cannot mean anything", () => {
-    expect(() => client({ retention: { olderThanMs: -1 } })).toThrow(/olderThanMs/);
-    expect(() => client({ retention: { olderThanMs: 0, intervalMs: 0 } })).toThrow(/intervalMs/);
+  it("refuses a cutoff or interval that cannot mean anything", async () => {
+    await expect(client({ retention: { olderThanMs: -1 } })).rejects.toThrow(/olderThanMs/);
+    await expect(client({ retention: { olderThanMs: 0, intervalMs: 0 } })).rejects.toThrow(/intervalMs/);
   });
 
   it("keeps each status on its own clock", async () => {
     // Retention needs are tiered: succeeded rows are spent once consumed, failed
     // ones are worth keeping for diagnosis. A status the map does not name is
     // never swept — granularity is an explicit statement of what may go.
-    const c = client({ retention: { olderThanMs: { succeeded: 0 }, intervalMs: 20 } });
+    const c = await client({ retention: { olderThanMs: { succeeded: 0 }, intervalMs: 20 } });
     const done = await finishOne(c);
     const failed = await failOne(c);
 
@@ -151,24 +149,20 @@ describe("retention", () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
-  it("refuses a per-status map that names nothing, or a live status", () => {
-    expect(() => client({ retention: { olderThanMs: {} } })).toThrow(/at least one rule/);
-    expect(() =>
-      client({ retention: { olderThanMs: { queued: 0 } as never } }),
-    ).toThrow(/terminal/);
-    expect(() => client({ retention: { olderThanMs: { succeeded: -1 } } })).toThrow(/>= 0/);
+  it("refuses a per-status map that names nothing, or a live status", async () => {
+    await expect(client({ retention: { olderThanMs: {} } })).rejects.toThrow(/at least one rule/);
+    await expect(client({ retention: { olderThanMs: { queued: 0 } as never } })).rejects.toThrow(/terminal/);
+    await expect(client({ retention: { olderThanMs: { succeeded: -1 } } })).rejects.toThrow(/>= 0/);
   });
 
-  it("refuses a rule array that names nothing, or a rule purge would reject", () => {
-    expect(() => client({ retention: { olderThanMs: [] } })).toThrow(/at least one rule/);
-    expect(() =>
-      client({ retention: { olderThanMs: [{ status: "queued" as never, olderThanMs: 0 }] } }),
-    ).toThrow(/terminal/);
-    expect(() => client({ retention: { olderThanMs: [{ olderThanMs: -1 }] } })).toThrow(/>= 0/);
+  it("refuses a rule array that names nothing, or a rule purge would reject", async () => {
+    await expect(client({ retention: { olderThanMs: [] } })).rejects.toThrow(/at least one rule/);
+    await expect(client({ retention: { olderThanMs: [{ status: "queued" as never, olderThanMs: 0 }] } })).rejects.toThrow(/terminal/);
+    await expect(client({ retention: { olderThanMs: [{ olderThanMs: -1 }] } })).rejects.toThrow(/>= 0/);
   });
 
   it("sweeps each rule on its own cutoff, so one queue's retention is not the other's", async () => {
-    const c = client();
+    const c = await client();
     const rpc = await finishOne(c, { queue: "rpc" });
     const job = await finishOne(c, { queue: "jobs" });
     const broken = await failOne(c, { queue: "jobs" });
@@ -192,9 +186,13 @@ describe("retention", () => {
   });
 });
 
-describe("purge filters", () => {
+// Both dialects, for the same reason as the sweeper above — and more directly:
+// these ARE the optional filters `specialize` rewrites, one per test.
+describeBackends("purge filters", (backend) => {
+  const client = (opts: Parameters<typeof backend.client>[0] = {}) => backend.client(opts);
+
   it("deletes only rows matching a status filter", async () => {
-    const c = client();
+    const c = await client();
     const done = await finishOne(c);
     const failed = await failOne(c);
     await sleep(10); // purge deletes strictly-older rows; same-ms completion would miss

@@ -15,11 +15,16 @@ from cairnq import CairnQ, Worker
 from .helpers import all_terminal, wait_for
 
 
-async def test_a_worker_leaves_tasks_it_cannot_run_for_the_worker_that_can(db_path):
-    client = CairnQ.sqlite(db_path)
+# Both dialects: the name filter is where the claim statements differ most —
+# SQLite reads a JSON array through json_each, Postgres binds a text[] — and a
+# worker that claims a task it has no handler for fails that task permanently,
+# so a filter that works on one dialect and not the other destroys work.
+async def test_a_worker_leaves_tasks_it_cannot_run_for_the_worker_that_can(backend):
+    client = await backend.client()
+    client = await backend.client()
     await client.connect()
-    alpha = Worker.sqlite(db_path, poll_interval_ms=10)
-    beta = Worker.sqlite(db_path, poll_interval_ms=10)
+    alpha = backend.worker(poll_interval_ms=10)
+    beta = backend.worker(poll_interval_ms=10)
     alpha.task("alpha")(lambda ctx: {"by": "alpha"})
     beta.task("beta")(lambda ctx: {"by": "beta"})
 
@@ -41,12 +46,13 @@ async def test_a_worker_leaves_tasks_it_cannot_run_for_the_worker_that_can(db_pa
     assert all(t.result == {"by": "beta"} for t in final)
 
 
-async def test_a_worker_with_no_handlers_claims_nothing(db_path):
+async def test_a_worker_with_no_handlers_claims_nothing(backend):
     """The degenerate case of the same rule: nothing registered, nothing claimed —
     rather than claiming everything and failing all of it."""
-    client = CairnQ.sqlite(db_path)
+    client = await backend.client()
+    client = await backend.client()
     await client.connect()
-    idle = Worker.sqlite(db_path, poll_interval_ms=10)
+    idle = backend.worker(poll_interval_ms=10)
     try:
         async with idle.background():
             task = await client.submit("job", {})

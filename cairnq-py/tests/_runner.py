@@ -166,15 +166,46 @@ class Runner:
             return None
         raise ValueError(f"unknown op: {op}")
 
+    @staticmethod
+    def _deep_equal(a: Any, b: Any) -> bool:
+        """Value equality that also pins the type, mirroring the TypeScript
+        runner's deepEqual (which compares `typeof` before values).
+
+        Plain `==` is looser in Python than in JS in exactly the direction this
+        suite cannot afford: `True == 1` and `1 == 1.0` both hold, so a scenario
+        written to pin that a payload stays a *string* (or an int, or a bool)
+        would pass on one SDK and mean something weaker on the other. An
+        assertion primitive that is stricter in one runner than the other is a
+        hole in the thing this suite exists to guarantee."""
+        if isinstance(a, bool) != isinstance(b, bool):
+            return False
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(
+                Runner._deep_equal(a[k], b[k]) for k in a
+            )
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(
+                Runner._deep_equal(x, y) for x, y in zip(a, b, strict=True)
+            )
+        if type(a) is not type(b):
+            return False
+        return bool(a == b)
+
     def _assert(self, target: Any, spec: dict[str, Any]) -> None:
         if "equals" in spec:
             for k, v in spec["equals"].items():
                 actual = _field(target, k)
-                assert actual == self.resolve(v), f"equals {k}: {actual!r} != {v!r}"
+                assert self._deep_equal(actual, self.resolve(v)), (
+                    f"equals {k}: {actual!r} != {v!r}"
+                )
         if "equalsRef" in spec:
-            assert target == self.resolve(spec["equalsRef"]), "equalsRef mismatch"
+            assert self._deep_equal(target, self.resolve(spec["equalsRef"])), (
+                f"equalsRef: {target!r} != {self.resolve(spec['equalsRef'])!r}"
+            )
         if "notEqualsRef" in spec:
-            assert target != self.resolve(spec["notEqualsRef"]), "notEqualsRef matched"
+            assert not self._deep_equal(target, self.resolve(spec["notEqualsRef"])), (
+                "notEqualsRef matched"
+            )
         if "greaterThanRef" in spec:
             ref = self.resolve(spec["greaterThanRef"])
             assert target > ref, f"greaterThanRef: {target!r} !> {ref!r}"

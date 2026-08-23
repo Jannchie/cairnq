@@ -1,6 +1,121 @@
+import os
+
+import pytest
 import pytest_asyncio
 
-from cairnq import CairnQ
+from cairnq import CairnQ, Worker
+
+
+# ---------------------------------------------------------- backend matrix
+# Until this existed, "does this test touch Postgres?" was an EMERGENT property
+# of whether the file happened to read CAIRNQ_TEST_PG_DSN — 2 of 34 files did, so
+# lease recovery, backpressure, retention, batch delivery and the keyed
+# transactions were only ever proven on SQLite. The two dialects differ in ways
+# those suites are exactly the right shape to catch: the clock (`:now_ms` from
+# the SDK vs `now()` from the database), the key lock (a no-op on SQLite, an
+# advisory lock on Postgres), the claim (`BEGIN IMMEDIATE` vs
+# `FOR UPDATE SKIP LOCKED`), and which optional filters reach an index.
+#
+# So the backend set becomes a DECLARATION: a test asking for the `backend`
+# fixture runs on both unless it says otherwise with
+# `@pytest.mark.backends("sqlite", because="...")`, and that claim is reviewable
+# — where before, a suite covering one dialect looked exactly like a suite
+# covering both. Mirrors describeBackends in cairnq-node/test/backends.ts.
+
+PG_DSN = os.environ.get("CAIRNQ_TEST_PG_DSN")
+# A database of the matrix's own, so its truncates never race the live smoke
+# suite's rows (and so NOTIFY, which is database-scoped, stays out of it).
+_MATRIX_DB = "cairnq_backend_matrix"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "backends(*names, because=...): restrict this test to the named backends. "
+        "Naming one is a claim that the other would prove nothing; `because` argues it.",
+    )
+
+
+def pytest_generate_tests(metafunc):
+    if "backend" not in metafunc.fixturenames:
+        return
+    marker = metafunc.definition.get_closest_marker("backends")
+    names = list(marker.args) if marker and marker.args else ["sqlite", "postgres"]
+    metafunc.parametrize("backend", names, indirect=True)
+
+
+class _Backend:
+    """Everything a suite needs to reach the store under test."""
+
+    def __init__(self, name: str, source: str):
+        self.name = name
+        self._source = source
+        self._open: list[CairnQ] = []
+
+    async def client(self, **opts) -> CairnQ:
+        """A connected client on this test's own empty database. Closed
+        automatically when the test ends, so suites need no try/finally."""
+        make = CairnQ.sqlite if self.name == "sqlite" else CairnQ.postgres
+        c = make(self._source, **opts)
+        await c.connect()
+        self._open.append(c)
+        return c
+
+    def worker(self, **opts) -> Worker:
+        """A worker on the same database. Not connected — run()/serve() does that."""
+        make = Worker.sqlite if self.name == "sqlite" else Worker.postgres
+        return make(self._source, **opts)
+
+    async def aclose(self) -> None:
+        open_, self._open = self._open, []
+        for c in open_:
+            try:
+                await c.close()
+            except Exception:  # noqa: BLE001 - teardown must not mask a failure
+                pass
+
+
+@pytest_asyncio.fixture(scope="session")
+async def _pg_matrix_dsn():
+    """Create the matrix database once per session; migrations are applied here
+    so no individual test pays for them."""
+    if not PG_DSN:
+        return None
+    import asyncpg
+    from urllib.parse import urlparse, urlunparse
+
+    admin = await asyncpg.connect(PG_DSN)
+    try:
+        await admin.execute(f"drop database if exists {_MATRIX_DB}")
+        await admin.execute(f"create database {_MATRIX_DB}")
+    finally:
+        await admin.close()
+    dsn = urlunparse(urlparse(PG_DSN)._replace(path=f"/{_MATRIX_DB}"))
+    migrator = CairnQ.postgres(dsn)
+    await migrator.connect()
+    await migrator.close()
+    return dsn
+
+
+@pytest_asyncio.fixture
+async def backend(request, tmp_path, _pg_matrix_dsn):
+    if request.param == "sqlite":
+        b = _Backend("sqlite", str(tmp_path / "tasks.db"))
+    else:
+        if not _pg_matrix_dsn:
+            pytest.skip("set CAIRNQ_TEST_PG_DSN to run the Postgres arm")
+        import asyncpg
+
+        conn = await asyncpg.connect(_pg_matrix_dsn)
+        try:
+            await conn.execute("truncate cairnq_tasks, cairnq_task_keys")
+        finally:
+            await conn.close()
+        b = _Backend("postgres", _pg_matrix_dsn)
+    try:
+        yield b
+    finally:
+        await b.aclose()
 
 
 @pytest_asyncio.fixture

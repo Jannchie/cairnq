@@ -28,10 +28,13 @@ async def _wait_for(cond, timeout_s: float = 3.0) -> None:
         await asyncio.sleep(0.01)
 
 
-async def test_deletes_terminal_tasks_past_the_cutoff(db_path):
-    async with CairnQ.sqlite(
-        db_path, retention=Retention(older_than_ms=0, interval_ms=20)
-    ) as client:
+# Both dialects: purge is the statement whose optional filters `specialize`
+# rewrites, and the two dialects reach an index by different routes — SQLite
+# needs the rewrite because it plans before the parameters have values, Postgres
+# re-plans and folds the branch itself. A tiered sweep that quietly matched
+# nothing on one of them would look exactly like a sweep with nothing to do.
+async def test_deletes_terminal_tasks_past_the_cutoff(backend):
+    async with await backend.client(retention=Retention(older_than_ms=0, interval_ms=20)) as client:
         done = await _finish_one(client)
         live = await client.submit("job", {})
 
@@ -45,6 +48,10 @@ async def _is_gone(client: CairnQ, task_id: str) -> bool:
     return await client.get(task_id) is None
 
 
+# Builds its own handle rather than taking one from the fixture: the fixture
+# connects, and connecting is the thing under test. SQLite-only for the same
+# reason — lazy connect is a TaskStore property, not a dialect one.
+@pytest.mark.backends("sqlite", because="lazy connect is a TaskStore property, not a dialect one")
 async def test_starts_without_an_explicit_connect(db_path):
     # connect() is optional — every operation connects lazily through it — so
     # retention that only ran for callers who remembered to call it would be a
@@ -58,27 +65,24 @@ async def test_starts_without_an_explicit_connect(db_path):
         await client.close()
 
 
-async def test_keeps_tasks_that_have_not_aged_out(db_path):
-    async with CairnQ.sqlite(
-        db_path, retention=Retention(older_than_ms=3_600_000, interval_ms=20)
-    ) as client:
+async def test_keeps_tasks_that_have_not_aged_out(backend):
+    async with await backend.client(retention=Retention(older_than_ms=3_600_000, interval_ms=20)) as client:
         done = await _finish_one(client)
         await asyncio.sleep(0.08)
         assert await client.get(done) is not None
 
 
-async def test_does_not_purge_on_startup(db_path):
+async def test_does_not_purge_on_startup(backend):
     # A process that restarts often would otherwise issue a write burst on every
     # boot — exactly when the store is busiest.
-    async with CairnQ.sqlite(
-        db_path, retention=Retention(older_than_ms=0, interval_ms=60_000)
-    ) as client:
+    async with await backend.client(retention=Retention(older_than_ms=0, interval_ms=60_000)) as client:
         done = await _finish_one(client)
         await asyncio.sleep(0.05)
         assert await client.get(done) is not None
 
 
-async def test_drains_a_backlog_larger_than_one_statement(client):
+async def test_drains_a_backlog_larger_than_one_statement(backend):
+    client = await backend.client()
     for _ in range(7):
         await _finish_one(client)
 
@@ -88,12 +92,9 @@ async def test_drains_a_backlog_larger_than_one_statement(client):
     assert await client.list() == []
 
 
-async def test_reports_a_failed_sweep_and_keeps_sweeping(db_path):
+async def test_reports_a_failed_sweep_and_keeps_sweeping(backend):
     errors: list[BaseException] = []
-    async with CairnQ.sqlite(
-        db_path,
-        retention=Retention(older_than_ms=0, interval_ms=20, on_error=errors.append),
-    ) as client:
+    async with await backend.client(retention=Retention(older_than_ms=0, interval_ms=20, on_error=errors.append)) as client:
         store = client.store
         real_purge = store.purge
         failures = 2
@@ -116,16 +117,15 @@ async def test_reports_a_failed_sweep_and_keeps_sweeping(db_path):
         store.purge = real_purge
 
 
-async def test_stops_on_close_without_leaving_a_purge_behind(db_path):
-    client = CairnQ.sqlite(db_path, retention=Retention(older_than_ms=0, interval_ms=10))
-    await client.connect()
+async def test_stops_on_close_without_leaving_a_purge_behind(backend):
+    client = await backend.client(retention=Retention(older_than_ms=0, interval_ms=10))
     done = await _finish_one(client)
     await _wait_for(lambda: _is_gone(client, done))
     # close() awaits the sweep in flight, so nothing can be mid-write against a
     # store that is already gone.
     await client.close()
 
-    async with CairnQ.sqlite(db_path) as reopened:
+    async with await backend.client() as reopened:
         assert await reopened.get(done) is None
 
 
@@ -138,13 +138,11 @@ def test_refuses_a_cutoff_or_interval_that_cannot_mean_anything():
         Retention(older_than_ms=0, limit=0)
 
 
-async def test_keeps_each_status_on_its_own_clock(db_path):
+async def test_keeps_each_status_on_its_own_clock(backend):
     # Retention needs are tiered: succeeded rows are spent once consumed, failed
     # ones are worth keeping for diagnosis. A status the mapping does not name is
     # never swept — granularity is an explicit statement of what may go.
-    async with CairnQ.sqlite(
-        db_path, retention=Retention(older_than_ms={"succeeded": 0}, interval_ms=20)
-    ) as client:
+    async with await backend.client(retention=Retention(older_than_ms={"succeeded": 0}, interval_ms=20)) as client:
         done = await _finish_one(client)
         failed = await _fail_one(client)
 
@@ -171,7 +169,8 @@ def test_refuses_a_rule_sequence_that_names_nothing_or_a_rule_purge_would_reject
         Retention(older_than_ms=[RetentionRule(older_than_ms=-1)])
 
 
-async def test_sweeps_each_rule_on_its_own_cutoff(client):
+async def test_sweeps_each_rule_on_its_own_cutoff(backend):
+    client = await backend.client()
     # The shape the whole feature is for: one installation, two workloads — an
     # RPC result spent on read, a job's failure kept for diagnosis. Without a
     # queue dimension the shorter-lived one would set the retention for both.
@@ -198,7 +197,8 @@ async def test_sweeps_each_rule_on_its_own_cutoff(client):
     assert (await client.get(broken)).status == "failed"
 
 
-async def test_purge_deletes_only_rows_matching_a_queue_filter(client):
+async def test_purge_deletes_only_rows_matching_a_queue_filter(backend):
+    client = await backend.client()
     rpc = await _finish_one(client, queue="rpc")
     job = await _finish_one(client, queue="jobs")
     await asyncio.sleep(0.01)  # purge deletes strictly-older rows; same-ms would miss
@@ -207,7 +207,8 @@ async def test_purge_deletes_only_rows_matching_a_queue_filter(client):
     assert (await client.get(job)).status == "succeeded"
 
 
-async def test_purge_deletes_only_rows_matching_a_status_filter(client):
+async def test_purge_deletes_only_rows_matching_a_status_filter(backend):
+    client = await backend.client()
     done = await _finish_one(client)
     failed = await _fail_one(client)
     await asyncio.sleep(0.01)  # purge deletes strictly-older rows; same-ms would miss
@@ -216,7 +217,8 @@ async def test_purge_deletes_only_rows_matching_a_status_filter(client):
     assert (await client.get(failed)).status == "failed"
 
 
-async def test_purge_deletes_only_rows_matching_a_name_filter(client):
+async def test_purge_deletes_only_rows_matching_a_name_filter(backend):
+    client = await backend.client()
     alpha = await _finish_one(client, "alpha")
     beta = await _finish_one(client, "beta")
     await asyncio.sleep(0.01)  # purge deletes strictly-older rows; same-ms would miss

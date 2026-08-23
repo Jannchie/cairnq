@@ -5,28 +5,25 @@
 // to fail it permanently — which is exactly the mixed-language deployment the
 // README sells (a Python API next to a TypeScript worker on the default queue),
 // and it destroyed whichever tasks the wrong worker happened to win the race for.
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, expect, it } from "vitest";
 
-import { CairnQ, Worker, type Task } from "../src/index.js";
-import { freshDbPath, sleep, waitFor } from "./helpers.js";
+import { type CairnQ, type Task } from "../src/index.js";
+import { describeBackends } from "./backends.js";
+import { sleep, waitFor } from "./helpers.js";
 
-let dbPath: string;
-let client: CairnQ;
+// Both dialects: the name filter is where the claim statements differ most —
+// SQLite reads a JSON array through json_each, Postgres binds a text[] — and a
+// worker that claims a task it has no handler for fails that task permanently,
+// so a filter that works on one dialect and not the other destroys work.
+describeBackends("handler routing", (backend) => {
+  let client: CairnQ;
+  beforeEach(async () => {
+    client = await backend.client();
+  });
 
-beforeEach(async () => {
-  dbPath = freshDbPath();
-  client = CairnQ.sqlite(dbPath);
-  await client.connect();
-});
-
-afterEach(async () => {
-  await client.close();
-});
-
-describe("handler routing", () => {
   it("leaves tasks it cannot run for the worker that can", async () => {
-    const alpha = Worker.sqlite(dbPath, { pollIntervalMs: 10 });
-    const beta = Worker.sqlite(dbPath, { pollIntervalMs: 10 });
+    const alpha = backend.worker({ pollIntervalMs: 10 });
+    const beta = backend.worker({ pollIntervalMs: 10 });
     alpha.task("alpha", async () => ({ by: "alpha" }));
     beta.task("beta", async () => ({ by: "beta" }));
 
@@ -53,7 +50,7 @@ describe("handler routing", () => {
   it("claims nothing when no handler is registered", async () => {
     // The degenerate case of the same rule: nothing registered, nothing claimed —
     // rather than claiming everything and failing all of it.
-    const idle = Worker.sqlite(dbPath, { pollIntervalMs: 10 });
+    const idle = backend.worker({ pollIntervalMs: 10 });
     let current: Task | null = null;
     await idle.background(async () => {
       const task = await client.submit("job", {});

@@ -9,24 +9,14 @@
  * The Python twin (tests/test_batch_delivery.py) asserts the same behaviors.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, expect, it } from "vitest";
 
-import { CairnQ, isRunning, LostLease, TaskError, Worker } from "../src/index.js";
+import { type CairnQ, isRunning, LostLease, TaskError } from "../src/index.js";
 import type { Task } from "../src/index.js";
-import { allTerminal, freshDbPath, sleep, waitFor } from "./helpers.js";
+import { describeBackends } from "./backends.js";
+import { allTerminal, sleep, waitFor } from "./helpers.js";
 
-let dbPath: string;
 let client: CairnQ;
-
-beforeEach(async () => {
-  dbPath = freshDbPath();
-  client = CairnQ.sqlite(dbPath);
-  await client.connect();
-});
-
-afterEach(async () => {
-  await client.close();
-});
 
 /** Run the worker until every id is terminal, then return the tasks by id. */
 async function drain(ids: string[], worker: Worker) {
@@ -44,9 +34,17 @@ async function submitMany(name: string, n: number, payload: (i: number) => any, 
   return ids;
 }
 
-describe("batch delivery", () => {
+// Both dialects: a batched worker draws with the one-queue/one-name claim
+// specialisations, and those are four separate statements per dialect
+// (claim, claim_one_queue, claim_one_name, claim_one_queue_one_name). A batch
+// that silently came back short on one of them would look like a quiet queue.
+describeBackends("batch delivery", (backend) => {
+  beforeEach(async () => {
+    client = await backend.client();
+  });
+
   it("calls the handler once for the whole batch", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 8 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 8 });
     const calls: number[] = [];
 
     worker.task("embed", { batch: 8 }, async (items) => {
@@ -66,7 +64,7 @@ describe("batch delivery", () => {
   });
 
   it("chunks a batch by its registered size", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 8 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 8 });
     const calls: number[] = [];
 
     worker.task("embed", { batch: 3 }, async (items) => {
@@ -82,7 +80,7 @@ describe("batch delivery", () => {
   });
 
   it("returning nothing succeeds the whole batch with no result", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 4 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 4 });
     worker.task("index", { batch: 4 }, async () => {});
 
     const ids = await submitMany("index", 3, () => ({}));
@@ -93,7 +91,7 @@ describe("batch delivery", () => {
   });
 
   it("throwing fails every unsettled task retryably", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
     worker.task("flaky", { batch: 4 }, async () => {
       throw new Error("provider down");
     });
@@ -110,7 +108,7 @@ describe("batch delivery", () => {
   });
 
   it("re-attempts a retryable batch failure per task", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
     let calls = 0;
 
     worker.task("flaky", { batch: 4 }, async () => {
@@ -127,7 +125,7 @@ describe("batch delivery", () => {
   it("throwing a non-retryable TaskError fails the rest permanently", async () => {
     // The `abort_for_credit_depletion` shape: one condition ends the whole batch
     // and nothing should be retried.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
     worker.task("translate", { batch: 4 }, async () => {
       throw new TaskError("credit depleted", { code: "credit_depleted", retryable: false });
     });
@@ -144,7 +142,7 @@ describe("batch delivery", () => {
   });
 
   it("lets a handler settle some tasks and the rest ride on the return", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 8, retryBackoffMs: 0 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 8, retryBackoffMs: 0 });
 
     worker.task("embed", { batch: 8 }, async (items) => {
       for (const item of items) {
@@ -177,7 +175,7 @@ describe("batch delivery", () => {
   it("makes settling twice a no-op", async () => {
     // Handlers built on ack/nack queues all carry a `finalizedIds` set to
     // guarantee this. Holding it in the context is the point.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 4 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 4 });
 
     worker.task("once", { batch: 4 }, async (items) => {
       for (const item of items) {
@@ -197,7 +195,7 @@ describe("batch delivery", () => {
   });
 
   it("retries an explicitly failed task when retryable", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 4, retryBackoffMs: 0 });
     const seen: number[] = [];
 
     worker.task("retryable", { batch: 4 }, async (items) => {
@@ -216,7 +214,7 @@ describe("batch delivery", () => {
 
   it("lets batch and single handlers share one worker", async () => {
     // A claim comes back mixed by name; each name is delivered its own way.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 8 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 8 });
     const batched: number[] = [];
     const singles: string[] = [];
 
@@ -242,7 +240,7 @@ describe("batch delivery", () => {
   it("still uses the list form for batch: 1", async () => {
     // batch: 1 is a real configuration — work that saturates the machine (a
     // Docling parse) is registered this way, and must still get the list form.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20 });
+    const worker = backend.worker({ pollIntervalMs: 20 });
     const shapes: number[] = [];
 
     worker.task("parse", { batch: 1 }, async (items) => {
@@ -264,7 +262,7 @@ describe("batch delivery", () => {
     // delay a beat past a 200ms lease without anything being wrong with the
     // worker, which fails this for a reason it is not testing. Longer lease, same
     // beat-to-lease ratio, same number of lifetimes slept.
-    const worker = Worker.sqlite(dbPath, {
+    const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
       leaseMs: 1_000,
@@ -289,7 +287,7 @@ describe("batch delivery", () => {
     // owns; the beat has to drop tasks the handler already finished.
     // Same margin reasoning as the case above: what is under test is which
     // tasks a beat covers, not whether a beat lands inside 200ms on a busy host.
-    const worker = Worker.sqlite(dbPath, {
+    const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
       leaseMs: 1_000,
@@ -309,7 +307,7 @@ describe("batch delivery", () => {
   });
 
   it("bounds the whole batch call with maxRunMs", async () => {
-    const worker = Worker.sqlite(dbPath, {
+    const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
       maxRunMs: 150,
@@ -335,7 +333,7 @@ describe("batch delivery", () => {
     // so sizing it for the widest batch let a `batch: 64` registration pull 64
     // rows of unrelated work and turn each into its own call on a worker
     // configured for one. Each name now draws its own quota.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 1 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 1 });
     let live = 0;
     let peak = 0;
 
@@ -358,7 +356,7 @@ describe("batch delivery", () => {
     // concurrency counts handler calls: a call holding 4 tasks is one of them.
     // Counting tasks instead is what used to weld batch size to concurrency —
     // a full batch was unreachable unless concurrency was raised to match it.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 2 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 2 });
     let calls = 0;
     let peakCalls = 0;
     let widest = 0;
@@ -383,7 +381,7 @@ describe("batch delivery", () => {
   it("fills a batch on a worker left at the default concurrency", async () => {
     // The headline of the change: batch size is no longer capped by concurrency,
     // so `batch: 8` on a default worker delivers 8 rather than 1.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20 });
+    const worker = backend.worker({ pollIntervalMs: 20 });
     const sizes: number[] = [];
 
     worker.task("embed", { batch: 8 }, async (items) => {
@@ -400,7 +398,7 @@ describe("batch delivery", () => {
   it("caps calls per name with a per-name concurrency", async () => {
     // The worker budget allows 6 calls; `embed` may only ever run 2 of them, so
     // one expensive name cannot take the whole worker.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 6 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 6 });
     let live = 0;
     let peak = 0;
 
@@ -419,7 +417,7 @@ describe("batch delivery", () => {
   });
 
   it("applies a per-name concurrency without batching", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, concurrency: 8 });
+    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 8 });
     let live = 0;
     let peak = 0;
 
@@ -441,7 +439,7 @@ describe("batch delivery", () => {
     // One slot, two backlogs. The claim serves groups in the order given, so
     // without rotating that order `embed` would hold the slot until its 40 tasks
     // were done and `other` would not run at all.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 5, concurrency: 1 });
+    const worker = backend.worker({ pollIntervalMs: 5, concurrency: 1 });
     let embedDone = 0;
     let otherDone = 0;
 
@@ -469,7 +467,7 @@ describe("batch delivery", () => {
     // handler settled while the beat was in flight comes back absent — which the
     // loop read as "another worker took it" and flagged the context lease-lost.
     // A handler checking lostLease was told to bail out after a clean succeed.
-    const worker = Worker.sqlite(dbPath, {
+    const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
       leaseMs: 300,
@@ -494,7 +492,7 @@ describe("batch delivery", () => {
   it("does not flag a single-task handler that settles early either", async () => {
     // The same rule through the single-task path, which shares the loop: it used
     // to heartbeat a terminal row every beat and flag the context on the first.
-    const worker = Worker.sqlite(dbPath, {
+    const worker = backend.worker({
       pollIntervalMs: 20,
       leaseMs: 300,
       heartbeatIntervalMs: 10,
@@ -520,7 +518,7 @@ describe("batch delivery", () => {
     // the ownership check on a terminal row, and reports LostLease — telling the
     // handler another worker took its task when it had simply already finished
     // it, and flipping lostLease on the way out.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20 });
+    const worker = backend.worker({ pollIntervalMs: 20 });
     let raised = false;
     let lost: boolean | undefined;
 
@@ -543,7 +541,7 @@ describe("batch delivery", () => {
   });
 
   it("rejects a non-positive batch size at registration", () => {
-    const worker = Worker.sqlite(dbPath);
+    const worker = backend.worker();
     expect(() => worker.task("x", { batch: 0 }, async () => {})).toThrow(/batch must be/);
   });
 
@@ -551,7 +549,7 @@ describe("batch delivery", () => {
     // succeed()/fail() are on TaskContext, not on anything batch-shaped, so they
     // work in single-task delivery too — there they mean "settle now". The worker
     // must then not complete the task a second time over the handler's decision.
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20 });
+    const worker = backend.worker({ pollIntervalMs: 20 });
     worker.task("early", async (ctx) => {
       await ctx.succeed({ decidedBy: "handler" });
       return { decidedBy: "return value" }; // ignored: already settled
@@ -565,7 +563,7 @@ describe("batch delivery", () => {
   });
 
   it("lets a single-task handler fail itself permanently", async () => {
-    const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20, retryBackoffMs: 0 });
+    const worker = backend.worker({ pollIntervalMs: 20, retryBackoffMs: 0 });
     worker.task("doomed", async (ctx) => {
       await ctx.fail("bad input", { retryable: false });
     });
@@ -581,7 +579,7 @@ describe("batch delivery", () => {
   it("carries a cancel to a batch task through the shared heartbeat", async () => {
     // Cancellation rides along on the write the worker was making anyway — in a
     // batch that write is the shared beat, so it must carry each row back.
-    const worker = Worker.sqlite(dbPath, {
+    const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
       leaseMs: 400,

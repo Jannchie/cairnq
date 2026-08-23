@@ -4,21 +4,13 @@
 // that result afterwards used to mean submitting again under the key and hoping
 // the conflict strategy handed the finished task back, which is a re-submit
 // dressed as a read. `wait(err.taskId)` and `waitByKey(key)` make it a read.
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, expect, it } from "vitest";
 
-import { CairnQ, TaskTimeout } from "../src/index.js";
-import { freshDbPath, sleep } from "./helpers.js";
+import { type CairnQ, TaskTimeout } from "../src/index.js";
+import { describeBackends } from "./backends.js";
+import { sleep } from "./helpers.js";
 
 let client: CairnQ;
-
-beforeEach(async () => {
-  client = CairnQ.sqlite(freshDbPath());
-  await client.connect();
-});
-
-afterEach(async () => {
-  await client.close();
-});
 
 /** Finish a claimed task out of band, the way a worker elsewhere would. */
 async function finishNext(result: unknown): Promise<void> {
@@ -30,7 +22,15 @@ async function finishNext(result: unknown): Promise<void> {
   await client.store.succeed({ taskId: task.id, workerId: "w1", result });
 }
 
-describe("waiting again after a timeout", () => {
+// Both dialects: a key resolves through get_status_by_key on every probe, and
+// that statement's join is one of the places the two dialects are written
+// separately. A wait that stops following the key on one of them looks identical
+// from the API side — it just never finishes.
+describeBackends("waiting again after a timeout", (backend) => {
+  beforeEach(async () => {
+    client = await backend.client();
+  });
+
   it("re-attaches by id, without re-running the task", async () => {
     const err = await client
       .call("job", {}, { key: "A", waitTimeoutMs: 50 })

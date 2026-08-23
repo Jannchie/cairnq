@@ -24,7 +24,14 @@ async def _finish(client: CairnQ, task_id: str, result: dict | None = None) -> N
     await client.store.succeed(task_id=task_id, worker_id="w1", result=result or {"n": 1})
 
 
-async def test_a_failed_task_frees_the_key(client):
+# Both dialects: the key lock this suite is really about is where they differ
+# most — a no-op on SQLite, where BEGIN IMMEDIATE already serializes every keyed
+# transaction, and a pg_advisory_xact_lock on Postgres, where READ COMMITTED
+# gives two concurrent same-key submits nothing to serialize on. The concurrent
+# case below is the one that would silently pass on SQLite while the Postgres
+# lock was missing or wrong. Mirrors cairnq-node/test/key-conflict.test.ts.
+async def test_a_failed_task_frees_the_key(backend):
+    client = await backend.client()
     first = await client.submit("job", {}, key="A", max_attempts=1)
     await client.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
     await client.store.fail(
@@ -42,7 +49,8 @@ async def test_a_failed_task_frees_the_key(client):
     assert (await client.get(first.id)).status == "failed"
 
 
-async def test_a_succeeded_result_comes_back_only_under_reuse_succeeded(client):
+async def test_a_succeeded_result_comes_back_only_under_reuse_succeeded(backend):
+    client = await backend.client()
     first = await client.submit("job", {}, key="A")
     await _finish(client, first.id)
 
@@ -56,7 +64,8 @@ async def test_a_succeeded_result_comes_back_only_under_reuse_succeeded(client):
     assert rerun.status == "queued"
 
 
-async def test_concurrent_submits_collapse_onto_one_task(client):
+async def test_concurrent_submits_collapse_onto_one_task(backend):
+    client = await backend.client()
     first = await client.submit("job", {}, key="A")
     await _finish(client, first.id)
 
@@ -76,7 +85,8 @@ async def test_concurrent_submits_collapse_onto_one_task(client):
     assert len(await client.list()) == 2
 
 
-async def test_reject_still_rejects_a_finished_task(client):
+async def test_reject_still_rejects_a_finished_task(backend):
+    client = await backend.client()
     first = await client.submit("job", {}, key="A", conflict="reject")
     await _finish(client, first.id)
     # reject asks for a key that is used at most once, ever — a task reaching a
@@ -85,7 +95,8 @@ async def test_reject_still_rejects_a_finished_task(client):
         await client.submit("job", {}, key="A", conflict="reject")
 
 
-async def test_replace_still_cancels_a_live_task(client):
+async def test_replace_still_cancels_a_live_task(backend):
+    client = await backend.client()
     first = await client.submit("job", {}, key="A")
     second = await client.submit("job", {}, key="A", conflict="replace")
     assert second.id != first.id
