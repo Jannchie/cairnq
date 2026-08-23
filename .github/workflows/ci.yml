@@ -69,6 +69,35 @@ jobs:
         working-directory: cairnq-py
       - run: node conformance/cross-lang/run.mjs
 
+  # The differential harness: the same workload under a Node worker and under a
+  # Python worker, with the two databases projected and diffed. Covers the layer
+  # the conformance scenarios cannot reach — a JSON scenario cannot express a
+  # handler, nor the language-private value that made the encoder drift — and
+  # observes what an in-process runner cannot, namely a worker that took its host
+  # process down with it.
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - run: pnpm install --frozen-lockfile
+        working-directory: cairnq-node
+      - run: uv sync --extra dev
+        working-directory: cairnq-py
+      # The projection first: it decides what the comparison can see, so a
+      # projection that has stopped catching things makes the run below
+      # meaningless rather than failing.
+      - run: node conformance/differential/dump.spec.mjs
+      - run: node conformance/differential/run.mjs
+
   # Live Postgres: spin up a real PG and run each SDK's live smoke against it.
   # This is the only job that actually executes PostgresStore.
   postgres:
@@ -106,13 +135,16 @@ jobs:
       # a normal install brings it in for these tests.
       - run: pnpm install --frozen-lockfile
         working-directory: cairnq-node
-      # The live smoke plus the full conformance suite, which runs every scenario
-      # against Postgres too when a DSN is present — that is what holds the two
-      # dialects to the same behavior.
-      - run: pnpm exec vitest run test/postgres.live.test.ts test/conformance.test.ts
+      # The WHOLE suite, not a list of files. Naming files here is how the
+      # Postgres arms of every behavioural suite came to be written and never
+      # run: `describeBackends` declares that retention, batch delivery, the
+      # keyed transactions and the rest cover both dialects, and that
+      # declaration is only true if something executes it. Suites with no
+      # Postgres arm skip themselves; they cost a few seconds.
+      - run: pnpm exec vitest run
         working-directory: cairnq-node
       # python: asyncpg comes from the `postgres` extra.
       - run: uv sync --extra dev --extra postgres
         working-directory: cairnq-py
-      - run: uv run pytest tests/test_postgres_live.py tests/test_conformance.py -q
+      - run: uv run pytest -q
         working-directory: cairnq-py

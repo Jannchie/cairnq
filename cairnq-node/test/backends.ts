@@ -151,7 +151,9 @@ export interface BackendOptions {
  * `describe`, once per backend, with a fresh empty database per test.
  *
  * The Postgres arm skips without a DSN rather than failing, so `pnpm test`
- * works on a laptop; CI's `postgres` job is what actually runs it.
+ * works on a laptop. CI's `postgres` job runs the WHOLE suite with a DSN set,
+ * which is what makes the declaration true — for a while it named individual
+ * files instead, so every arm declared here was written and never executed.
  */
 export function describeBackends(
   title: string,
