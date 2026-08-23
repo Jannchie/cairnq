@@ -144,9 +144,10 @@ export class RetentionSweeper {
   start(): void {
     if (this.active) return;
     this.active = true;
-    this.stopping = false;
-    // A stopped sweeper can be started again, and the old signal is spent.
-    this.arm();
+    // No reset here: stop() clears `stopping` and re-arms the signal before it
+    // returns, and the constructor arms the first one — so a sweeper reaching
+    // this line always already has a fresh signal and a clear flag. (The Python
+    // twin has never had a reset here, for the same reason.)
     this.loop = this.run();
   }
 
@@ -162,6 +163,15 @@ export class RetentionSweeper {
     this.wake();
     await this.loop;
     this.loop = null;
+    // Cleared, and the signal re-armed, now that the loop is provably gone.
+    // `stopping` is how a sweep in flight cuts itself short, so leaving it set
+    // would silently truncate a later on-demand sweep() — a supported call — to
+    // its first batch. Leaving the signal spent would be the subtler half of the
+    // same bug: that sweep's between-batches yield would resolve on a microtask
+    // instead of handing the event loop back, so a long drain would starve the
+    // submits and claims sharing this process — exactly what the yield is for.
+    this.stopping = false;
+    this.arm();
   }
 
   private async run(): Promise<void> {

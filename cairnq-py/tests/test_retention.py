@@ -227,6 +227,50 @@ async def test_purge_deletes_only_rows_matching_a_name_filter(backend):
     assert (await client.get(beta)).status == "succeeded"
 
 
-async def test_purge_refuses_a_status_filter_that_could_never_match(client):
+async def test_purge_refuses_a_status_filter_that_could_never_match(backend):
+    client = await backend.client()
     with pytest.raises(ValueError, match="terminal"):
         await client.purge(status="queued")
+
+
+async def test_a_stopped_sweeper_still_drains_on_demand(backend):
+    """sweep() is documented as a direct call — "after a backfill, or from a
+    maintenance command" — and stop() used to leave it crippled.
+
+    `_stop` is how a sweep in flight cuts itself short, and stop() set it without
+    ever clearing it. A later sweep() then returned after its FIRST batch: with a
+    backlog of 7 and a limit of 2 it deleted 2 and reported success, leaving 5
+    rows behind and no indication anything had been skipped."""
+    client = await backend.client()
+    for _ in range(7):
+        await _finish_one(client)
+
+    sweeper = RetentionSweeper(client.store, Retention(older_than_ms=0, limit=2))
+    sweeper.start()
+    await sweeper.stop()
+
+    assert await sweeper.sweep() == 7
+    assert await client.list() == []
+
+
+async def test_a_stopped_sweeper_can_be_started_again(backend):
+    """The same unreset flag also broke restart: _run's first check saw `_stop`
+    still set and returned before sweeping anything, so a stopped sweeper could
+    never be revived. The TypeScript twin cleared its flag in start() and so only
+    had the sweep() half of this bug; both now clear it in stop()."""
+    client = await backend.client()
+    sweeper = RetentionSweeper(client.store, Retention(older_than_ms=0, interval_ms=20))
+    sweeper.start()
+    await sweeper.stop()
+
+    for _ in range(3):
+        await _finish_one(client)
+    sweeper.start()
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if await client.list() == []:
+                break
+        assert await client.list() == []
+    finally:
+        await sweeper.stop()

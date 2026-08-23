@@ -202,7 +202,7 @@ describeBackends("purge filters", (backend) => {
   });
 
   it("deletes only rows matching a queue filter", async () => {
-    const c = client();
+    const c = await client();
     const rpc = await finishOne(c, { queue: "rpc" });
     const job = await finishOne(c, { queue: "jobs" });
     await sleep(10); // purge deletes strictly-older rows; same-ms completion would miss
@@ -212,7 +212,7 @@ describeBackends("purge filters", (backend) => {
   });
 
   it("deletes only rows matching a name filter", async () => {
-    const c = client();
+    const c = await client();
     const alpha = await finishOne(c, { name: "alpha" });
     const beta = await finishOne(c, { name: "beta" });
     await sleep(10); // purge deletes strictly-older rows; same-ms completion would miss
@@ -222,7 +222,43 @@ describeBackends("purge filters", (backend) => {
   });
 
   it("refuses a status filter that could never match", async () => {
-    const c = client();
+    const c = await client();
     await expect(c.purge({ status: "queued" })).rejects.toThrow(/terminal/);
+  });
+
+  it("still drains on demand after it has been stopped", async () => {
+    // sweep() is documented as a direct call — "after a backfill, or from a
+    // maintenance command" — and stop() used to leave it crippled. `stopping` is
+    // how a sweep in flight cuts itself short, and only start() ever cleared it,
+    // so a later sweep() returned after its FIRST batch: with a backlog of 7 and
+    // a limit of 2 it deleted 2, reported success, and left 5 rows behind with
+    // no indication anything had been skipped.
+    const c = await client();
+    for (let i = 0; i < 7; i++) await finishOne(c);
+    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+    sweeper.start();
+    await sweeper.stop();
+
+    expect(await sweeper.sweep()).toBe(7);
+    expect(await c.list()).toEqual([]);
+  });
+
+  it("hands the loop back between batches of a drain after a stop", async () => {
+    // The subtler half of the same bug: stop() resolved the shared stop signal,
+    // and sweep()'s between-batches yield races that signal. Left spent, the
+    // yield resolved on a microtask instead of on a timer, so a long drain never
+    // handed the event loop back — starving exactly the submits and claims it is
+    // there to protect. Asserted by racing the drain against a macrotask: a real
+    // yield lets the timer fire somewhere in the middle.
+    const c = await client();
+    for (let i = 0; i < 7; i++) await finishOne(c);
+    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+    sweeper.start();
+    await sweeper.stop();
+
+    let ticked = false;
+    setTimeout(() => (ticked = true), 0);
+    await sweeper.sweep();
+    expect(ticked).toBe(true);
   });
 });

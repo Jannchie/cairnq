@@ -142,6 +142,12 @@ class RetentionSweeper:
         self._stop.set()
         task, self._task = self._task, None
         await task
+        # Cleared now that the loop is provably gone. `_stop` is how a sweep in
+        # flight cuts itself short, so leaving it set silently truncated a later
+        # on-demand sweep() — a supported call — to its first batch, and made a
+        # start() after a stop() exit its loop on the first check. Mirrors
+        # RetentionSweeper.stop in the TypeScript SDK.
+        self._stop.clear()
 
     async def _run(self) -> None:
         # Sleep first: a process that restarts often would otherwise purge on
