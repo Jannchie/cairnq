@@ -30,7 +30,7 @@ Synchronous call (submit + wait):
 from cairnq import TaskFailed, TaskTimeout
 
 try:
-    result = await tasks.call("create_summary", {"text": text}, wait_timeout_ms=10_000)
+    result = await tasks.call("create_summary", {"text": text}, timeout_ms=10_000)
 except TaskFailed as e:
     log(e.code, e.message, e.retryable)   # envelope fields, no e.error["code"] digging
 except TaskTimeout as e:
@@ -68,20 +68,17 @@ Opt-in: every API still accepts a plain name string (cross-language callers use 
 ```python
 worker = Worker.sqlite(
     "tasks.db",
-    concurrency=4,            # handler calls at once; use max_in_flight_bytes to bound memory
+    concurrency=4,            # handler calls at once (a batch call counts as one)
     retry_backoff_ms=1_000,   # window doubles per attempt, capped at retry_backoff_max_ms (30s),
                               # jittered over its upper half; 0 disables
     on_error=lambda exc, info: log.warning("worker survived %s: %s", info, exc),
 )
 
-# Nothing else deletes rows, so give the client a retention policy — it sweeps
-# terminal tasks in bounded batches for as long as the handle is open. A
-# per-status mapping keeps each status on its own clock (statuses left out are
-# never swept): spent results go in minutes, failures stay for diagnosis.
-tasks = CairnQ.sqlite(
-    "tasks.db",
-    retention=Retention(older_than_ms={"succeeded": 300_000, "failed": 7 * 24 * 3600_000}),
-)
+# Nothing else deletes rows, so give the client a retention cutoff — it sweeps
+# terminal tasks in bounded batches for as long as the handle is open. Tiered
+# retention (per queue, per status) is purge() with filters, from your own
+# scheduler.
+tasks = CairnQ.sqlite("tasks.db", retention_ms=7 * 24 * 3600_000)
 ```
 
 A **sync** handler (`def`, not `async def`) is dispatched to a thread, so the
@@ -154,21 +151,6 @@ Without it the two are separate transactions, and a crash between them leaves
 work durable while the task still reads as running — on retry, recomputed. If
 the lease turns out to be gone, the settlement matches no row and the caller's
 writes roll back with it.
-
-## Watching
-
-`watch` calls back when the tasks on a queue may have changed — for a dashboard
-that would otherwise poll:
-
-```python
-stop = tasks.watch(on_signal, queues=["render"])
-```
-
-It is notify-accelerated polling, not an event log. On Postgres an idle watch
-costs nothing and a signal lands within milliseconds; where LISTEN is
-unavailable — a transaction-mode pooler, or SQLite, which has no channel — the
-timer alone still delivers `poll` signals. Treat a signal as "re-read now"; the
-truth is in `stats()` / `list()` / `get()`.
 
 The protocol (schema + canonical SQL) lives in `../cairnq-protocol` and is shared
 verbatim with the TypeScript SDK. See `../cairnq-protocol/PROTOCOL.md`.

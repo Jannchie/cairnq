@@ -34,7 +34,7 @@ Synchronous call (submit + wait):
 import { TaskFailed, TaskTimeout } from "cairnq";
 
 try {
-  const result = await tasks.call("summary.create", { text }, { waitTimeoutMs: 10_000 });
+  const result = await tasks.call("summary.create", { text }, { timeoutMs: 10_000 });
 } catch (err) {
   if (err instanceof TaskFailed) log(err.code, err.message, err.retryable); // envelope fields
   else if (err instanceof TaskTimeout) {
@@ -45,13 +45,11 @@ try {
 }
 ```
 
-Inspect a task by id/key without matching status strings:
+Inspect a task by id/key:
 
 ```ts
-import { isSucceeded } from "cairnq"; // also isFailed/isCanceled/isRunning/isQueued/isTerminal
-
 const task = await tasks.getByKey(key);
-if (task && isSucceeded(task)) use(task.result);
+if (task?.status === "succeeded") use(task.result);
 ```
 
 Optionally define a task once and share the symbol across both ends — no string
@@ -72,19 +70,17 @@ Opt-in: every API still accepts a plain name string (cross-language callers use 
 
 ```ts
 const worker = Worker.sqlite("tasks.db", {
-  concurrency: 4,          // handler calls at once; use maxInFlightBytes to bound memory
+  concurrency: 4,          // handler calls at once (a batch call counts as one)
   retryBackoffMs: 1_000,   // window doubles per attempt, capped at retryBackoffMaxMs (30s),
                            // jittered over its upper half; 0 disables
   onError: (err, info) => log.warn({ err, ...info }), // claims/writes the loop survived
 });
 
-// Nothing else deletes rows, so give the client a retention policy — it sweeps
-// terminal tasks in bounded batches for as long as the handle is open. A
-// per-status map keeps each status on its own clock (statuses left out are
-// never swept): spent results go in minutes, failures stay for diagnosis.
-const tasks = CairnQ.sqlite("tasks.db", {
-  retention: { olderThanMs: { succeeded: 300_000, failed: 7 * 24 * 3600_000 } },
-});
+// Nothing else deletes rows, so give the client a retention cutoff — it sweeps
+// terminal tasks in bounded batches for as long as the handle is open. Tiered
+// retention (per queue, per status) is purge() with filters, from your own
+// scheduler.
+const tasks = CairnQ.sqlite("tasks.db", { retentionMs: 7 * 24 * 3600_000 });
 ```
 
 A handler that does real side effects should bail out when it loses its lease —
@@ -149,25 +145,6 @@ Without it the two are separate transactions, and a crash between them leaves
 work durable while the task still reads as running — on retry, recomputed. If
 the lease turns out to be gone, the settlement matches no row and the caller's
 writes roll back with it.
-
-## Watching
-
-`watch` calls back when the tasks on a queue may have changed — for a dashboard
-that would otherwise poll:
-
-```ts
-const stop = tasks.watch({ queues: ["render"] }, async (signal) => {
-  if (signal.reason === "done") return refreshOne(signal.taskId!);
-  setCounts(await tasks.stats());
-});
-```
-
-It is notify-accelerated polling, not an event log. On Postgres an idle watch
-costs nothing and a signal lands within milliseconds; where LISTEN is
-unavailable — a transaction-mode pooler, or SQLite, which has no channel — the
-timer alone still delivers `poll` signals. So the same consumer is correct either
-way, and only its promptness differs. Treat a signal as "re-read now"; the truth
-is in `stats()` / `list()` / `get()`.
 
 The protocol (schema + canonical SQL) lives in `../cairnq-protocol` and is shared
 verbatim with the Python SDK. See `../cairnq-protocol/PROTOCOL.md`.

@@ -4,7 +4,7 @@ description: >-
   Use cairnq, the cross-language durable task runtime that coordinates through a
   shared database (SQLite for one host, Postgres for many). Covers the worker side
   (register handlers, run them, batch delivery), the API side (submit / call / get
-  / cancel / retry / stats by id or business key), idempotency keys, retries,
+  / cancel / retry by id or business key), idempotency keys, retries,
   cooperative cancel, and the at-least-once limits. Trigger when code imports
   `cairnq` (Python or TypeScript), defines a Worker or handler, calls
   submit/call/getByKey, batches tasks into one handler call, or the user mentions
@@ -58,9 +58,7 @@ TS: `worker.task("summarize", async (ctx, payload) => {…})`, or `worker.task(f
 — it counts **handler calls**, so a batch call carrying 256 tasks is one of them),
 `lease_ms` (30s), `poll_interval_ms` (500ms), `retry_backoff_ms` /
 `retry_backoff_max_ms` (1s doubling to 30s, jittered), `max_run_ms`,
-`max_in_flight_bytes`
-(bounds resident payload bytes — `concurrency` bounds calls, not memory),
-`on_error`. `serve()` owns the process and its signals; `run()` / `background()`
+`resources`, `on_error`. `serve()` owns the process and its signals; `run()` / `background()`
 embed the worker in an event loop you manage.
 
 **`ctx`:** `payload`, `attempt`, `taskId`, `name`, `queue`, `metadata`, `rootId`,
@@ -82,7 +80,7 @@ embedding call over 256 texts rather than 256 calls — and size it by what the
 downstream API wants.
 
 ```python
-@worker.task("embed", batch=256, concurrency=2)   # concurrency here = per-name
+@worker.task("embed", batch=256)
 async def embed(items):                           # list[TaskContext]
     vectors = await model.embed([i.payload["text"] for i in items])
     return {item.task_id: {"vec": v} for item, v in zip(items, vectors)}
@@ -100,14 +98,13 @@ Everything stays per task — own lease, `attempt`, backoff, cancel flag — and
 heartbeat covers the batch.
 
 Each name draws its own claim quota, so `batch` and `concurrency` are independent:
-`batch=256` fills at the default `concurrency=1`, and a per-name `concurrency`
-(with or without `batch`) stops one expensive name from taking the whole worker.
+`batch=256` fills at the default `concurrency=1`.
 
 ### Shared resources (optional)
 
-`concurrency` caps a name against itself. When *different* handlers contend for
-one scarce thing — a GPU, a single-writer index — declare its capacity once on the
-worker and let the names join it:
+When one or several handlers contend for one scarce thing — a GPU, a
+single-writer index — declare its capacity once on the worker and let the names
+join it:
 
 ```python
 worker = Worker.sqlite("tasks.db", resources={"gpu": 1})
@@ -123,8 +120,8 @@ TS: `Worker.sqlite(path, { resources: { gpu: 1 } })` +
 `worker.task("render", { resource: "gpu" }, fn)`.
 
 Capacity is a count, so two GPUs are `{"gpu": 2}`; at 1 it is mutual exclusion
-across those names. A name may also cap itself (`concurrency=1, resource="gpu"`)
-and the tighter binds. An undeclared resource raises at registration rather than
+across those names. A name that only needs to cap itself declares a resource of
+its own. An undeclared resource raises at registration rather than
 reading as unlimited. The gate is at claim, so blocked work stays `queued` and
 claimable by another worker — it never sits on a lease waiting its turn.
 
@@ -134,35 +131,33 @@ run two calls against that GPU. For one GPU, run one worker process.
 ## API side
 
 ```ts
-import { CairnQ, isSucceeded } from "cairnq";
+import { CairnQ } from "cairnq";
 const tasks = CairnQ.sqlite("tasks.db");        // or CairnQ.postgres(dsn)
 
 await tasks.submit("summarize", { text }, { key: `summary:${docId}` });   // returns at once
-const result = await tasks.call("summarize", { text }, { waitTimeoutMs: 10_000 });
+const result = await tasks.call("summarize", { text }, { timeoutMs: 10_000 });
 
-const t = await tasks.getByKey(`summary:${docId}`);    // predicates, not status strings
-if (t && isSucceeded(t)) use(t.result);
+const t = await tasks.getByKey(`summary:${docId}`);
+if (t?.status === "succeeded") use(t.result);
 ```
 
-Python exposes the same checks as properties: `t.succeeded` / `.failed` /
+Python exposes status checks as properties: `t.succeeded` / `.failed` /
 `.canceled` / `.running` / `.queued` / `.is_terminal`.
 
 **Full surface**, each by `task_id` or business `key`: `submit`, `get` / `getByKey`,
 `list`, `wait` / `waitByKey`, `call`, `cancel` / `cancelByKey`, `retry` /
-`retryByKey`, `purge`, `stats`.
+`retryByKey`, `purge`, `queueDepth`.
 
 - **`submit`:** `key`, `queue` (`"default"`), `conflict` (`reuse` |
   `reuse-succeeded` | `reject` | `replace`), `maxAttempts` (3), `priority`,
-  `metadata`, `parentId`, `correlationId`, `runAtDelayMs`.
+  `metadata`, `delayMs`.
 - **`list`:** `status`, `queue`, `name`, `rootId`, `correlationId`, `limit` (100),
   `offset`.
 - **`retry(id, {resetAttempt: true})`** restarts from attempt 0 rather than
   spending the remaining `maxAttempts` budget.
-- **`stats()`** → zero-filled counts per queue per status;
-  `stats()["default"]["queued"]` is a backlog without listing rows.
-- **`retention`** on the client (`Retention(older_than_ms=...)` / `{ olderThanMs }`)
-  sweeps terminal tasks on a schedule for as long as the handle is open. Without
-  it nothing removes rows, ever.
+- **`retentionMs` / `retention_ms`** on the client sweeps terminal tasks on a
+  schedule for as long as the handle is open. Without it nothing removes rows,
+  ever; tiered retention is `purge()` with filters from your own scheduler.
 
 ## The non-obvious rules — where people go wrong
 
@@ -196,15 +191,14 @@ Python exposes the same checks as properties: `t.succeeded` / `.failed` /
   keep them, so a failed task still shows how far it got.
 - **Nothing is deleted unless you configure it.** Terminal tasks stay forever
   otherwise, which with large payloads is a disk leak, not just clutter. Set
-  `retention` on the client and the sweep runs itself; `purge(olderThanMs=…)`
+  `retentionMs` on the client and the sweep runs itself; `purge(olderThanMs=…)`
   stays available for an external scheduler (bounded by `limit`, 1000 per call —
   loop until it returns fewer than `limit`).
 - **Blocking work must leave the loop.** The heartbeat renews leases on the
   worker's own event loop, so a handler that blocks it lets its lease expire and
   its task get recovered *while it is still running*. Python sends **sync
   handlers to a thread** automatically; blocking inside an `async` handler is the
-  case nothing can save, and both SDKs report `EventLoopBlocked` through
-  `on_error` / `onError` when they see a beat go missing.
+  case nothing can save — keep synchronous work off the loop.
 - **Worker errors are silent unless you ask.** `on_error` / `onError` reports what
   the run loop survived (a claim that threw, a store write that failed while
   finalizing). Task *failures* go to the DB; these do not.

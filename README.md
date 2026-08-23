@@ -45,7 +45,7 @@ API (TypeScript) — submit and wait for the result:
 import { CairnQ } from "cairnq";
 
 const tasks = CairnQ.sqlite("tasks.db");
-const result = await tasks.call("summarize", { text }, { waitTimeoutMs: 10_000 });
+const result = await tasks.call("summarize", { text }, { timeoutMs: 10_000 });
 ```
 
 Or submit async and follow up by id / key:
@@ -58,7 +58,7 @@ const task = await tasks.submit("image.generate", { prompt }, {
 });
 // later:
 const t = await tasks.getByKey(key);
-if (t && isSucceeded(t)) use(t.result);   // status predicates, no string matching
+if (t?.status === "succeeded") use(t.result);
 ```
 
 ### Typed tasks (optional)
@@ -136,25 +136,13 @@ and one shared heartbeat renews only the ones still in play.
 size: a call carrying 256 tasks is one of them, and `batch=256` fills at the
 default `concurrency=1`. Size `concurrency` for how much work you want running at
 once and `batch` for what the downstream API wants — they no longer trade against
-each other, and `maxInFlightBytes` / `max_in_flight_bytes` is what bounds memory.
+each other. Each name draws its own quota from one claim, so a big `batch` on one
+name never starts extra calls for another, and a name with a deep backlog cannot
+starve the others.
 
-Cap a single name with its own `concurrency`, so one expensive name cannot take
-the whole worker:
-
-```python
-@worker.task("embed", batch=256, concurrency=2)   # at most 2 calls at a time
-async def embed(items): ...
-```
-
-Each name draws its own quota from one claim, so a big `batch` on one name never
-starts extra calls for another, and a name with a deep backlog cannot starve the
-others.
-
-**A `resource` is that same ceiling shared by several names.** `concurrency` caps
-a name against itself, which cannot say what usually binds a worker doing heavy
-local work: different handlers contending for one scarce thing — a GPU, an index
-that tolerates a single writer. The limit belongs to the thing, so it is declared
-once, on the worker, and the names join it:
+**A `resource` caps a scarce thing that one or several names contend for** — a
+GPU, an index that tolerates a single writer. The limit belongs to the thing, so
+it is declared once, on the worker, and the names join it:
 
 ```python
 worker = Worker.sqlite("tasks.db", resources={"gpu": 1, "index": 1})
@@ -179,8 +167,8 @@ worker.task("compare", { resource: "gpu" }, compare);
 ```
 
 Capacity is a count, not a flag, so two GPUs are `{"gpu": 2}`; at 1 it is mutual
-exclusion across those names. A name may also cap itself under the shared limit
-(`concurrency=1, resource="gpu"`), and the tighter of the two binds. A resource
+exclusion across those names. A name that only needs to cap *itself* declares a
+resource of its own (`resources={"embed": 2}`, `resource="embed"`). A resource
 that no `Worker(resources=...)` declares is rejected at registration rather than
 read as unlimited — a typo would otherwise silently remove the ceiling.
 
@@ -231,51 +219,32 @@ and a JSON protocol.
   handler; TypeScript aborts `ctx.signal` and cuts the context off from the
   store) and records a retryable `handler_timeout` failure, so backoff,
   `max_attempts` and cancel-wins apply as usual.
-- **Blocking work is handled, not merely warned about.** The heartbeat shares the
-  worker's event loop, so a handler that occupies it stops renewing its own lease
-  — the task is recovered mid-run and a second worker computes it in parallel,
-  with no error anywhere. Python dispatches **sync handlers to a thread**, so the
-  usual shape (`def handler(ctx, payload)` around a GPU call) is safe by
-  construction; when the loop is blocked anyway, both SDKs report
-  `EventLoopBlocked` through `on_error` / `onError` while the lease still holds.
+- **Blocking work is handled.** The heartbeat shares the worker's event loop, so
+  a handler that occupies it stops renewing its own lease — the task is recovered
+  and redelivered, never lost. Python dispatches **sync handlers to a thread**,
+  so the usual shape (`def handler(ctx, payload)` around a GPU call) is safe by
+  construction; in TypeScript, keep synchronous work off the loop (a worker
+  thread, a child process).
 - **Retention**: nothing else ever removes rows, so a long-lived database needs a
   sweep — and with payloads that carry real data (an image, a document, a batch of
   embeddings) "nothing removes rows" is a disk leak measured in gigabytes per
-  backfill. Give the client a retention policy and it sweeps itself, in bounded
-  batches, for as long as the handle is open:
+  backfill. Give the client a cutoff and it sweeps itself, in bounded batches,
+  for as long as the handle is open:
 
   ```python
-  tasks = CairnQ.sqlite("tasks.db", retention=Retention(older_than_ms=7 * 86_400_000))
+  tasks = CairnQ.sqlite("tasks.db", retention_ms=7 * 86_400_000)
   ```
 
-  Retention needs are usually tiered — a succeeded row is spent once its result
-  is consumed, a failed one is worth keeping for diagnosis — so `older_than_ms`
-  also takes a per-status mapping (`{"succeeded": 300_000, "failed":
-  86_400_000}`; a status left out is never swept). And because one installation
-  is how two languages are meant to coordinate here, it routinely carries two
-  workloads whose rows have nothing to do with each other's lifetimes — so
-  `older_than_ms` also takes a list of rules, tiered on anything `purge` filters
-  on:
+  Tiered retention — a succeeded row is spent once its result is consumed, a
+  failed one is worth keeping for diagnosis — is
+  `purge(older_than_ms=..., queue=..., status=..., name=..., limit=...)` with
+  filters, from your own scheduler or a one-off drain.
 
-  ```python
-  tasks = CairnQ.sqlite("tasks.db", retention=Retention(older_than_ms=[
-      RetentionRule(queue="rpc", older_than_ms=300_000),
-      RetentionRule(queue="jobs", status="failed", older_than_ms=7 * 86_400_000),
-  ]))
-  ```
-
-  Rules are independent — nothing a rule does not match is swept.
-  `purge(older_than_ms=..., queue=..., status=..., name=..., limit=...)` remains
-  the manual form, for an external scheduler or a one-off drain.
-
-- **Operational visibility**: `stats()` returns task counts per queue and status
-  (zero-filled), so a dashboard or health check reads backlog without listing
-  rows; `stats(queue)` narrows it to one queue so a caller does not pay for the
-  other workloads sharing the installation. It counts what it reports, so poll
-  `queue_depth()` — which is bounded — and keep `stats()` for the dashboard. An
-  `on_error` / `onError` hook on the worker reports what the run loop survived (a
-  failed claim, a store write that blew up while finalizing) — without it those
-  are silent.
+- **Operational visibility**: an `on_error` / `onError` hook on the worker
+  reports what the run loop survived (a failed claim, a store write that blew up
+  while finalizing) — without it those are silent. `queue_depth(queue,
+  max_depth)` reads a queue's remaining headroom, bounded so it stays cheap to
+  ask on every enqueue.
 
 - **Backpressure**, so a producer that outruns its workers is bounded by
   something other than disk. Give the client a depth limit and `submit` blocks
@@ -290,17 +259,8 @@ and a JSON protocol.
   the same option (a worker process has no client handle to have set it).
 
   `queue_depth(queue, max_depth)` is the same read without the blocking, for a
-  producer that would rather shed load than wait — bounded at `max_depth` index
-  entries, so it stays cheap to ask on every enqueue. The limit is soft across
+  producer that would rather shed load than wait. The limit is soft across
   several producers (see PROTOCOL.md).
-
-  On the worker side, `max_in_flight_bytes` / `maxInFlightBytes` bounds resident
-  payload bytes, which no other option does. `concurrency` counts handler calls,
-  and a batched call carries up to `batch` tasks, so the bytes a worker can hold
-  are `concurrency * batch * largest-payload` — for payloads carrying media
-  inline, the difference between megabytes and gigabytes. It is read between
-  claims, so a poll can still overshoot it by one draw per name; size batches with
-  that in mind.
 
 ### At-least-once, not exactly-once
 
