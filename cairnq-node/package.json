@@ -1,6 +1,6 @@
 {
   "name": "cairnq",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "SQLite-first, cross-language, storage-centered durable task runtime",
   "license": "MIT",
   "author": "Jannchie <jannchie@gmail.com>",
