@@ -207,20 +207,31 @@ export class RetentionSweeper {
         if (this.stopping) return deleted;
         if (ids.length < this.limit) break;
         // Hand the loop back between batches: a large drain must not starve the
-        // submits and claims sharing this process.
-        await this.sleep(0);
+        // submits and claims sharing this process. Ref'd — see sleep().
+        await this.sleep(0, true);
       }
     }
     return deleted;
   }
 
-  /** Sleep, interruptible by stop(). Unref'd: retention is housekeeping, and a
-   * pending sweep must never be the reason a process refuses to exit. */
-  private sleep(ms: number): Promise<void> {
+  /**
+   * Sleep, interruptible by stop().
+   *
+   * `holdProcess` is the same distinction the store draws between `claimWake`
+   * and `taskDoneWake`: a wait nobody is awaiting must not hold the process
+   * open, and a wait somebody IS awaiting must. The scheduled loop's interval is
+   * the first — retention is housekeeping, and a pending sweep must never be the
+   * reason a process refuses to exit. `sweep()`'s between-batches yield is the
+   * second: its caller is awaiting the drain, and an unref'd timer there let
+   * Node decide the loop was idle and exit mid-drain, leaving that promise
+   * unsettled forever (a maintenance command that swept two rows of seven and
+   * exited 13). Python's twin never had this, `asyncio.sleep` having no unref.
+   */
+  private sleep(ms: number, holdProcess = false): Promise<void> {
     let timer: NodeJS.Timeout;
     const nap = new Promise<void>((resolve) => {
       timer = setTimeout(resolve, ms);
-      timer.unref?.();
+      if (!holdProcess) timer.unref?.();
     });
     // Clear the timer whichever side wins, so a stop is never followed by a
     // leftover sweep timer.

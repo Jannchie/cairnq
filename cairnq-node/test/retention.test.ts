@@ -184,6 +184,81 @@ describeBackends("retention", (backend) => {
     expect((await c.get(job))?.status).toBe("succeeded");
     expect((await c.get(broken))?.status).toBe("failed");
   });
+
+  it("still drains on demand after it has been stopped", async () => {
+    // sweep() is documented as a direct call — "after a backfill, or from a
+    // maintenance command" — and stop() used to leave it crippled. `stopping` is
+    // how a sweep in flight cuts itself short, and only start() ever cleared it,
+    // so a later sweep() returned after its FIRST batch: with a backlog of 7 and
+    // a limit of 2 it deleted 2, reported success, and left 5 rows behind with
+    // no indication anything had been skipped.
+    const c = await client();
+    for (let i = 0; i < 7; i++) await finishOne(c);
+    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+    sweeper.start();
+    await sweeper.stop();
+
+    expect(await sweeper.sweep()).toBe(7);
+    expect(await c.list()).toEqual([]);
+  });
+
+  it("holds the process open for the length of an on-demand drain", async () => {
+    // The between-batches yield used to be unref'd, like the scheduled loop's
+    // interval. For the loop that is right — retention is housekeeping and must
+    // never be why a process refuses to exit — but sweep() is a call somebody is
+    // AWAITING, and an unref'd timer let Node decide the loop was idle and exit
+    // mid-drain, leaving the promise unsettled: a maintenance command that swept
+    // two rows of seven and exited 13. Asserted through the timer's own flag,
+    // since a test runner keeps the loop alive and would hide the difference.
+    const c = await client();
+    for (let i = 0; i < 7; i++) await finishOne(c);
+    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+
+    // Only the drain's own 0ms yields are watched, and only whether each of
+    // those was unref'd — other timers in flight (the store's busy retry) say
+    // nothing about this.
+    const yields: { unrefd: boolean }[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+      const timer = realSetTimeout(fn, ms);
+      if (ms === 0) {
+        const seen = { unrefd: false };
+        yields.push(seen);
+        const unref = timer.unref.bind(timer);
+        timer.unref = () => {
+          seen.unrefd = true;
+          return unref();
+        };
+      }
+      return timer;
+    }) as typeof setTimeout;
+    try {
+      expect(await sweeper.sweep()).toBe(7);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+    expect(yields.length).toBeGreaterThan(0);
+    expect(yields.some((y) => y.unrefd)).toBe(false);
+  });
+
+  it("hands the loop back between batches of a drain after a stop", async () => {
+    // The subtler half of the same bug: stop() resolved the shared stop signal,
+    // and sweep()'s between-batches yield races that signal. Left spent, the
+    // yield resolved on a microtask instead of on a timer, so a long drain never
+    // handed the event loop back — starving exactly the submits and claims it is
+    // there to protect. Asserted by racing the drain against a macrotask: a real
+    // yield lets the timer fire somewhere in the middle.
+    const c = await client();
+    for (let i = 0; i < 7; i++) await finishOne(c);
+    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+    sweeper.start();
+    await sweeper.stop();
+
+    let ticked = false;
+    setTimeout(() => (ticked = true), 0);
+    await sweeper.sweep();
+    expect(ticked).toBe(true);
+  });
 });
 
 // Both dialects, for the same reason as the sweeper above — and more directly:
@@ -226,39 +301,4 @@ describeBackends("purge filters", (backend) => {
     await expect(c.purge({ status: "queued" })).rejects.toThrow(/terminal/);
   });
 
-  it("still drains on demand after it has been stopped", async () => {
-    // sweep() is documented as a direct call — "after a backfill, or from a
-    // maintenance command" — and stop() used to leave it crippled. `stopping` is
-    // how a sweep in flight cuts itself short, and only start() ever cleared it,
-    // so a later sweep() returned after its FIRST batch: with a backlog of 7 and
-    // a limit of 2 it deleted 2, reported success, and left 5 rows behind with
-    // no indication anything had been skipped.
-    const c = await client();
-    for (let i = 0; i < 7; i++) await finishOne(c);
-    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
-    sweeper.start();
-    await sweeper.stop();
-
-    expect(await sweeper.sweep()).toBe(7);
-    expect(await c.list()).toEqual([]);
-  });
-
-  it("hands the loop back between batches of a drain after a stop", async () => {
-    // The subtler half of the same bug: stop() resolved the shared stop signal,
-    // and sweep()'s between-batches yield races that signal. Left spent, the
-    // yield resolved on a microtask instead of on a timer, so a long drain never
-    // handed the event loop back — starving exactly the submits and claims it is
-    // there to protect. Asserted by racing the drain against a macrotask: a real
-    // yield lets the timer fire somewhere in the middle.
-    const c = await client();
-    for (let i = 0; i < 7; i++) await finishOne(c);
-    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
-    sweeper.start();
-    await sweeper.stop();
-
-    let ticked = false;
-    setTimeout(() => (ticked = true), 0);
-    await sweeper.sweep();
-    expect(ticked).toBe(true);
-  });
 });
