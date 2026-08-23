@@ -199,8 +199,8 @@ export class PostgresStore extends TaskStore {
    * Every path here connects lazily, so a store used again after close simply
    * reconnects — and without this it would reconnect permanently degraded to
    * polling, having decided "no push channel" about a connection that no longer
-   * exists. Called from the constructor for the initial state and from doConnect
-   * for every later one, so the three fields cannot be re-armed by halves. Only
+   * exists. The fields' initializers give the first state and doConnect calls
+   * this for every later one, so the three cannot be re-armed by halves. Only
    * ever safe under doConnect's generation check.
    */
   private resetListenerState(): void {

@@ -13,8 +13,9 @@
 -- counted, which is the whole queue, terminal rows included. That is fine for a
 -- dashboard and wrong for a poll loop — queue_depth.sql is the bounded question,
 -- and the one to ask on an interval.
--- stats_one_queue.sql is the equality form the SDK uses when a queue is
--- named; see purge.sql for why the optional filter here cannot be indexed.
+-- When a queue IS named, the SDK rewrites the optional filter below to a plain
+-- equality before preparing this statement (`specialize`) — see purge.sql for
+-- why the optional form cannot be indexed.
 -- params: queue
 select queue, status, count(*) as count
 from cairnq_tasks

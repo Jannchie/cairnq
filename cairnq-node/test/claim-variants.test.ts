@@ -1,10 +1,13 @@
-// Several canonical statements ship specializations: claim swaps a list-valued
-// predicate for an equality so the planner can read the right index in claim
-// order (claim_one_queue, claim_one_name, claim_one_queue_one_name), and purge
-// and stats swap an OPTIONAL filter for an equality because
-// `(:p is null or col = :p)` is planned before the parameter has a value, so it
-// reaches no index at all (purge_one_queue, purge_one_status,
-// purge_one_queue_one_status, stats_one_queue).
+// claim ships specializations as FILES: it swaps a list-valued predicate for an
+// equality so the planner can read the right index in claim order
+// (claim_one_queue, claim_one_name, claim_one_queue_one_name).
+//
+// The other kind of specialization has no files. purge, list and stats swap an
+// OPTIONAL filter for an equality — `(:p is null or col = :p)` is planned before
+// the parameter has a value, so it reaches no index at all — and the SDK does
+// that rewrite at run time in `specialize`, per set of filters a caller actually
+// supplied. Only the file-backed variants are pinned below; the rewritten ones
+// are covered by planner-statistics and query-plan tests instead.
 //
 // Near-identical canonical statements are exactly the drift the protocol's
 // load-the-same-strings rule exists to prevent, so pin the relationship: every

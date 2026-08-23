@@ -21,17 +21,17 @@
 -- durable job's log kept for a week. Migration 0009 adds the index that makes
 -- the queue filter read only its own queue's rows rather than skipping past
 -- every other queue's.
--- Three specializations exist for the two filters that DO have indexes —
--- purge_one_queue.sql, purge_one_status.sql, purge_one_queue_one_status.sql —
--- and the SDK picks one per call. This file's optional form is the one it uses
--- when neither filter is set, because `(:p is null or col = :p)` is planned
--- before the parameter has a value: SQLite must plan both branches, reaches no
--- index at all, and walks every row past the cutoff in completion order.
+-- The optional form written here is not what runs when a filter IS supplied:
+-- `(:p is null or col = :p)` is planned before the parameter has a value, so
+-- SQLite must plan both branches, reaches no index at all, and walks every row
+-- past the cutoff in completion order. The SDK rewrites each supplied filter to
+-- a plain equality before preparing the statement (`specialize`), which is what
+-- lets the queue and status indexes be reached. That rewrite replaced the three
+-- hand-written variant files this comment used to name.
 --
--- Both dialects ship every variant. Postgres does not need them — it re-plans
--- with the parameter values for a statement's first executions and folds the
--- null branch away — but a caller that had to know which dialect indexes which
--- form would be a worse contract than four extra files.
+-- Postgres does not need the rewrite — it re-plans with the parameter values for
+-- a statement's first executions and folds the null branch away — but it costs
+-- nothing there, and one behaviour is easier to reason about than two.
 --
 -- :name has no specialization: no index covers it, so it is a residual predicate
 -- either way and an equality form would buy nothing.
