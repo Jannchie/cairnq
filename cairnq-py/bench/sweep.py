@@ -341,7 +341,7 @@ async def finalize_batching(bed_of: BedFactory) -> None:
 
 
 # --------------------------------------------------------------------- sweep C
-# The counterpart to B, for the knob that already exists (claim_batch).
+# The counterpart to B, at the store level: how claim cost scales with limit.
 async def claim_batch_size(bed_of: BedFactory) -> None:
     print(f"\nC  claim batch size — moving {N_BATCH} tasks into 'running', median of {REPEATS}")
     for limit in CLAIM_LIMITS:

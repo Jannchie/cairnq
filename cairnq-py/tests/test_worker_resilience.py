@@ -70,7 +70,7 @@ async def test_keeps_polling_after_a_transient_claim_error(client, db_path):
         return {"ok": True}
 
     async with worker.background():
-        result = await client.call("job", {}, wait_timeout_ms=5_000, poll_ms=20)
+        result = await client.call("job", {}, timeout_ms=5_000, poll_ms=20)
     await store.close()
 
     assert result == {"ok": True}
@@ -82,8 +82,9 @@ async def test_lost_lease_is_signalled_to_the_running_handler(client, db_path):
         db_path,
         queues=["default"],
         poll_interval_ms=20,
-        lease_ms=5_000,
-        heartbeat_interval_ms=30,
+        # The beat is lease/3, so a short lease is what makes the takeover below
+        # visible to the handler inside the test's window.
+        lease_ms=600,
     )
     observed = {"flag": False, "event": False}
 
@@ -221,7 +222,7 @@ async def test_timeout_frees_the_concurrency_slot(client, db_path):
 
     await client.submit("hang", {}, max_attempts=1)
     async with worker.background():
-        result = await client.call("quick", {}, wait_timeout_ms=3_000, poll_ms=20)
+        result = await client.call("quick", {}, timeout_ms=3_000, poll_ms=20)
 
     assert result == {"ok": True}
 

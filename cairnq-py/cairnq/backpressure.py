@@ -56,12 +56,10 @@ class QueueDepthGate:
         max_queue_depth: QueueDepthLimit,
         *,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
-        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
     ):
         self._store = store
         self._limits = max_queue_depth
         self._max_wait_ms = max_queue_wait_ms
-        self._initial_probe_ms = queue_poll_interval_ms
         #: Remaining grant per queue: submits allowed before the next probe.
         self._headroom: dict[str, int] = {}
         #: In-flight probe per queue, so concurrent submits share one read rather
@@ -97,7 +95,7 @@ class QueueDepthGate:
             return
 
         started_at = time.monotonic()
-        wait_ms = self._initial_probe_ms
+        wait_ms = INITIAL_PROBE_INTERVAL_MS
         while True:
             left = self._headroom.get(queue, 0)
             if left > 0:

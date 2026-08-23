@@ -1,6 +1,6 @@
 """Picking a wait back up after it timed out.
 
-`wait_timeout_ms` bounds the wait, not the task — the task runs on. Getting at
+`timeout_ms` bounds the wait, not the task — the task runs on. Getting at
 that result afterwards used to mean submitting again under the key and hoping the
 conflict strategy handed the finished task back, which is a re-submit dressed as
 a read. `wait(err.task_id)` and `wait_by_key(key)` make it a read.
@@ -28,7 +28,7 @@ async def _finish_next(client: CairnQ, result: dict) -> None:
 async def test_reattaches_by_id_without_rerunning(backend):
     client = await backend.client()
     with pytest.raises(TaskTimeout) as caught:
-        await client.call("job", {}, key="A", wait_timeout_ms=50)
+        await client.call("job", {}, key="A", timeout_ms=50)
     err = caught.value
     assert err.task_id
     assert err.key is None

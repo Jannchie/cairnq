@@ -1,10 +1,7 @@
-"""Backpressure: the depth probe's semantics, the gate built on it, and the
-worker-side byte budget.
+"""Backpressure: the depth probe's semantics and the gate built on it.
 
-Without these a producer that outruns its workers is bounded only by disk, and a
-worker sized by task count holds concurrency * largest-payload bytes the moment
-big payloads arrive. Each test here pins one half of that. The TypeScript SDK
-carries the same set (test/backpressure.test.ts)."""
+Without these a producer that outruns its workers is bounded only by disk. The
+TypeScript SDK carries the same set (test/backpressure.test.ts)."""
 
 from __future__ import annotations
 
@@ -12,7 +9,8 @@ import asyncio
 
 import pytest
 
-from cairnq import CairnQ, QueueDepthGate, QueueFull, Worker
+from cairnq import CairnQ, QueueFull, Worker
+from cairnq.backpressure import QueueDepthGate
 from cairnq.store.sqlite import SQLiteStore
 
 from .helpers import wait_for
@@ -43,7 +41,7 @@ async def test_lets_submits_through_under_the_limit(client, db_path):
 
 
 async def test_blocks_at_the_limit_and_proceeds_once_drained(client, db_path):
-    gated = CairnQ.sqlite(db_path, max_queue_depth=2, queue_poll_interval_ms=20)
+    gated = CairnQ.sqlite(db_path, max_queue_depth=2)
     await gated.connect()
     worker = Worker(SQLiteStore(db_path), ["default"], poll_interval_ms=20)
     try:
@@ -71,7 +69,7 @@ async def test_blocks_at_the_limit_and_proceeds_once_drained(client, db_path):
 
 async def test_raises_queue_full_on_timeout_and_enqueues_nothing(client, db_path):
     gated = CairnQ.sqlite(
-        db_path, max_queue_depth=1, max_queue_wait_ms=120, queue_poll_interval_ms=20
+        db_path, max_queue_depth=1, max_queue_wait_ms=120
     )
     await gated.connect()
     try:
@@ -89,7 +87,6 @@ async def test_gates_only_the_queues_a_per_queue_limit_names(client, db_path):
         db_path,
         max_queue_depth={"tight": 1},
         max_queue_wait_ms=60,
-        queue_poll_interval_ms=20,
     )
     await gated.connect()
     try:
@@ -162,7 +159,6 @@ async def test_gates_task_context_submit_too(client, db_path):
         poll_interval_ms=10,
         max_queue_depth=1,
         max_queue_wait_ms=100,
-        queue_poll_interval_ms=20,
     )
     caught: list[BaseException] = []
 
@@ -193,112 +189,3 @@ def test_refuses_a_limit_below_one_at_construction(db_path):
         QueueDepthGate(store, 0)
     with pytest.raises(ValueError, match=">= 1"):
         QueueDepthGate(store, {"q": -1})
-
-
-# --------------------------------------------------------- max_in_flight_bytes
-async def test_holds_back_claims_on_resident_bytes(client, db_path):
-    # Four tasks, each ~64KB, against a budget of 100KB: the byte ceiling binds
-    # before the concurrency one does, so not all four can run at once.
-    big = "x" * (64 * 1024)
-    for i in range(4):
-        await client.submit("job", {"i": i, "big": big})
-
-    worker = Worker(
-        SQLiteStore(db_path),
-        ["default"],
-        concurrency=4,
-        claim_batch=1,  # one task per claim, so the budget is consulted between them
-        poll_interval_ms=10,
-        max_in_flight_bytes=100 * 1024,
-    )
-    peak = 0
-    in_flight = 0
-    gate = asyncio.Event()
-
-    async def handler(ctx, payload):
-        nonlocal peak, in_flight
-        in_flight += 1
-        peak = max(peak, in_flight)
-        await gate.wait()
-        in_flight -= 1
-        return {}
-
-    worker.register("job", handler)
-    runner = asyncio.ensure_future(worker.run())
-    try:
-        await wait_for(lambda: in_flight >= 1)
-        await asyncio.sleep(0.12)  # give the loop every chance to over-claim
-        # Two 64KB payloads already exceed 100KB, so the third cannot be claimed.
-        assert 1 <= peak <= 2
-    finally:
-        gate.set()
-        worker.stop()
-        await runner
-        await worker.close()
-
-
-async def test_runs_a_payload_larger_than_the_budget_rather_than_deadlocking(
-    client, db_path
-):
-    # The budget is spent the moment this is charged, so nothing claims alongside
-    # it — but refusing to run it at all would stall the queue forever.
-    await client.submit("job", {"big": "x" * (200 * 1024)})
-    worker = Worker(
-        SQLiteStore(db_path),
-        ["default"],
-        concurrency=2,
-        poll_interval_ms=10,
-        max_in_flight_bytes=10 * 1024,
-    )
-    ran = False
-
-    async def handler(ctx, payload):
-        nonlocal ran
-        ran = True
-        return {"ok": True}
-
-    worker.register("job", handler)
-    runner = asyncio.ensure_future(worker.run())
-    try:
-        await wait_for(lambda: ran, 3.0)
-        assert ran
-    finally:
-        worker.stop()
-        await runner
-        await worker.close()
-
-
-async def test_refunds_the_charge_so_later_tasks_are_still_claimed(client, db_path):
-    big = "x" * (64 * 1024)
-    for i in range(3):
-        await client.submit("job", {"i": i, "big": big})
-    worker = Worker(
-        SQLiteStore(db_path),
-        ["default"],
-        concurrency=1,
-        poll_interval_ms=10,
-        max_in_flight_bytes=80 * 1024,
-    )
-    done = 0
-
-    async def handler(ctx, payload):
-        nonlocal done
-        done += 1
-        return {}
-
-    worker.register("job", handler)
-    runner = asyncio.ensure_future(worker.run())
-    try:
-        # Without the refund the budget stays spent after the first task and the
-        # remaining two are never claimed.
-        await wait_for(lambda: done == 3, 5.0)
-        assert done == 3
-    finally:
-        worker.stop()
-        await runner
-        await worker.close()
-
-
-def test_worker_rejects_a_non_positive_byte_budget(db_path):
-    with pytest.raises(ValueError, match="> 0"):
-        Worker(SQLiteStore(db_path), ["default"], max_in_flight_bytes=0)

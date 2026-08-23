@@ -119,7 +119,6 @@ FILTERED_CASES = [
     ("purge", {"queue": "rpc"}, "cairnq_tasks_queue_completed_idx", PURGE_BASE),
     ("purge", {"queue": "rpc", "status": "succeeded"},
      "cairnq_tasks_queue_completed_idx", PURGE_BASE),
-    ("stats", {"queue": "default"}, "cairnq_tasks_claim", {"queue": None}),
     # list's filters are the oldest instance of the same defect: migration 0001
     # shipped an index for each and none was read until specialize existed.
     ("list", {"root_id": "r7"}, "cairnq_tasks_root_idx", LIST_BASE),

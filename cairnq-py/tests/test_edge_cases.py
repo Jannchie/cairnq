@@ -62,7 +62,7 @@ async def test_unserializable_task_error_details_still_record_the_failure(client
 
     async with worker.background():
         with pytest.raises(TaskFailed) as excinfo:
-            await client.call("bad-details", {}, wait_timeout_ms=3_000, poll_ms=20)
+            await client.call("bad-details", {}, timeout_ms=3_000, poll_ms=20)
 
     assert excinfo.value.message == "boom"
     assert excinfo.value.details == {}
@@ -85,7 +85,7 @@ async def test_sub_second_lease_is_maintained_by_the_heartbeat(client, db_path):
         return {"ok": True}
 
     async with worker.background():
-        result = await client.call("slow", {}, wait_timeout_ms=3_000, poll_ms=20)
+        result = await client.call("slow", {}, timeout_ms=3_000, poll_ms=20)
 
     assert result == {"ok": True}
     assert runs == 1
@@ -105,7 +105,7 @@ async def test_out_of_range_numeric_arguments_are_rejected(client):
     with pytest.raises(ValueError):
         await client.submit("job", {}, max_attempts=0)
     with pytest.raises(ValueError):
-        await client.submit("job", {}, run_at_delay_ms=-1)
+        await client.submit("job", {}, delay_ms=-1)
     with pytest.raises(ValueError):
         await client.list(limit=-1)
     with pytest.raises(ValueError):

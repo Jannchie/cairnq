@@ -19,11 +19,12 @@ def test_worker_sqlite_forwards_store_options(tmp_path):
 
 
 async def test_submit_accepts_an_explicit_parent(client):
-    """TaskContext.submit wired parent/root automatically, but a caller outside a
-    handler (an API process resuming a chain) had no way to say so."""
+    """TaskContext.submit wires parent/root automatically; a caller outside a
+    handler (an API process resuming a chain) says so through the store, which is
+    where the public client submit stops carrying the trio."""
     parent = await client.submit("parent", {})
-    child = await client.submit(
-        "child", {}, parent_id=parent.id, root_id=parent.root_id
+    child = await client.store.submit(
+        name="child", payload={}, parent_id=parent.id, root_id=parent.root_id
     )
     assert child.parent_id == parent.id
     assert child.root_id == parent.root_id

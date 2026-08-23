@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import json
 import signal
 from collections import defaultdict
 from collections.abc import Awaitable
@@ -16,15 +15,10 @@ from ._backoff import (
     fail_delay_ms,
     retry_delay_ms,
 )
-from ._ids import new_id, now_ms
-from .backpressure import (
-    DEFAULT_MAX_WAIT_MS,
-    INITIAL_PROBE_INTERVAL_MS,
-    QueueDepthLimit,
-)
+from ._ids import new_id
+from .backpressure import DEFAULT_MAX_WAIT_MS, QueueDepthLimit
 from .context import TaskContext
 from .errors import (
-    EventLoopBlocked,
     LostLease,
     SerializationError,
     as_envelope,
@@ -62,48 +56,6 @@ def _timeout_envelope(name: str, max_run_ms: int) -> dict[str, Any]:
         "the attempt was abandoned",
         retryable=True,
     )
-
-
-# Module-level for the same reason store/base.py keeps one: json.dumps builds a
-# fresh JSONEncoder for any non-default kwarg, which on the claim path would be
-# per-task construction for nothing. Separators match dump_json so a payload
-# measures the same as it was stored.
-_SIZE_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
-
-
-def _payload_bytes(task: Task) -> int:
-    """Resident size of a task's payload, for the max_in_flight_bytes budget.
-
-    Re-serializes because by this point the wire form is gone. Both Python
-    backends do hand one back — asyncpg registers no jsonb codec, so
-    `Task.from_row` holds the serialized str right up until json.loads discards
-    it — and capturing its length there would make this free, at the cost of
-    carrying a non-protocol field on Task in both SDKs. Left for when this shows
-    up in a profile.
-
-    What the budget is really after is the memory a payload pins while its
-    handler runs, and its JSON length tracks that closely enough to size one by."""
-    try:
-        return len(_SIZE_ENCODER.encode(task.payload).encode())
-    except (TypeError, ValueError):
-        # Unmeasurable, and it came out of the store, so it is already resident:
-        # charging nothing under-counts, but failing the claim over an accounting
-        # detail would drop a task the worker can otherwise run.
-        return 0
-
-
-def _release(counts: dict[str, int], key: str | None) -> None:
-    """Give back one call's unit of a counted budget. Popping at zero is what
-    keeps the dict to the keys actually in flight, so an idle worker holds no
-    entries at all — and both budgets (a name's own concurrency, a resource's
-    capacity) settle the same way, from one place."""
-    if key is None:
-        return
-    rest = counts.get(key, 1) - 1
-    if rest > 0:
-        counts[key] = rest
-    else:
-        counts.pop(key, None)
 
 
 def _consume_result(task: asyncio.Task) -> None:
@@ -184,19 +136,6 @@ async def _call(handler: Handler, is_async: bool, *args: Any) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
-class _Beat:
-    """When the heartbeat covering one call last ran.
-
-    Shared between the loop and the attempt that owns it, because the loop cannot
-    report its own absence: a handler that blocks for its whole attempt never lets
-    the heartbeat task take a turn at all, so the check has to survive it."""
-
-    __slots__ = ("at_ms",)
-
-    def __init__(self, at_ms: int):
-        self.at_ms = at_ms
-
-
 @dataclass(frozen=True)
 class _Registration:
     """What `worker.task` recorded for one task name."""
@@ -210,9 +149,6 @@ class _Registration:
     is_async: bool
     #: Tasks per handler call, or None for one-at-a-time delivery.
     batch: int | None = None
-    #: Concurrent handler calls allowed for this name, or None for no limit
-    #: beyond the worker's own.
-    concurrency: int | None = None
     #: Resource this name's calls draw from, or None to draw from nothing but
     #: the worker budget. Declared in `Worker(resources=...)`.
     resource: str | None = None
@@ -223,32 +159,139 @@ class _ClaimSource:
     """One draw's worth of quota: a set of names and how many handler calls they
     may start.
 
-    A name that limits itself — by `batch`, by its own `concurrency`, or by a
-    `resource` it shares with other names — gets a source to itself, because its
-    quota cannot be expressed in a draw shared with names that count differently.
-    Everything else shares one, where a task is a call."""
+    A name that limits itself — by `batch`, or by a `resource` it shares with
+    other names — gets a source to itself, because its quota cannot be expressed
+    in a draw shared with names that count differently. Everything else shares
+    one, where a task is a call."""
 
-    #: Counts calls in flight, and set only when this source caps its own
-    #: concurrency — nothing else reads the count, so nothing else pays for it.
-    #: Such a source always holds exactly one name, so this is that name.
-    key: str | None
     names: tuple[str, ...]
     #: Tasks per call — 1 for the shared source.
     batch: int
-    #: Calls allowed for this source, or None for the worker budget alone.
-    concurrency: int | None
-    #: Resource this source draws from, or None. Unlike `concurrency`, the
-    #: ceiling it names is shared with the other sources that declare it, which
-    #: is what keeps two names off one scarce thing at the same time.
+    #: Resource this source draws from, or None. The ceiling it names is shared
+    #: with the other sources that declare it, which is what keeps two names off
+    #: one scarce thing at the same time.
     resource: str | None = None
 
 
-@dataclass(frozen=True)
-class _Schedule:
-    """What one poll's claim draws from, and the names the probe spans."""
+class _ClaimPlanner:
+    """The worker's claim-scheduling state, in one object: which names draw
+    together and at what batch size, which shared resource each draw spends, how
+    many calls each resource still has room for, and whose turn it is.
 
-    sources: tuple[_ClaimSource, ...]
-    names: list[str]
+    A name that limits itself — by `batch`, or by a `resource` — needs a quota
+    the shared draw cannot express, so it gets a source of its own; every other
+    name shares one, where a task is a call.
+
+    A resource is deliberately *not* one source spanning its names: `batch` is
+    per name, and a single source carries one batch size, so two members that
+    batch differently could not share a draw. Keeping a source per name and
+    letting several of them draw down one shared ceiling composes with batching
+    instead of excluding it.
+    """
+
+    def __init__(self, capacities: dict[str, int]):
+        self._capacities = capacities
+        self._sources: tuple[_ClaimSource, ...] = ()
+        #: The union of names the claim probe spans.
+        self.names: list[str] = []
+        #: Calls holding units of each declared resource.
+        self._in_flight: dict[str, int] = {}
+        #: Rotates which source is offered the free budget first — see plan().
+        self._cursor = 0
+
+    def rebuild(self, handlers: dict[str, _Registration]) -> None:
+        """Rebuild the sources from the registrations. Called from register(),
+        which is the only place the set changes, so a poll never pays for it."""
+        sources: list[_ClaimSource] = []
+        shared: list[str] = []
+        for name, reg in handlers.items():
+            if reg.batch is not None or reg.resource is not None:
+                sources.append(_ClaimSource((name,), reg.batch or 1, reg.resource))
+            else:
+                shared.append(name)
+        if shared:
+            sources.append(_ClaimSource(tuple(shared), 1))
+        self._sources = tuple(sources)
+        self.names = list(handlers)
+
+    @property
+    def empty(self) -> bool:
+        return not self._sources
+
+    async def plan(
+        self,
+        free: int,
+        claim: Callable[[list[str] | None, int], Awaitable[list[Task]]],
+        split: Callable[[list[Task]], list[tuple["_Registration | None", list[Task]]]],
+    ) -> list[tuple[_ClaimSource, list[tuple["_Registration | None", list[Task]]]]]:
+        """Draw up to `free` handler calls from one claim transaction.
+
+        Sources are served in rotating order — without rotating, the first source
+        would take every free slot and the rest would starve behind its backlog.
+        Each draw sizes itself from what the previous ones took, so a source with
+        nothing queued costs nothing; that feedback is why this runs inside the
+        claim transaction rather than dividing the budget up front. It must await
+        nothing but `claim` — the store holds the write lock while it runs.
+
+        `split` is the worker's `_deliveries`: rows become handler calls there, so
+        spending the budget against its result is the only way the two cannot
+        disagree."""
+        cursor = self._cursor % len(self._sources)
+        order = self._sources[cursor:] + self._sources[:cursor]
+        self._cursor = (cursor + 1) % len(self._sources)
+        drawn: list[tuple[_ClaimSource, list[tuple[_Registration | None, list[Task]]]]] = []
+        left = free
+        # Resource units this poll has already drawn. `_in_flight` only moves
+        # when a call is dispatched, which happens after this whole plan returns
+        # — so without a local tally two sources sharing a resource would each
+        # see its full ceiling and together overshoot it.
+        taken: dict[str, int] = {}
+        for src in order:
+            if left <= 0:
+                break
+            own = self._headroom(src, taken)
+            quota = left if own is None else min(own, left)
+            if quota <= 0:
+                continue
+            rows = await claim(list(src.names), src.batch * quota)
+            if not rows:
+                continue
+            calls = split(rows)
+            drawn.append((src, calls))
+            left -= len(calls)
+            if src.resource is not None:
+                taken[src.resource] = taken.get(src.resource, 0) + len(calls)
+        return drawn
+
+    def _headroom(self, src: _ClaimSource, taken: dict[str, int]) -> int | None:
+        """A source's own call ceiling for one poll, or None when only the
+        worker-wide budget applies: its resource's capacity less what is running
+        and what earlier draws in this same poll already took."""
+        if src.resource is None:
+            return None
+        return max(
+            0,
+            self._capacities[src.resource]
+            - self._in_flight.get(src.resource, 0)
+            - taken.get(src.resource, 0),
+        )
+
+    def acquire(self, resource: str | None) -> None:
+        """Charge one dispatched call to its resource, for the span of the call."""
+        if resource is None:
+            return
+        self._in_flight[resource] = self._in_flight.get(resource, 0) + 1
+
+    def release(self, resource: str | None) -> None:
+        """Give the unit back. Popping at zero keeps the dict to the resources
+        actually in flight, so an idle worker holds no entries at all."""
+        if resource is None:
+            return
+        rest = self._in_flight.get(resource, 1) - 1
+        if rest > 0:
+            self._in_flight[resource] = rest
+        else:
+            self._in_flight.pop(resource, None)
 
 
 class Worker:
@@ -259,13 +302,10 @@ class Worker:
         *,
         concurrency: int = 1,
         lease_ms: int = 30_000,
-        heartbeat_interval_ms: int | None = None,
         poll_interval_ms: int = 500,
-        claim_batch: int | None = None,
         retry_backoff_ms: int = DEFAULT_RETRY_BACKOFF_MS,
         retry_backoff_max_ms: int = DEFAULT_RETRY_BACKOFF_MAX_MS,
         max_run_ms: int | None = None,
-        max_in_flight_bytes: int | None = None,
         resources: dict[str, int] | None = None,
         # Backpressure is accepted here too, not only on CairnQ: a handler
         # spawning children through TaskContext.submit is a producer, and in a
@@ -273,32 +313,24 @@ class Worker:
         # the store.
         max_queue_depth: QueueDepthLimit | None = None,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
-        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
         on_error: OnError | None = None,
     ):
         if max_run_ms is not None and max_run_ms <= 0:
             raise ValueError(f"max_run_ms must be > 0, got {max_run_ms}")
-        if max_in_flight_bytes is not None and max_in_flight_bytes <= 0:
-            raise ValueError(f"max_in_flight_bytes must be > 0, got {max_in_flight_bytes}")
         for resource, capacity in (resources or {}).items():
             if capacity < 1:
                 raise ValueError(
                     f"resources[{resource!r}] must be >= 1, got {capacity}"
                 )
         if max_queue_depth is not None:
-            store.use_backpressure(
-                max_queue_depth,
-                max_queue_wait_ms=max_queue_wait_ms,
-                queue_poll_interval_ms=queue_poll_interval_ms,
-            )
+            store.use_backpressure(max_queue_depth, max_queue_wait_ms=max_queue_wait_ms)
         self._store = store
         self._queues = list(queues)
         self._concurrency = concurrency
         self._lease_ms = lease_ms
         # lease/3 gives two beats of slack; the floor only matters for sub-150ms leases.
-        self._hb_interval = heartbeat_interval_ms or max(50, lease_ms // 3)
+        self._hb_interval = max(50, lease_ms // 3)
         self._poll = poll_interval_ms
-        self._batch = claim_batch
         self._retry_backoff_ms = retry_backoff_ms
         self._retry_backoff_max_ms = retry_backoff_max_ms
         # Wall-clock ceiling for one attempt. The heartbeat renews the lease for
@@ -306,36 +338,12 @@ class Worker:
         # task `running` (and its concurrency slot) forever — cancel can't help,
         # cooperative checks need a live handler. None disables the ceiling.
         self._max_run_ms = max_run_ms
-        # Resident payload bytes allowed across running handlers, independent of
-        # their count. `concurrency` bounds tasks, not memory, so a worker sized
-        # for small payloads holds concurrency * largest-payload bytes the moment
-        # a batch of big ones arrives — for payloads carrying media inline, the
-        # difference between megabytes and gigabytes resident. Once spent, the
-        # worker stops claiming until running handlers give it back.
-        #
-        # The bound is on tasks already executing: it is read between claims,
-        # never during one, and a claim commits to its rows before any size is
-        # known. One poll can therefore overshoot by up to `claim_batch` rows per
-        # registered name (or one whole `batch`, whichever is larger); lower
-        # `claim_batch`, or the batch sizes, to tighten that. A single payload
-        # larger than the whole budget still runs — alone, rather than
-        # deadlocking the worker. None disables the budget, and the measurement
-        # with it.
-        self._max_in_flight_bytes = max_in_flight_bytes
-        self._in_flight_bytes = 0
-        # Calls in flight, for the names that cap their own concurrency.
-        self._calls_in_flight: dict[str, int] = {}
-        # Capacity of each declared resource, and the calls currently holding
-        # units of it. A resource is the same shape of budget as a name's own
-        # `concurrency` — a ceiling on calls — differing only in who draws from
-        # it: several names rather than one. That is what expresses "these
-        # handlers share one GPU" without inventing a queue per resource.
+        # Which names draw together, what each draw spends, and whose turn it is.
+        # Capacities are the declared resources: ceilings several names may draw
+        # from, which is what expresses "these handlers share one GPU" without
+        # inventing a queue per resource.
         self._resources = dict(resources or {})
-        self._resource_calls: dict[str, int] = {}
-        # Rotates which source is offered the free budget first — see run().
-        self._claim_cursor = 0
-        # Invalidated by register(); see _schedule().
-        self._schedule_cache: _Schedule | None = None
+        self._planner = _ClaimPlanner(self._resources)
         # Called for errors the worker survived — a claim that threw, a store
         # write that failed while finalizing a task. Without it these are silent:
         # the run loop carries on either way, so this is the only place an
@@ -411,7 +419,6 @@ class Worker:
         name: str | TaskDef[Any, Any] | Handler | None = None,
         *,
         batch: int | None = None,
-        concurrency: int | None = None,
         resource: str | None = None,
     ) -> Any:
         """Register a handler. Usable bare (`@worker.task` — registered under the
@@ -425,30 +432,21 @@ class Worker:
         call over 256 texts rather than 256 calls — and size N by what the
         downstream API wants, not by the queue.
 
-        `concurrency=N` caps the calls this name may run at once, under the
-        worker's own. Use it to keep one expensive name from taking the whole
-        worker; it applies to batched and unbatched names alike.
-
         `resource="gpu"` draws each call from a ceiling declared in
         `Worker(resources={"gpu": 1})` and shared with every other name that
         names it. Use it when several handlers contend for one scarce thing —
         a GPU, an index that tolerates a single writer — and the limit belongs
         to the thing rather than to any one of them. At capacity 1 it is
-        mutual exclusion across those names."""
+        mutual exclusion across those names. A name that only needs to cap
+        itself declares a resource of its own."""
         if callable(name):  # used bare: @worker.task
-            self.register(
-                _required_name(name), name,
-                batch=batch, concurrency=concurrency, resource=resource,
-            )
+            self.register(_required_name(name), name, batch=batch, resource=resource)
             return name
 
         resolved = None if name is None else task_name(name)
 
         def decorator(fn: Handler) -> Handler:
-            self.register(
-                resolved or _required_name(fn), fn,
-                batch=batch, concurrency=concurrency, resource=resource,
-            )
+            self.register(resolved or _required_name(fn), fn, batch=batch, resource=resource)
             return fn
 
         return decorator
@@ -459,13 +457,10 @@ class Worker:
         fn: Handler,
         *,
         batch: int | None = None,
-        concurrency: int | None = None,
         resource: str | None = None,
     ) -> None:
         if batch is not None and batch < 1:
             raise ValueError(f"batch must be >= 1, got {batch}")
-        if concurrency is not None and concurrency < 1:
-            raise ValueError(f"concurrency must be >= 1, got {concurrency}")
         # Loudly, at registration: an undeclared resource would otherwise read
         # as an unbounded one, so a typo would silently remove the ceiling the
         # caller asked for — the failure this option exists to prevent.
@@ -476,9 +471,9 @@ class Worker:
                 f"Worker(resources=...); declared: {known}"
             )
         self._handlers[name] = _Registration(
-            fn, _wants_payload(fn), _is_async_handler(fn), batch, concurrency, resource
+            fn, _wants_payload(fn), _is_async_handler(fn), batch, resource
         )
-        self._schedule_cache = None
+        self._planner.rebuild(self._handlers)
 
     def stop(self) -> None:
         self._stop.set()
@@ -532,73 +527,21 @@ class Worker:
         concurrency = max(1, concurrency or self._concurrency)
         await self._store.connect()
         # The calls in flight — `concurrency` counts these, so the set's size is
-        # the budget. How many tasks they carry is max_in_flight_bytes's business.
+        # the budget. How many tasks they carry is the batch sizes' business.
         running: set[asyncio.Task] = set()
         try:
             while not self._stop.is_set():
                 # `concurrency` counts calls, so the calls in flight *are* the
                 # running tasks — a batch holding 256 tasks is one of them.
                 free = concurrency - len(running)
-                # Two ceilings, either of which stops the claim: calls in flight
-                # and resident payload bytes. The byte arm is guarded on
-                # `running` being non-empty because it must never be the reason
-                # we wait on an empty set — asyncio.wait(set()) raises. With
-                # nothing running, nothing is resident, so the budget cannot be
-                # what is holding us back anyway.
-                over_budget = (
-                    self._max_in_flight_bytes is not None
-                    and self._in_flight_bytes >= self._max_in_flight_bytes
-                )
-                if running and (free <= 0 or over_budget):
+                if free <= 0:
                     # Wait for a slot rather than polling for one. _run_call never
                     # raises, so waiting on it cannot surface an exception here.
                     await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
                     continue
-                schedule = self._schedule()
-                if not schedule.sources:
+                if self._planner.empty:
                     await self._idle(self._poll)
                     continue
-                # Round-robin the starting point. The draws are served in order,
-                # so without rotating it the first source would take every free
-                # slot and the rest would starve behind its backlog.
-                sources = schedule.sources
-                cursor = self._claim_cursor % len(sources)
-                order = sources[cursor:] + sources[:cursor]
-                self._claim_cursor = (cursor + 1) % len(sources)
-
-                async def plan(claim, order=order, free=free):
-                    drawn: list[tuple[_ClaimSource, list[Any]]] = []
-                    left = free
-                    # Resource units this poll has already drawn. `_resource_calls`
-                    # only moves when a call is dispatched, which happens after
-                    # this whole plan returns — so without a local tally two
-                    # sources sharing a resource would each see its full ceiling
-                    # and together overshoot it. Same shape as `left`, one budget
-                    # down.
-                    taken: dict[str, int] = {}
-                    for src in order:
-                        if left <= 0:
-                            break
-                        own = self._source_calls(src, taken)
-                        quota = left if own is None else min(own, left)
-                        if quota <= 0:
-                            continue
-                        rows = await claim(list(src.names), src.batch * quota)
-                        if not rows:
-                            continue
-                        # _deliveries is what actually turns rows into handler
-                        # calls, so spending the budget against its result is the
-                        # only way the two cannot disagree. A source with nothing
-                        # queued costs nothing, which is why the budget is spent
-                        # here, draw by draw, rather than divided up before the
-                        # claim.
-                        calls = self._deliveries(rows)
-                        drawn.append((src, calls))
-                        left -= len(calls)
-                        if src.resource is not None:
-                            taken[src.resource] = taken.get(src.resource, 0) + len(calls)
-                    return drawn
-
                 try:
                     claimed = await self._store.claim_session(
                         queues=self._queues,
@@ -608,8 +551,10 @@ class Worker:
                         # work by task name, so another worker's tasks would
                         # otherwise be claimed here and failed for want of a
                         # handler.
-                        names=schedule.names,
-                        plan=plan,
+                        names=self._planner.names,
+                        plan=lambda claim, free=free: self._planner.plan(
+                            free, claim, self._deliveries
+                        ),
                     )
                 except Exception as exc:
                     # A claim can fail transiently (lock contention, a dropped
@@ -624,33 +569,15 @@ class Worker:
                 for src, calls in claimed:
                     for reg, group in calls:
                         # Charged before the handler starts and refunded when it
-                        # settles, so the budgets cover exactly the span the call
-                        # holds its slot and its payloads stay pinned in memory.
-                        charged = (
-                            0
-                            if self._max_in_flight_bytes is None
-                            else sum(_payload_bytes(t) for t in group)
-                        )
-                        self._in_flight_bytes += charged
-                        if src.key is not None:
-                            self._calls_in_flight[src.key] = (
-                                self._calls_in_flight.get(src.key, 0) + 1
-                            )
-                        if src.resource is not None:
-                            self._resource_calls[src.resource] = (
-                                self._resource_calls.get(src.resource, 0) + 1
-                            )
+                        # settles, so the resource covers exactly the span the
+                        # call holds its slot.
+                        self._planner.acquire(src.resource)
 
                         def settled(
-                            fut: asyncio.Task,
-                            size: int = charged,
-                            key: str | None = src.key,
-                            resource: str | None = src.resource,
+                            fut: asyncio.Task, resource: str | None = src.resource
                         ) -> None:
                             running.discard(fut)
-                            self._in_flight_bytes -= size
-                            _release(self._calls_in_flight, key)
-                            _release(self._resource_calls, resource)
+                            self._planner.release(resource)
 
                         # An unregistered name has nothing to run, so it never
                         # starts a handler or a heartbeat; everything else is one
@@ -666,72 +593,6 @@ class Worker:
         finally:
             if running:
                 await asyncio.gather(*running, return_exceptions=True)
-
-    def _schedule(self) -> _Schedule:
-        """How this poll's claim is split into per-name quotas, plus the union of
-        names the probe spans.
-
-        Cached and invalidated by `register()`, rather than rebuilt each poll:
-        handlers may be registered after run() started, but only there, and this
-        otherwise allocates a source per name on every tick for a worker's whole
-        lifetime.
-
-        A name that limits itself — by `batch`, by its own `concurrency`, or by a
-        `resource` — needs a quota the shared draw cannot express, so it gets a
-        source of its own; every other name shares one, where a task is a call.
-
-        A resource is deliberately *not* one source spanning its names: `batch`
-        is per name, and a single source carries one batch size, so two members
-        that batch differently could not share a draw. Keeping a source per name
-        and letting several of them draw down one shared ceiling composes with
-        batching instead of excluding it."""
-        if self._schedule_cache is not None:
-            return self._schedule_cache
-        sources: list[_ClaimSource] = []
-        shared: list[str] = []
-        for name, reg in self._handlers.items():
-            if reg.batch is not None or reg.concurrency is not None or reg.resource is not None:
-                key = name if reg.concurrency is not None else None
-                sources.append(
-                    _ClaimSource(
-                        key, (name,), reg.batch or 1, reg.concurrency, reg.resource
-                    )
-                )
-            else:
-                shared.append(name)
-        if shared:
-            sources.append(_ClaimSource(None, tuple(shared), 1, None))
-        self._schedule_cache = _Schedule(tuple(sources), list(self._handlers))
-        return self._schedule_cache
-
-    def _source_calls(self, src: _ClaimSource, taken: dict[str, int]) -> int | None:
-        """A source's own call ceiling for one poll, or None when only the
-        worker-wide budget applies.
-
-        Three independent ceilings, whichever binds first: the name's own
-        concurrency less what it is already running; its resource's capacity less
-        what is running *and* what earlier draws in this same poll already took
-        (`taken`); and `claim_batch`. The last is a ceiling on *rows* per poll, so
-        it converts at this source's batch size — and never below one call, or a
-        `claim_batch` under some name's batch would stall that name outright."""
-        by_rows = None if self._batch is None else max(1, self._batch // src.batch)
-        by_name = (
-            None
-            if src.concurrency is None
-            else max(0, src.concurrency - self._calls_in_flight.get(src.key, 0))
-        )
-        by_resource = (
-            None
-            if src.resource is None
-            else max(
-                0,
-                self._resources[src.resource]
-                - self._resource_calls.get(src.resource, 0)
-                - taken.get(src.resource, 0),
-            )
-        )
-        limits = [n for n in (by_rows, by_name, by_resource) if n is not None]
-        return min(limits) if limits else None
 
     def _deliveries(
         self, claimed: list[Task]
@@ -821,8 +682,7 @@ class Worker:
             args: tuple[Any, ...] = (ctxs,)
         else:
             args = (ctxs[0], tasks[0].payload) if reg.wants_payload else (ctxs[0],)
-        beat = _Beat(now_ms())
-        hb = asyncio.create_task(self._heartbeat_loop(ctxs, beat))
+        hb = asyncio.create_task(self._heartbeat_loop(ctxs))
         try:
             try:
                 result = await self._attempt(lambda: _call(reg.fn, reg.is_async, *args), ctxs)
@@ -850,11 +710,6 @@ class Worker:
             hb.cancel()
             with contextlib.suppress(BaseException):
                 await hb
-            # After cancelling, not only inside the loop: a handler that blocked
-            # for its whole attempt never let the heartbeat task take a turn, so
-            # the loop had no chance to notice — and that is the worst case, the
-            # one where the lease is already gone.
-            self._check_beat(beat, tasks[0].id)
 
     def _outcome_of(
         self, exc: BaseException, name: str
@@ -969,24 +824,7 @@ class Worker:
         runner.add_done_callback(_consume_result)
         raise _AttemptTimeout
 
-    def _check_beat(self, beat: _Beat, task_id: str) -> None:
-        """Report a heartbeat that has not run for more than two intervals.
-
-        Two intervals is a whole beat missed, and at the default interval of
-        lease/3 the next one loses the lease outright — so this fires while the
-        lease still holds. After it expires the only evidence is a task that ran
-        twice, in two workers' logs, with no error in either."""
-        now = now_ms()
-        late_ms = now - beat.at_ms - self._hb_interval
-        if late_ms > self._hb_interval:
-            self._report(
-                EventLoopBlocked(late_ms, self._hb_interval, self._lease_ms),
-                phase="execute",
-                task_id=task_id,
-            )
-        beat.at_ms = now
-
-    async def _heartbeat_loop(self, ctxs: list[TaskContext], beat: _Beat) -> None:
+    async def _heartbeat_loop(self, ctxs: list[TaskContext]) -> None:
         """One statement per beat, however many tasks the call covers — a
         single-task handler is just the one-element case.
 
@@ -1002,7 +840,6 @@ class Worker:
         try:
             while True:
                 await asyncio.sleep(self._hb_interval / 1000)
-                self._check_beat(beat, ctxs[0].task_id)
                 live = [c for c in ctxs if not c.settled and not c.lost_lease]
                 if not live:
                     return

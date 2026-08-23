@@ -198,7 +198,7 @@ async def test_keeps_reads_out_of_the_write_transaction(db_path):
         # failing, and a hung test is a worse signal than a failed one.
         assert await asyncio.wait_for(client.get("absent"), timeout=10) is None
         assert await asyncio.wait_for(client.list(limit=1), timeout=10) == []
-        assert await asyncio.wait_for(client.stats(), timeout=10) is not None
+        assert await asyncio.wait_for(client.queue_depth("default", 10), timeout=10) >= 0
     finally:
         blocker.execute("ROLLBACK")
         blocker.close()

@@ -1,8 +1,9 @@
-"""The two capabilities the executor seam exists for, on the Python side.
+"""The capabilities the executor seam exists for, on the Python side.
 
-Mirrors `watch.test.ts` and the succeedIn half of `pg-executor.test.ts`: the
-same contracts, tested the same way, because "everything above the storage seam
-is identical" is a claim this SDK has to keep too.
+Mirrors the succeedIn half of `pg-executor.test.ts`, plus the LISTEN wake
+machinery that shares its listener: the same contracts, tested the same way,
+because "everything above the storage seam is identical" is a claim this SDK has
+to keep too.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import asyncio
 
 import pytest
 
-from cairnq import CairnQ, LostLease, WatchSignal
+from cairnq import LostLease
 from cairnq.context import TaskContext
 from cairnq.models import Task
 from .conftest import FakeExecutor, task_row
@@ -35,9 +36,9 @@ async def _pushing_store():
     """A connected store over an executor whose LISTEN is under test control.
 
     Returns the store and a `notify(channel, payload)` that fires what the
-    database would have. The subscription is established synchronously by
-    watch() -> _subscribe_push -> _listener_ready, so awaiting the task it
-    creates is deterministic — no sleeping on it.
+    database would have. The subscription is started by the first wake call, so
+    awaiting the task it creates (see _settled) is deterministic — no sleeping
+    on it.
     """
     captured: dict = {}
 
@@ -51,7 +52,7 @@ async def _pushing_store():
 
 
 async def _settled(store: PostgresStore):
-    """Await the in-flight LISTEN subscription, if watch() started one."""
+    """Await the in-flight LISTEN subscription, if a wake call started one."""
     if store._listener_connecting is not None:
         await store._listener_connecting
 
@@ -120,42 +121,7 @@ async def test_a_sqlite_store_says_plainly_that_it_cannot_do_this(client):
         await client.store.complete_in(task_id="t1", worker_id="w1", write=lambda _s: _none())
 
 
-# ------------------------------------------------------------------ watch
-
-async def test_watch_delivers_queued_and_done_signals():
-    store, captured = await _pushing_store()
-    seen: list[WatchSignal] = []
-    # A poll interval far beyond the test, so anything observed came from push.
-    stop = store.watch(seen.append, poll_ms=60_000)
-    try:
-        await _settled(store)
-        captured["notify"]("cairnq_queued", "render")
-        captured["notify"]("cairnq_done", "task-7")
-        assert seen == [
-            WatchSignal(reason="queued", queue="render"),
-            WatchSignal(reason="done", task_id="task-7"),
-        ]
-    finally:
-        stop()
-
-
-async def test_watch_drops_queues_it_was_not_asked_about():
-    store, captured = await _pushing_store()
-    seen: list[WatchSignal] = []
-    stop = store.watch(seen.append, queues=["render"], poll_ms=60_000)
-    try:
-        await _settled(store)
-        captured["notify"]("cairnq_queued", "ingest")
-        captured["notify"]("cairnq_queued", "render")
-        # A done notification names only the task — which queue it was on is not
-        # in the payload, so it is never filtered out.
-        captured["notify"]("cairnq_done", "task-7")
-        assert seen == [
-            WatchSignal(reason="queued", queue="render"),
-            WatchSignal(reason="done", task_id="task-7"),
-        ]
-    finally:
-        stop()
+# ------------------------------------------------------------ push wakeups
 
 
 # close() does not take the init lock — it only drops the handle to whatever
@@ -188,12 +154,12 @@ async def test_does_not_install_a_listener_for_a_store_closed_while_connecting()
 
     # Nothing subscribed, and nothing can start one later either.
     assert listens == 0
-    store.watch(lambda _s: None, poll_ms=60_000)()
-    await asyncio.sleep(0.02)
+    await store.claim_wake(["render"], 1)
+    await _settled(store)
     assert listens == 0
 
 
-# claim_wake's buffer, which watch() shares a listener with. A notification that
+# claim_wake's buffer. A notification that
 # lands between two polls has to survive until the next claim_wake asks — but only
 # for a queue somebody actually waits on, or the buffer is a leak that grows with
 # every distinct queue name the database ever sees.
@@ -217,39 +183,3 @@ async def test_buffers_a_wake_for_a_waited_queue_and_only_for_those():
     assert loop.time() - started_at < 1.0
 
     await store.close()
-
-
-async def test_watch_keeps_signalling_where_there_is_no_push_channel(client):
-    # SQLite has no channel; the consumer must still be told to re-read.
-    seen: list[WatchSignal] = []
-    stop = client.watch(seen.append, poll_ms=10)
-    try:
-        await asyncio.sleep(0.05)
-    finally:
-        stop()
-    assert len(seen) >= 2
-    assert all(s.reason == "poll" for s in seen)
-
-    before = len(seen)
-    await asyncio.sleep(0.05)
-    # A signal after unsubscribe would have the consumer re-reading a store it
-    # has stopped caring about, possibly a closed one.
-    assert len(seen) == before
-
-
-async def test_one_subscribers_exception_does_not_cost_the_others_their_signal():
-    store, captured = await _pushing_store()
-    seen: list[WatchSignal] = []
-
-    def boom(_signal):
-        raise RuntimeError("consumer bug")
-
-    stop_a = store.watch(boom, poll_ms=60_000)
-    stop_b = store.watch(seen.append, poll_ms=60_000)
-    try:
-        await _settled(store)
-        captured["notify"]("cairnq_queued", "render")
-        assert len(seen) == 1
-    finally:
-        stop_a()
-        stop_b()

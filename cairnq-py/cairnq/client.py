@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from ._wait import (
@@ -10,16 +9,12 @@ from ._wait import (
     poll_wait,
     poll_wait_by_key,
 )
-from .backpressure import (
-    DEFAULT_MAX_WAIT_MS,
-    INITIAL_PROBE_INTERVAL_MS,
-    QueueDepthLimit,
-)
+from .backpressure import DEFAULT_MAX_WAIT_MS, QueueDepthLimit
 from .errors import TaskCanceled, TaskFailed
-from .models import Task, TaskDef, TaskRef, TaskStatus, task_name
-from .retention import Retention, RetentionSweeper
+from .models import Task, TaskDef, TaskStatus, task_name
+from .retention import RetentionSweeper
 from .store.pg_executor import PgExecutor
-from .store.base import DEFAULT_WATCH_POLL_MS, Conflict, TaskStore, WatchSignal
+from .store.base import Conflict, TaskStore
 from .store.postgres import PostgresStore
 from .store.sqlite import SQLiteStore
 
@@ -34,24 +29,26 @@ class CairnQ:
         *,
         max_queue_depth: QueueDepthLimit | None = None,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
-        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
-        retention: Retention | None = None,
+        retention_ms: int | None = None,
     ):
+        """`retention_ms` deletes terminal tasks that many ms after they
+        finished, on a schedule, for as long as this handle is open. Off unless
+        set — and off means rows accumulate forever, because nothing else in
+        CairnQ removes them. Tiered retention (per queue, per status) is
+        `purge()` with filters, from your own scheduler."""
         self._store = store
         # Installed on the store, not held here: every submit path goes through
         # the store, including TaskContext.submit, which this handle never sees.
         if max_queue_depth is not None:
-            store.use_backpressure(
-                max_queue_depth,
-                max_queue_wait_ms=max_queue_wait_ms,
-                queue_poll_interval_ms=queue_poll_interval_ms,
-            )
+            store.use_backpressure(max_queue_depth, max_queue_wait_ms=max_queue_wait_ms)
         # Retention goes on the store too, but for a different reason: scheduling
         # it needs a running event loop, which a handle built at import time does
         # not have. The store starts it when it connects — the one path no
         # operation can skip, since `connect()` is optional and everything
         # connects lazily through it. See TaskStore.use_retention.
-        self._sweeper = RetentionSweeper(store, retention) if retention is not None else None
+        self._sweeper = (
+            RetentionSweeper(store, retention_ms) if retention_ms is not None else None
+        )
         if self._sweeper is not None:
             store.use_retention(self._sweeper)
 
@@ -113,15 +110,13 @@ class CairnQ:
         max_attempts: int = 3,
         priority: int = 0,
         metadata: dict[str, Any] | None = None,
-        parent_id: str | None = None,
-        root_id: str | None = None,
-        correlation_id: str | None = None,
-        run_at_delay_ms: int = 0,
+        delay_ms: int = 0,
     ) -> Task:
         """Enqueue a task. With `max_queue_depth` configured this blocks while
         the target queue is at its limit, and raises QueueFull if it stays there
-        for `max_queue_wait_ms` — see QueueDepthGate for why that bound is
-        approximate across several producers."""
+        for `max_queue_wait_ms` — a soft limit across several producers.
+
+        `delay_ms` runs the task no earlier than that many ms from now."""
         return await self._store.submit(
             name=task_name(name),
             payload=payload,
@@ -131,10 +126,7 @@ class CairnQ:
             max_attempts=max_attempts,
             priority=priority,
             metadata=metadata,
-            parent_id=parent_id,
-            root_id=root_id,
-            correlation_id=correlation_id,
-            run_at_delay_ms=run_at_delay_ms,
+            delay_ms=delay_ms,
         )
 
     async def get(self, task_id: str) -> Task | None:
@@ -142,15 +134,6 @@ class CairnQ:
 
     async def get_by_key(self, key: str) -> Task | None:
         return await self._store.get_by_key(key)
-
-    async def get_status(self, task_id: str) -> TaskRef | None:
-        """The status-only probe wait polls on: id + status, no payload. Public
-        for the same reason it exists — a dashboard or poller that only asks
-        "is it finished yet" should not drag the payload back per ask."""
-        return await self._store.get_status(task_id)
-
-    async def get_status_by_key(self, key: str) -> TaskRef | None:
-        return await self._store.get_status_by_key(key)
 
     async def list(
         self,
@@ -196,8 +179,9 @@ class CairnQ:
     ) -> list[str]:
         """Delete terminal tasks that finished more than `older_than_ms` ago and
         return their ids. Nothing else in CairnQ removes rows, so a long-lived
-        database needs this on a schedule. Each call is bounded by `limit` to keep
-        the write short; loop until it returns fewer than `limit`.
+        database needs this on a schedule — `retention_ms` is this call on a
+        timer. Each call is bounded by `limit` to keep the write short; loop
+        until it returns fewer than `limit`.
 
         `queue` / `status` / `name` narrow the sweep — one installation carrying
         two workloads needs a retention per workload, not one for the whole
@@ -207,40 +191,11 @@ class CairnQ:
             older_than_ms=older_than_ms, queue=queue, status=status, name=name, limit=limit
         )
 
-    async def stats(self, queue: str | None = None) -> dict[str, dict[TaskStatus, int]]:
-        """Task counts per queue, keyed by status and zero-filled across all
-        statuses — `stats()["default"]["queued"]` is the backlog of a queue.
-        `queue` narrows the aggregate to one queue, which is also what keeps a
-        caller from paying for the other workloads sharing the installation; a
-        named queue is always present, zero-filled if it has no rows.
-
-        This counts rows, so it costs what it counts — use it for a dashboard,
-        and poll `queue_depth()` instead, which is bounded."""
-        return await self._store.stats(queue)
-
-    def watch(
-        self,
-        on_signal: Callable[[WatchSignal], None],
-        *,
-        queues: list[str] | tuple[str, ...] | None = None,
-        poll_ms: int = DEFAULT_WATCH_POLL_MS,
-    ) -> Callable[[], None]:
-        """Call `on_signal` when the tasks on `queues` may have changed. Returns
-        an unsubscribe.
-
-        Notify-accelerated polling, not an event log: a signal means "re-read
-        now", and `stats` / `list` / `get` are where the truth is. On Postgres an
-        idle watch costs nothing and signals land in milliseconds; everywhere
-        else the timer alone still delivers, so the same consumer code is correct
-        either way. See TaskStore.watch for the full contract."""
-        return self._store.watch(on_signal, queues=queues, poll_ms=poll_ms)
-
     async def queue_depth(self, queue: str, max_depth: int) -> int:
         """How many more tasks fit on `queue` under `max_depth` — 0 once it is
         full. The non-blocking read behind `max_queue_depth`, for a producer that
-        would rather shed load or pick another queue than wait. Cheaper than
-        `stats()`: bounded at `max_depth` index entries instead of aggregating
-        the table."""
+        would rather shed load or pick another queue than wait. Bounded at
+        `max_depth` index entries, so it stays cheap to ask on every enqueue."""
         return await self._store.queue_depth(queue, max_depth)
 
     async def wait(
@@ -288,7 +243,7 @@ class CairnQ:
         name: str | TaskDef[Any, Any],
         payload: dict[str, Any] | None = None,
         *,
-        wait_timeout_ms: int = DEFAULT_WAIT_TIMEOUT_MS,
+        timeout_ms: int = DEFAULT_WAIT_TIMEOUT_MS,
         poll_ms: int = DEFAULT_POLL_MS,
         max_poll_ms: int = MAX_POLL_MS,
         **submit_kwargs: Any,
@@ -297,12 +252,12 @@ class CairnQ:
         TaskCanceled / TaskTimeout otherwise. Accepts a name string or a TaskDef
         (its name is used).
 
-        `wait_timeout_ms` bounds the wait, not the task: on timeout the task runs
+        `timeout_ms` bounds the wait, not the task: on timeout the task runs
         on, and `wait(err.task_id)` — or `wait_by_key`, from a process that only
         has the key — resumes the wait rather than starting the work over."""
         task = await self.submit(name, payload, **submit_kwargs)
         final = await self.wait(
-            task.id, timeout_ms=wait_timeout_ms, poll_ms=poll_ms, max_poll_ms=max_poll_ms
+            task.id, timeout_ms=timeout_ms, poll_ms=poll_ms, max_poll_ms=max_poll_ms
         )
         if final.succeeded:
             return final.result

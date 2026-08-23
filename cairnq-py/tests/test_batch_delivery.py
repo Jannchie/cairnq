@@ -260,7 +260,7 @@ async def test_the_batch_heartbeat_keeps_every_lease_alive(backend):
     # beat-to-lease ratio, same number of lifetimes slept. Mirrors the margins in
     # batch-delivery.test.ts.
     worker = backend.worker(
-        poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
+        poll_interval_ms=20, concurrency=4, lease_ms=1_000
     )
 
     @worker.task("slow", batch=4)
@@ -285,7 +285,7 @@ async def test_a_settled_task_stops_being_heartbeaten(backend):
     # recovered and redelivered as a batch of its own, whose items[0] settles
     # early too, and the assertion below counts two.
     worker = backend.worker(
-        poll_interval_ms=20, concurrency=4, lease_ms=1_000, heartbeat_interval_ms=200
+        poll_interval_ms=20, concurrency=4, lease_ms=1_000
     )
 
     @worker.task("half", batch=4)
@@ -330,7 +330,7 @@ async def test_a_cancel_reaches_a_batch_task_through_the_heartbeat(backend):
     batch that write is the shared beat, so it must carry each row back."""
     client = await backend.client()
     worker = backend.worker(
-        poll_interval_ms=20, concurrency=4, lease_ms=400, heartbeat_interval_ms=30
+        poll_interval_ms=20, concurrency=4, lease_ms=400
     )
     observed: dict[str, bool] = {}
 
@@ -466,50 +466,6 @@ async def test_a_batch_fills_at_the_default_concurrency(backend):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_per_name_concurrency_caps_calls_for_that_name(backend):
-    """The worker budget allows 6 calls; `embed` may only ever run 2 of them, so
-    one expensive name cannot take the whole worker."""
-    client = await backend.client()
-    worker = backend.worker(poll_interval_ms=20, concurrency=6)
-    live = 0
-    peak = 0
-
-    @worker.task("embed", batch=2, concurrency=2)
-    async def embed(items):
-        nonlocal live, peak
-        live += 1
-        peak = max(peak, live)
-        await asyncio.sleep(0.03)
-        live -= 1
-
-    ids = [(await client.submit("embed", {})).id for _ in range(20)]
-    tasks = await _drain(client, ids, worker)
-
-    assert peak <= 2, f"per-name concurrency=2 but {peak} calls ran at once"
-    assert all(t.status == "succeeded" for t in tasks.values())
-
-
-async def test_per_name_concurrency_without_batching(backend):
-    client = await backend.client()
-    worker = backend.worker(poll_interval_ms=20, concurrency=8)
-    live = 0
-    peak = 0
-
-    @worker.task("slow", concurrency=1)
-    async def slow(ctx, payload):
-        nonlocal live, peak
-        live += 1
-        peak = max(peak, live)
-        await asyncio.sleep(0.02)
-        live -= 1
-
-    ids = [(await client.submit("slow", {})).id for _ in range(10)]
-    tasks = await _drain(client, ids, worker)
-
-    assert peak == 1, f"per-name concurrency=1 but {peak} handlers ran at once"
-    assert all(t.status == "succeeded" for t in tasks.values())
-
-
 async def test_a_name_is_not_starved_behind_another_names_backlog(backend):
     """One slot, two backlogs. The claim serves groups in the order given, so
     without rotating that order `embed` would hold the slot until its 40 tasks
@@ -543,16 +499,16 @@ async def test_settling_during_a_beat_is_not_read_as_lease_loss(backend):
     A handler checking `lost_lease` was told to bail out after a clean succeed."""
     client = await backend.client()
     worker = backend.worker(
-        poll_interval_ms=20, concurrency=4, lease_ms=300, heartbeat_interval_ms=10
+        poll_interval_ms=20, concurrency=4, lease_ms=300
     )
     flagged: dict[str, list[bool]] = {}
 
     @worker.task("racy", batch=4)
     async def racy(items):
-        await asyncio.sleep(0.05)  # let a beat land first
+        await asyncio.sleep(0.15)  # let a beat land first (lease/3 = 100ms)
         for item in items:
             await item.succeed({"ok": True})
-        await asyncio.sleep(0.1)  # and several more beats after settling
+        await asyncio.sleep(0.3)  # and several more beats after settling
         flagged["lost"] = [i.lost_lease for i in items]
 
     ids = [(await client.submit("racy", {})).id for _ in range(3)]
@@ -567,14 +523,14 @@ async def test_a_single_task_handler_that_settles_early_is_not_flagged_either(ba
     to heartbeat a terminal row every beat and flag the context on the first one."""
     client = await backend.client()
     worker = backend.worker(
-        poll_interval_ms=20, lease_ms=300, heartbeat_interval_ms=10
+        poll_interval_ms=20, lease_ms=300
     )
     flagged: dict[str, bool] = {}
 
     @worker.task("early")
     async def early(ctx, payload):
         await ctx.succeed({"ok": True})
-        await asyncio.sleep(0.1)  # several beats with the task already terminal
+        await asyncio.sleep(0.3)  # several beats with the task already terminal
         flagged["lost"] = ctx.lost_lease
 
     ids = [(await client.submit("early", {})).id]

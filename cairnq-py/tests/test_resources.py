@@ -1,10 +1,11 @@
 """Resources: a call ceiling several names draw from.
 
-`concurrency` caps one name against itself, which cannot express the constraint
-that actually binds a worker doing heavy local work — several *different*
-handlers contending for one scarce thing (a GPU, an index with a single writer).
-A resource is that same ceiling with more than one name drawing on it; at
-capacity 1 it is mutual exclusion across those names.
+The constraint that actually binds a worker doing heavy local work is several
+*different* handlers contending for one scarce thing (a GPU, an index with a
+single writer), so the ceiling belongs to that thing rather than to any one
+name; at capacity 1 it is mutual exclusion across the names that join it. A name
+that only needs to cap itself declares a resource of its own — which is also the
+only way to cap one name, there being no per-name `concurrency`.
 
 The gate is at claim, not inside the handler: a semaphore around the body would
 let the task be claimed first, so it would hold a lease, burn a concurrency slot
@@ -189,45 +190,28 @@ async def test_a_resource_composes_with_batching(client, db_path):
     assert all(t.status == "succeeded" for t in tasks.values())
 
 
-async def test_the_tighter_of_name_and_resource_binds(client, db_path):
-    """A name's own concurrency and its resource are independent ceilings; the
-    smaller one wins, and neither is relaxed by the other."""
+async def test_a_resource_of_its_own_caps_one_name(client, db_path):
+    """The worker budget allows 8 calls; `render` has a resource nobody else
+    joins, so it may only ever run one of them. That is how a single name caps
+    itself now that there is no per-name `concurrency`."""
     worker = Worker.sqlite(
-        db_path, poll_interval_ms=20, concurrency=8, resources={"gpu": 3}
+        db_path, poll_interval_ms=20, concurrency=8, resources={"render": 1}
     )
-    render_live = 0
-    render_peak = 0
-    total_live = 0
-    total_peak = 0
+    live = 0
+    peak = 0
 
-    async def hold(counter):
-        nonlocal total_live, total_peak
-        total_live += 1
-        total_peak = max(total_peak, total_live)
-        await asyncio.sleep(0.03)
-        total_live -= 1
-
-    @worker.task("render", concurrency=1, resource="gpu")
+    @worker.task("render", resource="render")
     async def render(ctx, payload):
-        nonlocal render_live, render_peak, total_live, total_peak
-        render_live += 1
-        render_peak = max(render_peak, render_live)
-        total_live += 1
-        total_peak = max(total_peak, total_live)
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
         await asyncio.sleep(0.03)
-        total_live -= 1
-        render_live -= 1
+        live -= 1
 
-    @worker.task("compare", resource="gpu")
-    async def compare(ctx, payload):
-        await hold(None)
-
-    ids = [(await client.submit("render", {})).id for _ in range(4)]
-    ids += [(await client.submit("compare", {})).id for _ in range(6)]
+    ids = [(await client.submit("render", {})).id for _ in range(6)]
     tasks = await _drain(client, ids, worker)
 
-    assert render_peak == 1, f"render caps itself at 1 but ran {render_peak}"
-    assert total_peak <= 3, f"gpu capacity is 3 but the peak was {total_peak}"
+    assert peak == 1, f"render's own resource is 1 but {peak} calls ran at once"
     assert all(t.status == "succeeded" for t in tasks.values())
 
 

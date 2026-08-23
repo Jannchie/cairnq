@@ -18,7 +18,6 @@ import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from contextlib import AbstractAsyncContextManager
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, get_args
@@ -27,12 +26,7 @@ if TYPE_CHECKING:  # import cycle: retention builds on the store it sweeps
     from ..retention import RetentionSweeper
 
 from .._ids import new_id
-from ..backpressure import (
-    DEFAULT_MAX_WAIT_MS,
-    INITIAL_PROBE_INTERVAL_MS,
-    QueueDepthGate,
-    QueueDepthLimit,
-)
+from ..backpressure import DEFAULT_MAX_WAIT_MS, QueueDepthGate, QueueDepthLimit
 from ..errors import (
     AlreadyExists,
     LostLease,
@@ -212,28 +206,6 @@ def statement_params(sql: str) -> tuple[str, ...]:
 ClaimDraw = Callable[[list[str] | None, int], Awaitable[list[Task]]]
 
 
-@dataclass(frozen=True, slots=True)
-class WatchSignal:
-    """Why `watch` is calling back.
-
-    ``queued`` / ``done`` come from the store's push channel and name what
-    moved; ``poll`` is the timer saying the watch cannot rule out a change. None
-    of them carries state — the row is the truth.
-    """
-
-    reason: Literal["queued", "done", "poll"]
-    #: The queue a task was queued on. Only on ``queued``.
-    queue: str | None = None
-    #: The task that reached a terminal status. Only on ``done``.
-    task_id: str | None = None
-
-
-#: How often `watch` signals in the absence of a push channel — and, where there
-#: is one, how long a dropped listener can go unnoticed. The default trades a
-#: dashboard's idle query rate against how stale it may look.
-DEFAULT_WATCH_POLL_MS = 2_000
-
-
 class TaskStore(ABC):
     #: Set by use_backpressure; None means submit is ungated.
     _gate: QueueDepthGate | None = None
@@ -243,7 +215,6 @@ class TaskStore(ABC):
         max_queue_depth: QueueDepthLimit,
         *,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
-        queue_poll_interval_ms: int = INITIAL_PROBE_INTERVAL_MS,
     ) -> None:
         """Bound how deep a queue may get before `submit` blocks. Off unless set.
 
@@ -255,7 +226,6 @@ class TaskStore(ABC):
             self,
             max_queue_depth,
             max_queue_wait_ms=max_queue_wait_ms,
-            queue_poll_interval_ms=queue_poll_interval_ms,
         )
 
     #: Set by use_retention; None means this store sweeps nothing.
@@ -322,24 +292,10 @@ class TaskStore(ABC):
         `claim_session`'s `plan`, above all — must still be written to survive
         running twice: derive nothing in it that the caller cannot derive again."""
 
-    def _subscribe_push(
-        self, on_signal: Callable[[WatchSignal], None]
-    ) -> Callable[[], None] | None:
-        """Register for this store's push channel, if it has one; returns an
-        unsubscribe. A store without a push channel returns None and `watch`
-        degrades to its timer alone."""
-        return None
-
     def _register_wakeable(self, queues: list[str]) -> None:
         """Tell a store with a push channel which queues this process will wait
         on, so it can buffer their notifications and ignore everyone else's. A
         store without a push channel has nothing to buffer."""
-
-    def _warm_push(self) -> None:
-        """Nudge the push channel back up if it has dropped. Called from
-        `watch`'s timer, which is the only thing keeping a client-side
-        subscriber alive: a process that never claims never calls claim_wake, so
-        without this a listener that died once would never come back there."""
 
     async def _has_claimable_work(self, params: dict[str, Any]) -> bool:
         """Whether it is worth opening the claim transaction at all — the
@@ -404,7 +360,8 @@ class TaskStore(ABC):
         parent_id: str | None = None,
         root_id: str | None = None,
         correlation_id: str | None = None,
-        run_at_delay_ms: int = 0,
+        #: Run no earlier than this many ms from now.
+        delay_ms: int = 0,
     ) -> Task:
         # Validate up front: untyped callers otherwise only hit the strategy
         # branch on the second submit of a key, deep inside the transaction.
@@ -415,8 +372,8 @@ class TaskStore(ABC):
         # delay is always a mistake. Both fail loudly instead.
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
-        if run_at_delay_ms < 0:
-            raise ValueError(f"run_at_delay_ms must be >= 0, got {run_at_delay_ms}")
+        if delay_ms < 0:
+            raise ValueError(f"delay_ms must be >= 0, got {delay_ms}")
         # After validation and before the first write: bad arguments should fail
         # now, not after waiting out a full queue.
         if self._gate is not None:
@@ -430,7 +387,7 @@ class TaskStore(ABC):
             "metadata": dump_json(metadata or {}),
             "max_attempts": max_attempts,
             "priority": priority,
-            "delay_ms": run_at_delay_ms,
+            "delay_ms": delay_ms,
             "parent_id": parent_id,
             "root_id": root_id or task_id,
             "correlation_id": correlation_id,
@@ -577,114 +534,13 @@ class TaskStore(ABC):
         )
         return [r["id"] for r in rows]
 
-    async def stats(self, queue: str | None = None) -> dict[str, dict[TaskStatus, int]]:
-        """Task counts per queue, keyed by status and zero-filled across all
-        statuses — `stats()["default"]["queued"]` is the backlog of a queue.
-        A queue appears only while it has rows; terminal tasks keep counting
-        until `purge` removes them.
-
-        `queue` restricts the aggregate to one queue, which is also what stops
-        the caller paying for every other queue's rows: one installation carrying
-        two workloads is the coordination this project recommends, and the
-        unfiltered form reads the whole table. A named queue is always present in
-        the result, zero-filled if it has no rows at all — asking about a
-        specific queue and getting a KeyError would make every caller write the
-        same fallback.
-
-        Filtered or not, this COUNTS, so it costs what it counts: a whole queue,
-        terminal rows included. Right for a dashboard, wrong on an interval —
-        poll `queue_depth`, which is bounded, and keep this for when the real
-        numbers are the point."""
-        out: dict[str, dict[TaskStatus, int]] = {}
-        # Seed before the query, not after: a named queue with no rows returns no
-        # rows to seed from, and that is exactly the case the promise is about.
-        if queue is not None:
-            out[queue] = dict.fromkeys(STATUSES, 0)
-        for row in await self._fetch("stats", {"queue": queue}):
-            per = out.setdefault(row["queue"], dict.fromkeys(STATUSES, 0))
-            per[row["status"]] = int(row["count"])
-        return out
-
-    def watch(
-        self,
-        on_signal: Callable[[WatchSignal], None],
-        *,
-        queues: list[str] | tuple[str, ...] | None = None,
-        poll_ms: int = DEFAULT_WATCH_POLL_MS,
-    ) -> Callable[[], None]:
-        """Call `on_signal` when the tasks on `queues` may have changed —
-        something was queued, or something finished.
-
-        This is notify-ACCELERATED POLLING, not an event log, and the difference
-        is the whole contract. Where a push channel is available (Postgres
-        LISTEN) an idle watch costs nothing and a signal arrives within
-        milliseconds of the event. Where it is not — a transaction-mode pooler
-        refuses LISTEN, SQLite has no channel at all — the timer alone still
-        delivers ``poll`` signals, so a consumer that re-reads on every signal is
-        correct in both cases and merely less prompt in one.
-
-        What it will NOT do is promise that a signal means something happened, or
-        that every event produces its own signal. Treat a signal as "re-read now"
-        and take the truth from `stats` / `list` / `get`, which is where it
-        lives. ``reason`` is a hint for reading less: a ``done`` signal names the
-        task, so a dashboard can refresh that row instead of the list.
-
-        Returns an unsubscribe. Mirrors `watch` in the TypeScript SDK.
-        """
-        interval = max(1, poll_ms) / 1000
-        wanted = set(queues) if queues else None
-        live = True
-
-        def emit(signal: WatchSignal) -> None:
-            # A signal delivered after unsubscribe would have the consumer
-            # re-reading a store it has stopped caring about, possibly a closed
-            # one.
-            if live:
-                on_signal(signal)
-
-        def filtered(signal: WatchSignal) -> None:
-            # A queued signal names its queue, so a watch scoped to some queues
-            # can drop the rest. A done signal names only the task — which queue
-            # it was on is not in the notification, so it is never filtered out.
-            if signal.reason == "queued" and wanted is not None and signal.queue not in wanted:
-                return
-            emit(signal)
-
-        unsubscribe = self._subscribe_push(filtered)
-
-        async def tick() -> None:
-            while True:
-                await asyncio.sleep(interval)
-                self._warm_push()
-                # Guarded for the same reason PostgresStore guards its push
-                # fan-out: a consumer that raises must not take the timer down
-                # with it. Losing the timer would silently retire the fallback
-                # that makes watch correct where there is no push channel.
-                try:
-                    emit(WatchSignal(reason="poll"))
-                except Exception:
-                    pass  # the consumer's problem, not the watch's
-
-        timer = asyncio.get_running_loop().create_task(tick())
-
-        def stop() -> None:
-            nonlocal live
-            live = False
-            if unsubscribe is not None:
-                unsubscribe()
-            timer.cancel()
-
-        return stop
-
     async def queue_depth(self, queue: str, max_depth: int) -> int:
         """How many more tasks fit on `queue` under `max_depth` — 0 once it is
         full.
 
-        The cheap half of backpressure: bounded at `max_depth` index entries,
-        unlike `stats()`, which aggregates the whole table (terminal rows
-        included) and so costs more the longer a database has been running. Use
-        it directly to shed load or shape a producer; `QueueDepthGate` builds the
-        blocking form on top."""
+        The cheap half of backpressure: bounded at `max_depth` index entries, so
+        it stays cheap to ask on every enqueue. Use it directly to shed load or
+        shape a producer; `QueueDepthGate` builds the blocking form on top."""
         if max_depth < 0:
             raise ValueError(f"max_depth must be >= 0, got {max_depth}")
         rows = await self._fetch("queue_depth", {"queue": queue, "max_depth": max_depth})

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any
 
@@ -29,7 +29,6 @@ from .base import (
     NAMED,
     Fetch,
     TaskStore,
-    WatchSignal,
     check_protocol_version,
     specialize,
     statement_params,
@@ -141,10 +140,6 @@ class PostgresStore(TaskStore):
         self._wakeable_queues: set[str] = set()
         self._queued_event = asyncio.Event()
         self._done_waiters: dict[str, set[asyncio.Event]] = {}
-        # watch() subscribers. Separate from the wake events: a waiter is
-        # one-shot and consumes the notification, a subscriber is standing and
-        # only observes.
-        self._subscribers: set[Callable[[WatchSignal], None]] = set()
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
@@ -411,27 +406,9 @@ class PostgresStore(TaskStore):
             if payload in self._wakeable_queues:
                 self._pending_queues.add(payload)
             self._queued_event.set()
-            self._publish(WatchSignal(reason="queued", queue=payload))
         elif channel == DONE_CHANNEL and payload:
             for event in self._done_waiters.get(payload, ()):
                 event.set()
-            self._publish(WatchSignal(reason="done", task_id=payload))
-
-    def _publish(self, signal: WatchSignal) -> None:
-        """Hand a notification to every watch() subscriber. A raising subscriber
-        is its own problem: it must not cost the others their signal, nor take
-        down the listener connection that delivered it."""
-        # The common case is a worker with no watchers at all, and this runs on
-        # every notification the database delivers.
-        if not self._subscribers:
-            return
-        # Copied so a subscriber that unsubscribes from inside its own callback
-        # does not mutate the set being iterated.
-        for subscriber in list(self._subscribers):
-            try:
-                subscriber(signal)
-            except Exception:
-                pass  # deliberately swallowed — see above
 
     def _on_listener_lost(self) -> None:
         # A dropped listener degrades to polling; the next wake call reconnects.
@@ -507,12 +484,3 @@ class PostgresStore(TaskStore):
         async with self._executor.transaction() as session:
             yield self._bound_fetch(session), session
 
-    # ------------------------------------------------------------ push seams
-    def _subscribe_push(self, on_signal: Callable[[WatchSignal], None]) -> Callable[[], None]:
-        self._subscribers.add(on_signal)
-        self._listener_ready()  # an API-side watcher is often the only thing asking
-        return lambda: self._subscribers.discard(on_signal)
-
-    def _warm_push(self) -> None:
-        if self._subscribers:
-            self._listener_ready()

@@ -5,16 +5,13 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
-from .backpressure import QueueDepthGate, QueueDepthLimit
 from .client import CairnQ
 from .context import TaskContext
 from .store.pg_executor import ListenUnavailable, PgExecutor, PgSession
 from .store.pg_pool import create_pool_executor
-from .store.base import DEFAULT_WATCH_POLL_MS, WatchSignal
 from .errors import (
     AlreadyExists,
     CairnQError,
-    EventLoopBlocked,
     LostLease,
     ProtocolVersionMismatch,
     SchemaMismatch,
@@ -28,7 +25,6 @@ from .errors import (
     TaskTimeout,
 )
 from .models import STATUSES, Task, TaskDef, TaskRef, TaskStatus, is_terminal_status
-from .retention import Retention, RetentionRule, RetentionSweeper
 from .store import Conflict, PostgresStore, SQLiteStore, TaskStore
 from .worker import Worker
 
@@ -53,11 +49,6 @@ __all__ = [
     "TaskStore",
     "SQLiteStore",
     "PostgresStore",
-    "QueueDepthGate",
-    "QueueDepthLimit",
-    "Retention",
-    "RetentionRule",
-    "RetentionSweeper",
     "CairnQError",
     "AlreadyExists",
     "QueueFull",
@@ -66,7 +57,6 @@ __all__ = [
     "TaskCanceled",
     "TaskError",
     "LostLease",
-    "EventLoopBlocked",
     "ProtocolVersionMismatch",
     "SchemaMismatch",
     "UnsupportedBackend",
@@ -74,8 +64,6 @@ __all__ = [
     "ListenUnavailable",
     "PgSession",
     "PgExecutor",
-    "DEFAULT_WATCH_POLL_MS",
-    "WatchSignal",
     "SerializationError",
     "StoreClosed",
 ]

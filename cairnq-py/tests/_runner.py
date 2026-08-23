@@ -87,22 +87,33 @@ class Runner:
     async def _dispatch(self, op: str, a: dict[str, Any]) -> Any:
         c, s = self.client, self.store
         if op == "submit":
-            return await c.submit(
-                a["name"], a.get("payload", {}),
+            # The scenario arg keeps the protocol's spelling; the SDK option is
+            # `delay_ms`.
+            opts = dict(
                 key=a.get("key"), queue=a.get("queue", "default"),
                 conflict=a.get("conflict", "reuse"),
                 max_attempts=a.get("max_attempts", 3), priority=a.get("priority", 0),
-                metadata=a.get("metadata"), correlation_id=a.get("correlation_id"),
-                run_at_delay_ms=a.get("run_at_delay_ms", 0),
+                metadata=a.get("metadata"),
+                delay_ms=a.get("run_at_delay_ms", 0),
             )
+            # correlation_id is a store-level submit field: the public client
+            # submit no longer carries the parent/root/correlation trio, which
+            # TaskContext.submit wires for a child. A scenario that sets one goes
+            # through the store — the same submit the client delegates to.
+            if a.get("correlation_id") is not None:
+                return await s.submit(
+                    name=a["name"], payload=a.get("payload", {}),
+                    correlation_id=a["correlation_id"], **opts,
+                )
+            return await c.submit(a["name"], a.get("payload", {}), **opts)
         if op == "get":
             return await c.get(a["id"])
         if op == "get_by_key":
             return await c.get_by_key(a["key"])
         if op == "get_status":
-            return await c.get_status(a["id"])
+            return await s.get_status(a["id"])
         if op == "get_status_by_key":
-            return await c.get_status_by_key(a["key"])
+            return await s.get_status_by_key(a["key"])
         if op == "list":
             return await c.list(**a)
         if op == "cancel":
@@ -157,8 +168,6 @@ class Runner:
                 name=a.get("name"),
                 limit=a.get("limit", 1000),
             )
-        if op == "stats":
-            return await c.stats(a.get("queue"))
         if op == "queue_depth":
             return await c.queue_depth(a["queue"], a["max_depth"])
         if op == "sleep":

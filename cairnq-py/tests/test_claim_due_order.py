@@ -57,7 +57,7 @@ async def test_never_claims_a_task_that_is_not_due_yet(db_path):
             queues=["default"], worker_id="w1", lease_ms=5_000, limit=5
         )
         assert [t.id for t in claimed] == ["due"]
-        assert (await client.stats())["default"]["queued"] == 1
+        assert len(await client.list(status="queued")) == 1
     finally:
         await client.close()
 

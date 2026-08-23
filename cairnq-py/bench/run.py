@@ -54,7 +54,7 @@ async def call_latencies(tasks: CairnQ, **call_kwargs) -> list[float]:
     lat = []
     for _ in range(N_CALL):
         t0 = perf_counter()
-        await tasks.call(noop, {}, wait_timeout_ms=15_000, **call_kwargs)
+        await tasks.call(noop, {}, timeout_ms=15_000, **call_kwargs)
         lat.append((perf_counter() - t0) * 1000)
     return sorted(lat)
 

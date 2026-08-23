@@ -9,12 +9,6 @@ async def test_protocol_version(client):
     assert await client.store.protocol_version() == 1
 
 
-async def test_stats_on_an_empty_database(client):
-    # No rows, no queues — {} rather than a zero-filled "default" that would
-    # imply the store knows which queues exist before anything is submitted.
-    assert await client.stats() == {}
-
-
 async def test_protocol_version_mismatch(tmp_path):
     import sqlite3
 
@@ -127,8 +121,11 @@ async def test_retry_failed_task(client):
 
 
 async def test_list_filters(client):
-    a = await client.submit("alpha", {}, correlation_id="req-1")
-    await client.submit("beta", {}, correlation_id="req-2")
+    # correlation_id is a store-level submit field — the public client submit
+    # carries only the per-task options, and TaskContext.submit wires the
+    # parent/root/correlation trio for a child.
+    a = await client.store.submit(name="alpha", payload={}, correlation_id="req-1")
+    await client.store.submit(name="beta", payload={}, correlation_id="req-2")
     by_name = await client.list(name="alpha")
     assert [t.id for t in by_name] == [a.id]
     by_corr = await client.list(correlation_id="req-1")

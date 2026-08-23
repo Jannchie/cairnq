@@ -9,7 +9,7 @@ from cairnq.errors import TaskFailed, TaskTimeout
 async def test_call_timeout_keeps_task_running(client, db_path):
     # No worker for this name -> call should time out and the task stays queued.
     with pytest.raises(TaskTimeout) as excinfo:
-        await client.call("unhandled", {}, wait_timeout_ms=300, poll_ms=50)
+        await client.call("unhandled", {}, timeout_ms=300, poll_ms=50)
     task_id = excinfo.value.task_id
     assert task_id
     task = await client.get(task_id)
@@ -32,7 +32,7 @@ async def test_worker_end_to_end_with_call(client, db_path):
         return {"sum": payload["a"] + payload["b"]}
 
     async with worker.background():
-        result = await client.call("sum", {"a": 2, "b": 3}, wait_timeout_ms=5000, poll_ms=20)
+        result = await client.call("sum", {"a": 2, "b": 3}, timeout_ms=5000, poll_ms=20)
 
     assert result == {"sum": 5}
     assert captured["attempt"] == 1
@@ -46,7 +46,7 @@ async def test_worker_payload_signature(client, db_path):
         return {"echoed": payload}
 
     async with worker.background():
-        result = await client.call("echo", {"hello": "world"}, wait_timeout_ms=5000, poll_ms=20)
+        result = await client.call("echo", {"hello": "world"}, timeout_ms=5000, poll_ms=20)
     assert result == {"echoed": {"hello": "world"}}
 
 
@@ -66,7 +66,7 @@ async def test_worker_retries_then_succeeds(client, db_path):
 
     async with worker.background():
         result = await client.call(
-            "flaky", {}, max_attempts=3, wait_timeout_ms=5000, poll_ms=20
+            "flaky", {}, max_attempts=3, timeout_ms=5000, poll_ms=20
         )
     assert result == {"ok": True}
     assert seen == [1, 2]
@@ -133,7 +133,7 @@ async def test_task_error_is_non_retryable(client, db_path):
 
     async with worker.background():
         with pytest.raises(TaskFailed) as excinfo:
-            await client.call("bad", {}, max_attempts=3, wait_timeout_ms=3000, poll_ms=20)
+            await client.call("bad", {}, max_attempts=3, timeout_ms=3000, poll_ms=20)
 
     e = excinfo.value
     assert e.code == "bad_input" and e.message == "bad input" and e.retryable is False
@@ -149,7 +149,7 @@ async def test_bare_task_decorator_uses_function_name(client, db_path):
         return {"out": payload["n"] * 2}
 
     async with worker.background():
-        result = await client.call("double", {"n": 21}, wait_timeout_ms=3000, poll_ms=20)
+        result = await client.call("double", {"n": 21}, timeout_ms=3000, poll_ms=20)
     assert result == {"out": 42}
 
 
@@ -161,7 +161,7 @@ async def test_payload_defaults_to_empty_dict(client, db_path):
         return {"pong": True}
 
     async with worker.background():
-        result = await client.call("ping", wait_timeout_ms=3000, poll_ms=20)  # no payload arg
+        result = await client.call("ping", timeout_ms=3000, poll_ms=20)  # no payload arg
     assert result == {"pong": True}
 
 
@@ -178,7 +178,7 @@ async def test_background_keeps_injected_store_open(db_path):
         return {"ok": True}
 
     async with worker.background():
-        result = await client.call("ping", wait_timeout_ms=3000, poll_ms=20)
+        result = await client.call("ping", timeout_ms=3000, poll_ms=20)
     assert result == {"ok": True}
 
     # The store was injected, not created by Worker.sqlite, so background() must
@@ -199,7 +199,7 @@ async def test_task_def_shares_name_across_worker_and_client(client, db_path):
         return {"msg": f"hi {payload['who']}"}
 
     async with worker.background():
-        result = await client.call(greet, {"who": "ada"}, wait_timeout_ms=3000, poll_ms=20)
+        result = await client.call(greet, {"who": "ada"}, timeout_ms=3000, poll_ms=20)
     assert result == {"msg": "hi ada"}
 
     # A plain-string submit hits the same handler — the TaskDef is just the name.

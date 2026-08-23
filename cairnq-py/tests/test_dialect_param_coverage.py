@@ -38,7 +38,7 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
     worker = "w1"
 
     # Client side, including every key-conflict branch.
-    task = await store.submit(name="job", payload={"v": 1}, run_at_delay_ms=0)
+    task = await store.submit(name="job", payload={"v": 1}, delay_ms=0)
     await store.submit(name="job", payload={}, key="k", conflict="reuse")
     await store.submit(name="job", payload={}, key="k", conflict="reuse")
     await store.submit(name="job", payload={}, key="k", conflict="reuse-succeeded")
@@ -92,8 +92,6 @@ async def _exercise_every_operation(store: RecordingStore) -> None:
 
     await store.cancel(task.id)
     await store.retry(task.id, reset_attempt=False)
-    await store.stats()
-    await store.stats("default")
     await store.queue_depth("default", 10)
     # Every filter combination: each picks a different statement, so calling one
     # shape would leave the other three unbound and unchecked.

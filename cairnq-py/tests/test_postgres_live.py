@@ -154,7 +154,7 @@ async def test_notify_wakes_worker_and_waiter_beating_the_poll_floor(pg_client):
         t0 = perf_counter()
         async with worker.background():
             await asyncio.sleep(0.3)  # park the worker in its idle sleep first
-            result = await pg_client.call("ping", {}, wait_timeout_ms=8_000, poll_ms=4_000)
+            result = await pg_client.call("ping", {}, timeout_ms=8_000, poll_ms=4_000)
         assert result == {"pong": True}
         assert perf_counter() - t0 < 3.0
     finally:
@@ -169,7 +169,7 @@ async def test_worker_end_to_end(pg_client):
         return {"sum": payload["a"] + payload["b"]}
 
     async with worker.background():
-        result = await pg_client.call("sum", {"a": 2, "b": 3}, wait_timeout_ms=10_000, poll_ms=50)
+        result = await pg_client.call("sum", {"a": 2, "b": 3}, timeout_ms=10_000, poll_ms=50)
     assert result == {"sum": 5}
 
 
@@ -179,7 +179,7 @@ async def test_batch_delivery_end_to_end(pg_client):
     settle-the-rest contract over the DB clock rather than a supplied now_ms."""
     worker = Worker.postgres(
         DSN, queues=["default"], poll_interval_ms=50, concurrency=8, lease_ms=400,
-        heartbeat_interval_ms=60, retry_backoff_ms=0,
+        retry_backoff_ms=0,
     )
     seen: list[int] = []
 
