@@ -131,9 +131,17 @@ jobs:
       - name: Publish to npm
         if: ${{ github.event_name == 'push' || !inputs.dry_run }}
         run: npm publish --access public --provenance
+      # `npm pack`, not `npm publish --dry-run`: the latter still asks the
+      # registry and refuses a version that already exists, so a dry run was
+      # only possible between a version bump and its release — never on a
+      # released commit, which is exactly when you want to check the workflow
+      # itself rather than a change to it. What a dry run is for here is the
+      # tarball (does dist/_protocol make it in?) and the build, both of which
+      # pack shows; registry-side validation is not available before publishing
+      # in any case.
       - name: Dry run (pack only)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-        run: npm publish --dry-run --access public
+        run: npm pack --dry-run
 
   pypi:
     runs-on: ubuntu-latest
