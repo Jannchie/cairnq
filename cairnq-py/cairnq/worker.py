@@ -1092,12 +1092,43 @@ class Worker:
 
     @contextlib.asynccontextmanager
     async def background(self, *, concurrency: int | None = None):
-        """Run the worker in the same process (deployment mode A)."""
+        """Run the worker in the same process (deployment mode A).
+
+        ``run()`` can fail before the body has done anything — a database that
+        will not open, a migration that will not apply, a protocol version this
+        SDK does not speak. Suppressing that (as this used to) left the block
+        looking like it succeeded while no worker was running at all, and nothing
+        anywhere said why. Only cancellation is swallowed now.
+
+        If the body returned, the worker's failure is what the caller hears: a
+        result produced with no worker running is not a success worth reporting
+        quietly. If the body raised, its own error wins — it is the caller's
+        code, and replacing it would hide what they were actually doing — with
+        the worker's failure attached as ``__cause__`` so the root of it stays
+        reachable. Mirrors background() in the TypeScript SDK.
+        """
         runner = asyncio.create_task(self.run(concurrency=concurrency))
+
+        async def shutdown() -> BaseException | None:
+            """Stop the worker and hand back what run() failed with, if anything."""
+            self.stop()
+            failure: BaseException | None = None
+            try:
+                await runner
+            except asyncio.CancelledError:
+                pass
+            except BaseException as exc:  # noqa: BLE001 - re-raised by the caller below
+                failure = exc
+            await self._close_if_owned()
+            return failure
+
         try:
             yield self
-        finally:
-            self.stop()
-            with contextlib.suppress(BaseException):
-                await runner
-            await self._close_if_owned()
+        except BaseException as exc:
+            failure = await shutdown()
+            if failure is not None and exc.__cause__ is None:
+                exc.__cause__ = failure
+            raise
+        failure = await shutdown()
+        if failure is not None:
+            raise failure

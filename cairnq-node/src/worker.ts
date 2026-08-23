@@ -679,16 +679,50 @@ export class Worker {
     }
   }
 
-  /** Run the worker in the same process for the duration of fn (deployment mode A). */
+  /**
+   * Run the worker in the same process for the duration of fn (deployment mode A).
+   *
+   * `run()` can fail before `fn` has even started — a database that will not
+   * open, a migration that will not apply, a protocol version this SDK does not
+   * speak — so its rejection is captured from the first tick rather than only at
+   * the `await` in the teardown. Left uncaught until then it is an unhandled
+   * rejection, which Node terminates the process for by default: the caller
+   * never saw the error, and `fn` never finished. (The same mistake `runCall`
+   * documents having made.)
+   *
+   * If `fn` returned, the worker's failure is what the caller hears: a value
+   * produced with no worker running is not a success worth reporting quietly. If
+   * `fn` threw, its own error wins — it is the caller's code, and replacing it
+   * would hide what they were actually doing — with the worker's failure
+   * attached as `cause` so the root of it stays reachable.
+   */
   async background<T>(fn: () => Promise<T>, opts: { concurrency?: number } = {}): Promise<T> {
     const runner = this.run(opts);
-    try {
-      return await fn();
-    } finally {
+    // Attached now, not at the await in the teardown: that is what keeps an
+    // early rejection from being an unhandled one. Carried as a value rather
+    // than assigned to a captured variable, so the outcome flows out of
+    // `shutdown` and needs no cast to be read.
+    const settled = runner.then(
+      () => null,
+      (err: unknown) => ({ err }),
+    );
+    const shutdown = async (): Promise<{ err: unknown } | null> => {
       this.stop();
-      await runner;
+      const failure = await settled;
       await this.closeIfOwned();
+      return failure;
+    };
+    let value: T;
+    try {
+      value = await fn();
+    } catch (err) {
+      const failure = await shutdown();
+      if (failure && err instanceof Error && err.cause === undefined) err.cause = failure.err;
+      throw err;
     }
+    const failure = await shutdown();
+    if (failure) throw failure.err;
+    return value;
   }
 
   /**
@@ -882,10 +916,13 @@ export class Worker {
    * set.
    *
    * On timeout the attempt is abandoned: every context it covers is flagged
-   * lease-lost first (ctx.signal aborts, and a handler that keeps running can
-   * never write again, nor settle anything behind the worker's back — see
-   * TaskContext.owned), then the still-pending promise is left to settle on its
-   * own, its outcome discarded. The caller records the handler_timeout failure;
+   * lease-lost first (ctx.signal aborts; a handler that keeps running can never
+   * write to its task again, nor settle anything behind the worker's back — see
+   * TaskContext.owned — and cannot create child tasks either, which would
+   * otherwise be created a second time by the retry), then the still-pending
+   * promise is left to settle on its own, its outcome discarded. What a zombie
+   * does OUTSIDE cairnq is its own business: `ctx.signal` is how a handler is
+   * told to stop, and only the handler can act on it. The caller records the handler_timeout failure;
    * lease recovery is NOT involved, so redelivery is immediate.
    */
   private async attempt(invoke: () => unknown, ctxs: TaskContext[]): Promise<unknown> {
