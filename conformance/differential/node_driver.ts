@@ -7,6 +7,7 @@
 // Every submit stamps `metadata.dt_key`: identity in the dump comes from the
 // workload, not from the random ULIDs. See dump.mjs.
 import { CairnQ, Worker } from "../../cairnq-node/src/index.js";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const [, , db, scenario] = process.argv;
@@ -25,8 +26,12 @@ async function backgroundFailureIsReported(): Promise<void> {
   await tasks.connect();
   await tasks.submit("marker", { at: "start" }, { metadata: { dt_key: "t00" } });
 
-  // A path no process can open, so connect() fails inside run().
-  const worker = Worker.sqlite(join("/proc/cairnq-cannot-exist", "tasks.db"));
+  // A path no process can open, so connect() fails inside run(). A regular
+  // file where a directory is needed fails ENOTDIR on every platform — unlike
+  // /proc, where Linux can leave the mkdir syscall hanging instead of failing.
+  const blocker = `${db}.blocker`;
+  writeFileSync(blocker, "");
+  const worker = Worker.sqlite(join(blocker, "tasks.db"));
   worker.task("noop", async () => null);
   let reported = false;
   let bodyRan = false;

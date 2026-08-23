@@ -23,8 +23,13 @@ async def background_failure_is_reported(db: str) -> None:
     await tasks.connect()
     await tasks.submit("marker", {"at": "start"}, metadata={"dt_key": "t00"})
 
-    # A path no process can open, so connect() fails inside run().
-    worker = Worker.sqlite("/proc/cairnq-cannot-exist/tasks.db")
+    # A path no process can open, so connect() fails inside run(). A regular
+    # file where a directory is needed fails ENOTDIR on every platform — unlike
+    # /proc, where Linux can leave the mkdir syscall hanging instead of failing.
+    blocker = db + ".blocker"
+    with open(blocker, "w"):
+        pass
+    worker = Worker.sqlite(blocker + "/tasks.db")
 
     @worker.task("noop")
     async def _noop(ctx, payload):
