@@ -174,7 +174,7 @@ class FakeSession:
             # (see the dict-valued `payload` in the test rows), so it answers the
             # wire-form probe the way a decoding driver would: the value without
             # its quotes. Stated rather than left to the fall-through, so the
-            # harness says which driver it is emulating.
+            # fixture says which driver it is emulating.
             return [{"probe": "cairnq"}]
         if "update cairnq_tasks" in text and "succeeded" in text:
             self.calls.append("complete")

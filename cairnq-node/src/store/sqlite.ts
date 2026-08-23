@@ -357,7 +357,6 @@ export class SQLiteStore extends TaskStore {
         `in-memory database ${JSON.stringify(this.path)} was closed — its contents ` +
           `went with the connection, so reopening would silently start from empty. ` +
           `Use a file path if the store needs to outlive a close.`,
-        true, // permanent: no amount of waiting brings this database back
       );
     }
     if (!memory) mkdirSync(dirname(this.path), { recursive: true });

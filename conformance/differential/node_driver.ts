@@ -12,24 +12,6 @@ import { join } from "node:path";
 const [, , db, scenario] = process.argv;
 
 /**
- * Writes accepted but not awaited, then an immediate close.
- *
- * SQLiteStore batches writes already waiting on its lock into one transaction,
- * so at the moment close() is called a group commit is holding submits whose
- * callers are still awaiting them. A close that does not drain loses exactly
- * those rows — and the count that comes back is the only evidence.
- */
-async function closeDrainsQueue(): Promise<void> {
-  const tasks = CairnQ.sqlite(db);
-  await tasks.connect();
-  const inFlight = Array.from({ length: 64 }, (_, i) =>
-    tasks.submit("job", { i }, { metadata: { dt_key: `t${String(i).padStart(2, "0")}` } }),
-  );
-  await tasks.close();
-  await Promise.allSettled(inFlight);
-}
-
-/**
  * A worker that cannot start, and whether the SDK says so.
  *
  * The outcome is written INTO the database as a task, because that is the only
@@ -58,33 +40,6 @@ async function backgroundFailureIsReported(): Promise<void> {
   }
 
   await tasks.submit("outcome", { reported, bodyRan }, { metadata: { dt_key: "t01" } });
-  await tasks.close();
-}
-
-/**
- * A sweeper stopped and started again, and one drained by hand afterwards.
- *
- * `stopping` is how a sweep in flight cuts itself short, and stop() used to
- * leave it set: a later sweep() returned after its FIRST batch, and in Python
- * a restarted sweeper never swept at all. Both show up as rows that should be
- * gone and are not.
- */
-async function sweeperStopStart(): Promise<void> {
-  const { RetentionSweeper } = await import("../../cairnq-node/src/retention.js");
-  const tasks = CairnQ.sqlite(db);
-  await tasks.connect();
-  for (let i = 0; i < 7; i++) {
-    const t = await tasks.submit("job", { i }, { metadata: { dt_key: `t${String(i).padStart(2, "0")}` } });
-    await tasks.store.claim({ queues: ["default"], workerId: "w1", leaseMs: 5_000 });
-    await tasks.store.succeed({ taskId: t.id, workerId: "w1", result: { i } });
-  }
-  // A survivor, so "swept everything" and "swept nothing" are distinguishable.
-  await tasks.submit("keep", {}, { metadata: { dt_key: "keep" } });
-
-  const sweeper = new RetentionSweeper(tasks.store, { olderThanMs: 0, limit: 2 });
-  sweeper.start();
-  await sweeper.stop();
-  await sweeper.sweep(); // the on-demand drain a stopped sweeper used to truncate
   await tasks.close();
 }
 
@@ -118,9 +73,7 @@ async function unserializableResult(): Promise<void> {
 }
 
 const scenarios: Record<string, () => Promise<void>> = {
-  close_drains_queue: closeDrainsQueue,
   background_failure_is_reported: backgroundFailureIsReported,
-  sweeper_stop_start: sweeperStopStart,
   unserializable_result: unserializableResult,
 };
 

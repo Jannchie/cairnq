@@ -295,9 +295,7 @@ class SQLiteStore(TaskStore):
                 raise StoreClosed(
                     f"in-memory database {self._path!r} was closed — its contents "
                     f"went with the connection, so reopening would silently start "
-                    f"from empty. Use a file path if the store needs to outlive a close.",
-                    # No amount of waiting brings this database back.
-                    permanent=True,
+                    f"from empty. Use a file path if the store needs to outlive a close."
                 )
             if not memory:
                 Path(self._path).parent.mkdir(parents=True, exist_ok=True)

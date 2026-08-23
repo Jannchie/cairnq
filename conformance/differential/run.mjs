@@ -38,24 +38,34 @@ const SIDES = {
 };
 
 /**
- * Scenarios. `tolerances` widens a single field of a single task to a range,
+ * Scenarios, and the bar for adding one.
+ *
+ * A scenario belongs here ONLY if an ordinary per-SDK regression test cannot
+ * express it — otherwise two of them is the cheaper coverage, and the workload
+ * below would be a third copy of the same assertion with a hand-mirrored driver
+ * on each side, which is a drift surface of exactly the kind this exists to
+ * detect. Two things clear that bar:
+ *
+ *   - a value only the language can construct. `Map` cannot be written in a
+ *     JSON conformance scenario, and it is what the encoder silently emptied.
+ *   - something observable only from OUTSIDE the process. A worker that takes
+ *     its host down with it is not a failed assertion anywhere; it is an exit
+ *     code, and only a parent process sees it.
+ *
+ * Scenarios for `close()` draining its queue and for a stopped sweeper still
+ * draining were written here first and then removed: both are ordinary
+ * behaviour, both already have per-SDK regression tests on both sides, and
+ * keeping them meant maintaining two more copies of one workload for no
+ * coverage that did not already exist.
+ *
+ * `tolerances` widens a single field of a single task to a range,
  * for the paths that genuinely cannot promise an exact value (lease expiry).
  * Declared here, where a reviewer sees it — not inside the projection, where it
  * would quietly widen every comparison.
  */
 const SCENARIOS = {
-  close_drains_queue: {
-    why: "close() must land the writes it already accepted; Node's dropped them.",
-    timeoutMs: 60_000,
-    tolerances: {},
-  },
   background_failure_is_reported: {
     why: "a worker that cannot start must be reported; Node crashed, Python swallowed.",
-    timeoutMs: 60_000,
-    tolerances: {},
-  },
-  sweeper_stop_start: {
-    why: "a stopped sweeper must still drain on demand, and must be restartable.",
     timeoutMs: 60_000,
     tolerances: {},
   },

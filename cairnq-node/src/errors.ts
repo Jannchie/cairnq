@@ -258,24 +258,12 @@ export class SchemaMismatch extends CairnQError {
  * raises the same named error.
  */
 export class StoreClosed extends CairnQError {
-  /**
-   * Whether this store is gone for good, or merely busy closing.
-   *
-   * The two need to be told apart without matching the message, because they
-   * call for opposite handling: the barrier a close in progress raises clears as
-   * soon as that close finishes, so waiting and retrying is right; an in-memory
-   * database that has been closed is never coming back, and the same retry is an
-   * infinite loop. False (transient) is the default because that is the common
-   * case and the safer thing to get wrong.
-   */
-  constructor(
-    message = "store is closing",
-    readonly permanent = false,
-  ) {
+  constructor(message = "store is closing") {
     super(message);
     this.name = "StoreClosed";
   }
 }
+
 
 /** A value could not be encoded for a protocol JSON column (non-finite number,
  * BigInt, circular structure, an opaque built-in like Map or Set, …). Raised at

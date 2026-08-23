@@ -11,25 +11,6 @@ import sys
 
 from cairnq import CairnQ, Retention, RetentionSweeper, Worker
 
-
-async def close_drains_queue(db: str) -> None:
-    """Writes accepted but not awaited, then an immediate close.
-
-    SQLiteStore batches writes already waiting on its lock into one transaction,
-    so at the moment close() is called a group commit is holding submits whose
-    callers are still awaiting them. A close that does not drain loses exactly
-    those rows — and the count that comes back is the only evidence."""
-    tasks = CairnQ.sqlite(db)
-    await tasks.connect()
-    in_flight = [
-        asyncio.create_task(tasks.submit("job", {"i": i}, metadata={"dt_key": f"t{i:02d}"}))
-        for i in range(64)
-    ]
-    await asyncio.sleep(0)  # let the submits reach the store, as JS scheduling does
-    await tasks.close()
-    await asyncio.gather(*in_flight, return_exceptions=True)
-
-
 async def background_failure_is_reported(db: str) -> None:
     """A worker that cannot start, and whether the SDK says so.
 
@@ -63,29 +44,6 @@ async def background_failure_is_reported(db: str) -> None:
     )
     await tasks.close()
 
-
-async def sweeper_stop_start(db: str) -> None:
-    """A sweeper stopped and started again, and one drained by hand afterwards.
-
-    `_stop` is how a sweep in flight cuts itself short, and stop() used to leave
-    it set: a later sweep() returned after its FIRST batch, and a restarted
-    sweeper never swept at all. Both show up as rows that should be gone."""
-    tasks = CairnQ.sqlite(db)
-    await tasks.connect()
-    for i in range(7):
-        t = await tasks.submit("job", {"i": i}, metadata={"dt_key": f"t{i:02d}"})
-        await tasks.store.claim(queues=["default"], worker_id="w1", lease_ms=5_000)
-        await tasks.store.succeed(task_id=t.id, worker_id="w1", result={"i": i})
-    # A survivor, so "swept everything" and "swept nothing" are distinguishable.
-    await tasks.submit("keep", {}, metadata={"dt_key": "keep"})
-
-    sweeper = RetentionSweeper(tasks.store, Retention(older_than_ms=0, limit=2))
-    sweeper.start()
-    await sweeper.stop()
-    await sweeper.sweep()  # the on-demand drain a stopped sweeper used to truncate
-    await tasks.close()
-
-
 async def unserializable_result(db: str) -> None:
     """A handler returning a value its language cannot put in JSON.
 
@@ -117,14 +75,10 @@ async def unserializable_result(db: str) -> None:
             await asyncio.sleep(0.025)
     await tasks.close()
 
-
 SCENARIOS = {
-    "close_drains_queue": close_drains_queue,
     "background_failure_is_reported": background_failure_is_reported,
-    "sweeper_stop_start": sweeper_stop_start,
     "unserializable_result": unserializable_result,
 }
-
 
 async def main() -> None:
     db, scenario = sys.argv[1], sys.argv[2]
@@ -134,6 +88,5 @@ async def main() -> None:
         raise SystemExit(2)
     await run(db)
     print("DRIVER_DONE", flush=True)
-
 
 asyncio.run(main())

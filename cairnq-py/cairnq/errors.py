@@ -239,17 +239,6 @@ class StoreClosed(CairnQError):
     The TypeScript SDK raises the same named error.
     """
 
-    def __init__(self, message: str = "store is closing", *, permanent: bool = False):
-        # Whether this store is gone for good, or merely busy closing. The two
-        # need to be told apart without matching the message, because they call
-        # for opposite handling: the barrier a close in progress raises clears as
-        # soon as that close finishes, so waiting and retrying is right; an
-        # in-memory database that has been closed is never coming back, and the
-        # same retry is an infinite loop. False is the default because that is
-        # the common case and the safer thing to get wrong.
-        super().__init__(message)
-        self.permanent = permanent
-
 
 class SerializationError(CairnQError):
     """A value could not be encoded for a protocol JSON column (non-finite

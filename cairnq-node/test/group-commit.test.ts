@@ -263,14 +263,9 @@ describe("group commit", () => {
     const t = await mem.submit("a", {});
     expect(await mem.get(t.id)).not.toBeNull();
     await mem.close();
-    const err = await mem.submit("b", {}).then(
-      () => null,
-      (e: unknown) => e as StoreClosed,
-    );
-    expect(err).toBeInstanceOf(StoreClosed);
-    // Permanent, unlike the barrier a close in progress raises: no amount of
-    // waiting brings an in-memory database back, so a caller that retries on
-    // StoreClosed has to be able to tell the two apart without matching prose.
-    expect(err?.permanent).toBe(true);
+    await expect(mem.submit("b", {})).rejects.toThrow(StoreClosed);
+    // And it stays refused: this is not the barrier a close in progress raises,
+    // which clears when that close finishes.
+    await expect(mem.submit("c", {})).rejects.toThrow(StoreClosed);
   });
 });
