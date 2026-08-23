@@ -1,9 +1,6 @@
-// Backpressure: the depth probe's semantics, the gate built on it, and the
-// worker-side byte budget.
+// Backpressure: the depth probe's semantics and the gate built on it.
 //
-// Without these a producer that outruns its workers is bounded only by disk, and
-// a worker sized by task count holds concurrency * largest-payload bytes the
-// moment big payloads arrive. Each test here pins one half of that.
+// Without these a producer that outruns its workers is bounded only by disk.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { CairnQ, QueueFull, Worker } from "../src/index.js";
@@ -49,7 +46,7 @@ describe("QueueDepthGate", () => {
   });
 
   it("blocks at the limit and proceeds once a worker drains the queue", async () => {
-    const gated = CairnQ.sqlite(dbPath, { maxQueueDepth: 2, queuePollIntervalMs: 20 });
+    const gated = CairnQ.sqlite(dbPath, { maxQueueDepth: 2 });
     await gated.connect();
     const worker = new Worker(new SQLiteStore(dbPath), ["default"], { pollIntervalMs: 20 });
     try {
@@ -82,7 +79,6 @@ describe("QueueDepthGate", () => {
     const gated = CairnQ.sqlite(dbPath, {
       maxQueueDepth: 1,
       maxQueueWaitMs: 120,
-      queuePollIntervalMs: 20,
     });
     await gated.connect();
     try {
@@ -99,7 +95,6 @@ describe("QueueDepthGate", () => {
     const gated = CairnQ.sqlite(dbPath, {
       maxQueueDepth: { tight: 1 },
       maxQueueWaitMs: 60,
-      queuePollIntervalMs: 20,
     });
     await gated.connect();
     try {
@@ -163,7 +158,6 @@ describe("QueueDepthGate", () => {
       pollIntervalMs: 10,
       maxQueueDepth: 1,
       maxQueueWaitMs: 100,
-      queuePollIntervalMs: 20,
     });
     let caught: unknown;
     worker.task("parent", async (ctx) => {
@@ -192,98 +186,5 @@ describe("QueueDepthGate", () => {
     const store = new SQLiteStore(dbPath);
     expect(() => new QueueDepthGate(store, { maxQueueDepth: 0 })).toThrow(/>= 1/);
     expect(() => new QueueDepthGate(store, { maxQueueDepth: { q: -1 } })).toThrow(/>= 1/);
-  });
-});
-
-describe("maxInFlightBytes", () => {
-  it("holds back claims on resident bytes, not just task count", async () => {
-    // Four tasks, each ~64KB, against a budget of 100KB: the byte ceiling binds
-    // before the concurrency one does, so the worker cannot run all four at once.
-    const big = "x".repeat(64 * 1024);
-    for (let i = 0; i < 4; i++) await client.submit("job", { i, big });
-
-    const worker = new Worker(new SQLiteStore(dbPath), ["default"], {
-      concurrency: 4,
-      claimBatch: 1, // one task per claim, so the budget is consulted between them
-      pollIntervalMs: 10,
-      maxInFlightBytes: 100 * 1024,
-    });
-    let peak = 0;
-    let inFlight = 0;
-    // One gate for every handler, so teardown is a single release — stop() plus
-    // run()'s finally drains whatever was still running.
-    let openGate!: () => void;
-    const gate = new Promise<void>((r) => (openGate = r));
-    worker.task("job", async () => {
-      inFlight++;
-      peak = Math.max(peak, inFlight);
-      await gate;
-      inFlight--;
-      return {};
-    });
-    const runner = worker.run();
-    try {
-      await waitFor(() => inFlight >= 1);
-      await sleep(120); // give the loop every chance to over-claim
-      // Two 64KB payloads already exceed 100KB, so the third cannot be claimed.
-      expect(peak).toBeLessThanOrEqual(2);
-      expect(peak).toBeGreaterThanOrEqual(1);
-    } finally {
-      openGate();
-      worker.stop();
-      await runner;
-      await worker.close();
-    }
-  });
-
-  it("runs a payload larger than the whole budget rather than deadlocking", async () => {
-    // The budget is spent the moment this is charged, so nothing else claims
-    // alongside it — but refusing to run it at all would stall the queue forever.
-    await client.submit("job", { big: "x".repeat(200 * 1024) });
-    const worker = new Worker(new SQLiteStore(dbPath), ["default"], {
-      concurrency: 2,
-      pollIntervalMs: 10,
-      maxInFlightBytes: 10 * 1024,
-    });
-    let ran = false;
-    worker.task("job", async () => {
-      ran = true;
-      return { ok: true };
-    });
-    const runner = worker.run();
-    try {
-      await waitFor(() => ran, 3_000);
-      expect(ran).toBe(true);
-    } finally {
-      worker.stop();
-      await runner;
-      await worker.close();
-    }
-  });
-
-  it("refunds the charge so a later task can still be claimed", async () => {
-    const big = "x".repeat(64 * 1024);
-    for (let i = 0; i < 3; i++) await client.submit("job", { i, big });
-    const worker = new Worker(new SQLiteStore(dbPath), ["default"], {
-      concurrency: 1,
-      pollIntervalMs: 10,
-      maxInFlightBytes: 80 * 1024,
-    });
-    let done = 0;
-    worker.task("job", async () => {
-      done++;
-      return {};
-    });
-    const runner = worker.run();
-    try {
-      // Without the refund the budget stays spent after the first task and the
-      // remaining two are never claimed.
-      await waitFor(() => done === 3, 5_000);
-      expect(done).toBe(3);
-    } finally {
-      worker.stop();
-      await runner;
-      await worker.close();
-    }
   });
 });

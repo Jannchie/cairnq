@@ -1,4 +1,5 @@
-import { type CairnQ, isTerminal } from "../src/index.js";
+import type { CairnQ } from "../src/index.js";
+import { isTerminal } from "../src/models.js";
 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";

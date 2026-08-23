@@ -4,7 +4,7 @@
 // real data leaks disk until someone remembers to schedule it. These pin what the
 // built-in sweep does — and, as much, what it refuses to do: purge on startup,
 // hold the write lock for a whole backlog, or outlive the store it writes to.
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { CairnQ } from "../src/index.js";
 import { RetentionSweeper } from "../src/retention.js";
@@ -15,20 +15,30 @@ import { failOne, finishOne, freshDbPath, sleep, waitFor } from "./helpers.js";
 // Both dialects: purge is the statement whose optional filters `specialize`
 // rewrites, and the two dialects reach an index by different routes — SQLite
 // needs the rewrite because it plans before the parameters have values, Postgres
-// re-plans and folds the branch itself. A tiered sweep that quietly matched
-// nothing on one of them would look exactly like a sweep with nothing to do.
+// re-plans and folds the branch itself. A sweep that quietly matched nothing on
+// one of them would look exactly like a sweep with nothing to do.
 describeBackends("retention", (backend) => {
   const client = (opts: Parameters<typeof backend.client>[0] = {}) => backend.client(opts);
 
+  // The handle's own sweeper runs on the default hourly interval, so the
+  // timer-driven cases drive a RetentionSweeper directly against the same store.
+  // What the handle adds over that is wiring, and the startup case below is
+  // where that wiring is observable.
   it("deletes terminal tasks past the cutoff, on its own", async () => {
-    const c = await client({ retention: { olderThanMs: 0, intervalMs: 20 } });
+    const c = await client();
     const done = await finishOne(c);
     const live = await c.submit("job", {});
 
-    await waitFor(async () => (await c.get(done)) === null);
-    expect(await c.get(done)).toBeNull();
-    // Only terminal rows go: the queued task is still there to be claimed.
-    expect((await c.get(live.id))?.status).toBe("queued");
+    const sweeper = new RetentionSweeper(c.store, 0, { intervalMs: 20 });
+    sweeper.start();
+    try {
+      await waitFor(async () => (await c.get(done)) === null);
+      expect(await c.get(done)).toBeNull();
+      // Only terminal rows go: the queued task is still there to be claimed.
+      expect((await c.get(live.id))?.status).toBe("queued");
+    } finally {
+      await sweeper.stop();
+    }
   });
 
   // Builds its own handle rather than taking one from the fixture: the fixture
@@ -39,44 +49,59 @@ describeBackends("retention", (backend) => {
     // connect() is optional — every operation connects lazily — so retention
     // that only ran for callers who remembered to call it would be a silent leak
     // in the feature that exists to prevent one.
-    const c = CairnQ.sqlite(freshDbPath(), { retention: { olderThanMs: 0, intervalMs: 20 } });
-    const done = await finishOne(c); // first store touch: no connect() above
-    await waitFor(async () => (await c.get(done)) === null);
-    expect(await c.get(done)).toBeNull();
+    const c = CairnQ.sqlite(freshDbPath());
+    const sweeper = new RetentionSweeper(c.store, 0, { intervalMs: 20 });
+    sweeper.start(); // sweeping a store nothing has connected yet
+    try {
+      const done = await finishOne(c);
+      await waitFor(async () => (await c.get(done)) === null);
+      expect(await c.get(done)).toBeNull();
+    } finally {
+      await sweeper.stop();
+      await c.close();
+    }
   });
 
   it("keeps tasks that have not aged out", async () => {
-    const c = await client({ retention: { olderThanMs: 3_600_000, intervalMs: 20 } });
+    const c = await client();
     const done = await finishOne(c);
-    await sleep(80);
-    expect(await c.get(done)).not.toBeNull();
+    const sweeper = new RetentionSweeper(c.store, 3_600_000, { intervalMs: 20 });
+    sweeper.start();
+    try {
+      await sleep(80);
+      expect(await c.get(done)).not.toBeNull();
+    } finally {
+      await sweeper.stop();
+    }
   });
 
   it("does not purge on startup", async () => {
     // A process that restarts often would otherwise issue a write burst on every
-    // boot — exactly when the store is busiest.
-    const c = await client({ retention: { olderThanMs: 0, intervalMs: 60_000 } });
+    // boot — exactly when the store is busiest. Through the handle, since this is
+    // the one thing the handle's own sweeper does at construction time.
+    const c = await client({ retentionMs: 0 });
     const done = await finishOne(c);
     await sleep(50);
     expect(await c.get(done)).not.toBeNull();
   });
 
-  it("drains a backlog larger than one statement", async () => {
+  it("stops without leaving a purge behind it", async () => {
     const c = await client();
-    const ids: string[] = [];
-    for (let i = 0; i < 7; i++) ids.push(await finishOne(c));
+    const done = await finishOne(c);
+    const sweeper = new RetentionSweeper(c.store, 0, { intervalMs: 10 });
+    sweeper.start();
+    await waitFor(async () => (await c.get(done)) === null);
+    // stop() awaited the sweep in flight, so nothing after this can be mid-write
+    // against a store that is already gone.
+    await sweeper.stop();
+    await c.close();
 
-    // Directly, so the assertion is about one sweep rather than about timing.
-    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
-    expect(await sweeper.sweep()).toBe(7);
-    expect((await c.list({})).length).toBe(0);
+    const reopened = await client();
+    expect(await reopened.get(done)).toBeNull();
   });
 
-  it("reports a failed sweep and keeps sweeping", async () => {
-    const errors: unknown[] = [];
-    const c = await client({
-      retention: { olderThanMs: 0, intervalMs: 20, onError: (e) => errors.push(e) },
-    });
+  it("keeps sweeping after a sweep that threw", async () => {
+    const c = await client();
     const store = c.store;
     const realPurge = store.purge.bind(store);
     let failures = 2;
@@ -86,41 +111,56 @@ describeBackends("retention", (backend) => {
     };
     const done = await finishOne(c);
 
-    // A purge that failed because the database was busy is not a reason to stop
-    // retaining, so the schedule survives it.
-    await waitFor(async () => (await c.get(done)) === null);
-    expect(await c.get(done)).toBeNull();
-    expect(errors.length).toBe(2);
-    store.purge = realPurge;
-  });
-
-  it("stops on close, without leaving a purge behind it", async () => {
-    const c = await client({ retention: { olderThanMs: 0, intervalMs: 10 } });
-    const done = await finishOne(c);
-    await waitFor(async () => (await c.get(done)) === null);
-    await c.close();
-    // close() awaited the sweep in flight, so nothing here can be mid-write
-    // against a store that is already gone.
-    const reopened = await client();
-    expect(await reopened.get(done)).toBeNull();
+    const sweeper = new RetentionSweeper(store, 0, { intervalMs: 20 });
+    sweeper.start();
+    try {
+      // A purge that failed because the database was busy is not a reason to
+      // stop retaining, so the schedule survives it.
+      await waitFor(async () => (await c.get(done)) === null);
+      expect(await c.get(done)).toBeNull();
+      expect(failures).toBeLessThan(0);
+    } finally {
+      await sweeper.stop();
+      store.purge = realPurge;
+    }
   });
 
   it("refuses a cutoff or interval that cannot mean anything", async () => {
-    await expect(client({ retention: { olderThanMs: -1 } })).rejects.toThrow(/olderThanMs/);
-    await expect(client({ retention: { olderThanMs: 0, intervalMs: 0 } })).rejects.toThrow(/intervalMs/);
+    await expect(client({ retentionMs: -1 })).rejects.toThrow(/retentionMs/);
+    const c = await client();
+    expect(() => new RetentionSweeper(c.store, 0, { intervalMs: 0 })).toThrow(/intervalMs/);
   });
+});
 
-  it("keeps each status on its own clock", async () => {
-    // Retention needs are tiered: succeeded rows are spent once consumed, failed
-    // ones are worth keeping for diagnosis. A status the map does not name is
-    // never swept — granularity is an explicit statement of what may go.
-    const c = await client({ retention: { olderThanMs: { succeeded: 0 }, intervalMs: 20 } });
-    const done = await finishOne(c);
-    const failed = await failOne(c);
+/** The sweeper's fixed rows-per-statement limit. */
+const FULL_BATCH = 1_000;
 
-    await waitFor(async () => (await c.get(done)) === null);
-    expect(await c.get(done)).toBeNull();
-    expect((await c.get(failed))?.status).toBe("failed");
+/**
+ * A store whose `purge` hands back a scripted sequence of batch sizes, then
+ * nothing.
+ *
+ * The drain loop keeps going while a batch comes back full, and "full" is now a
+ * fixed 1000 — so a real backlog spanning more than one statement would be 1001
+ * seeded rows per test. The loop reads nothing but how many ids came back, so
+ * scripting the batches exercises the same code in milliseconds.
+ */
+function scriptedStore(...sizes: number[]): TaskStore {
+  let call = 0;
+  return {
+    purge: async () => {
+      const n = sizes[call] ?? 0;
+      call++;
+      return Array.from({ length: n }, (_, i) => `t${call}-${i}`);
+    },
+  } as unknown as TaskStore;
+}
+
+// Dialect-free: every one of these is about the drain loop's own bookkeeping,
+// which never reaches SQL.
+describe("retention drains", () => {
+  it("drains a backlog larger than one statement", async () => {
+    const sweeper = new RetentionSweeper(scriptedStore(FULL_BATCH, FULL_BATCH, 7), 0);
+    expect(await sweeper.sweep()).toBe(2 * FULL_BATCH + 7);
   });
 
   it("stops promptly after an on-demand sweep, not an interval later", async () => {
@@ -129,18 +169,9 @@ describeBackends("retention", (backend) => {
     // slot with the scheduled loop's, the manual one overwrote and then cleared
     // it — stop() had nothing left to wake and close() blocked for the whole
     // interval. An hour, at the default.
-    let firstBatch = true;
-    const store = {
-      purge: async () => {
-        // A drain long enough to yield between batches: the loop only sleeps
-        // when a batch came back full.
-        const ids = firstBatch ? Array.from({ length: 1_000 }, (_, i) => String(i)) : [];
-        firstBatch = false;
-        return ids;
-      },
-    } as unknown as TaskStore;
-
-    const sweeper = new RetentionSweeper(store, { olderThanMs: 0, intervalMs: 3_600_000 });
+    const sweeper = new RetentionSweeper(scriptedStore(FULL_BATCH), 0, {
+      intervalMs: 3_600_000,
+    });
     sweeper.start();
     await sweeper.sweep();
 
@@ -149,57 +180,17 @@ describeBackends("retention", (backend) => {
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
-  it("refuses a per-status map that names nothing, or a live status", async () => {
-    await expect(client({ retention: { olderThanMs: {} } })).rejects.toThrow(/at least one rule/);
-    await expect(client({ retention: { olderThanMs: { queued: 0 } as never } })).rejects.toThrow(/terminal/);
-    await expect(client({ retention: { olderThanMs: { succeeded: -1 } } })).rejects.toThrow(/>= 0/);
-  });
-
-  it("refuses a rule array that names nothing, or a rule purge would reject", async () => {
-    await expect(client({ retention: { olderThanMs: [] } })).rejects.toThrow(/at least one rule/);
-    await expect(client({ retention: { olderThanMs: [{ status: "queued" as never, olderThanMs: 0 }] } })).rejects.toThrow(/terminal/);
-    await expect(client({ retention: { olderThanMs: [{ olderThanMs: -1 }] } })).rejects.toThrow(/>= 0/);
-  });
-
-  it("sweeps each rule on its own cutoff, so one queue's retention is not the other's", async () => {
-    const c = await client();
-    const rpc = await finishOne(c, { queue: "rpc" });
-    const job = await finishOne(c, { queue: "jobs" });
-    const broken = await failOne(c, { queue: "jobs" });
-    await sleep(10); // purge deletes strictly-older rows
-
-    const sweeper = new RetentionSweeper(c.store, {
-      // The shape the whole feature is for: one installation, two workloads —
-      // an RPC result spent on read, a job's failure kept for diagnosis.
-      olderThanMs: [
-        { queue: "rpc", olderThanMs: 0 },
-        { queue: "jobs", status: "failed", olderThanMs: 3_600_000 },
-      ],
-      intervalMs: 3_600_000,
-    });
-    expect(await sweeper.sweep()).toBe(1);
-    expect(await c.get(rpc)).toBeNull();
-    // Neither jobs row matched: the succeeded one has no rule at all, and the
-    // failed one has an hour to go.
-    expect((await c.get(job))?.status).toBe("succeeded");
-    expect((await c.get(broken))?.status).toBe("failed");
-  });
-
   it("still drains on demand after it has been stopped", async () => {
     // sweep() is documented as a direct call — "after a backfill, or from a
     // maintenance command" — and stop() used to leave it crippled. `stopping` is
     // how a sweep in flight cuts itself short, and only start() ever cleared it,
-    // so a later sweep() returned after its FIRST batch: with a backlog of 7 and
-    // a limit of 2 it deleted 2, reported success, and left 5 rows behind with
-    // no indication anything had been skipped.
-    const c = await client();
-    for (let i = 0; i < 7; i++) await finishOne(c);
-    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+    // so a later sweep() returned after its FIRST batch, reporting success and
+    // leaving the rest behind with no indication anything had been skipped.
+    const sweeper = new RetentionSweeper(scriptedStore(FULL_BATCH, 5), 0, { intervalMs: 20 });
     sweeper.start();
     await sweeper.stop();
 
-    expect(await sweeper.sweep()).toBe(7);
-    expect(await c.list()).toEqual([]);
+    expect(await sweeper.sweep()).toBe(FULL_BATCH + 5);
   });
 
   it("holds the process open for the length of an on-demand drain", async () => {
@@ -210,13 +201,10 @@ describeBackends("retention", (backend) => {
     // mid-drain, leaving the promise unsettled: a maintenance command that swept
     // two rows of seven and exited 13. Asserted through the timer's own flag,
     // since a test runner keeps the loop alive and would hide the difference.
-    const c = await client();
-    for (let i = 0; i < 7; i++) await finishOne(c);
-    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+    const sweeper = new RetentionSweeper(scriptedStore(FULL_BATCH, 2), 0);
 
     // Only the drain's own 0ms yields are watched, and only whether each of
-    // those was unref'd — other timers in flight (the store's busy retry) say
-    // nothing about this.
+    // those was unref'd — other timers in flight say nothing about this.
     const yields: { unrefd: boolean }[] = [];
     const realSetTimeout = globalThis.setTimeout;
     globalThis.setTimeout = ((fn: () => void, ms?: number) => {
@@ -233,7 +221,7 @@ describeBackends("retention", (backend) => {
       return timer;
     }) as typeof setTimeout;
     try {
-      expect(await sweeper.sweep()).toBe(7);
+      expect(await sweeper.sweep()).toBe(FULL_BATCH + 2);
     } finally {
       globalThis.setTimeout = realSetTimeout;
     }
@@ -248,9 +236,7 @@ describeBackends("retention", (backend) => {
     // handed the event loop back — starving exactly the submits and claims it is
     // there to protect. Asserted by racing the drain against a macrotask: a real
     // yield lets the timer fire somewhere in the middle.
-    const c = await client();
-    for (let i = 0; i < 7; i++) await finishOne(c);
-    const sweeper = new RetentionSweeper(c.store, { olderThanMs: 0, limit: 2 });
+    const sweeper = new RetentionSweeper(scriptedStore(FULL_BATCH, 2), 0, { intervalMs: 20 });
     sweeper.start();
     await sweeper.stop();
 

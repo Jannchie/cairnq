@@ -152,7 +152,7 @@ suite("postgres live", () => {
       const t0 = Date.now();
       const result = await worker.background(async () => {
         await sleep(300); // park the worker in its idle sleep first
-        return client.call("ping", {}, { waitTimeoutMs: 8_000, pollMs: 4_000 });
+        return client.call("ping", {}, { timeoutMs: 8_000, pollMs: 4_000 });
       });
       expect(result).toEqual({ pong: true });
       expect(Date.now() - t0).toBeLessThan(3_000);
@@ -165,7 +165,7 @@ suite("postgres live", () => {
     const worker = Worker.postgres(LIVE_DSN, { queues: ["default"], pollIntervalMs: 50 });
     worker.task("sum", async (_ctx, p) => ({ sum: p.a + p.b }));
     const result = await worker.background(() =>
-      client.call("sum", { a: 2, b: 3 }, { waitTimeoutMs: 10_000, pollMs: 50 }),
+      client.call("sum", { a: 2, b: 3 }, { timeoutMs: 10_000, pollMs: 50 }),
     );
     expect(result).toEqual({ sum: 5 });
   });
@@ -179,7 +179,6 @@ suite("postgres live", () => {
       pollIntervalMs: 50,
       concurrency: 8,
       leaseMs: 400,
-      heartbeatIntervalMs: 60,
       retryBackoffMs: 0,
     });
     const seen: number[] = [];

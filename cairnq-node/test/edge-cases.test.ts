@@ -57,7 +57,7 @@ describe("edge cases", () => {
     });
     await worker.background(async () => {
       const err = await rejection<TaskFailed>(
-        client.call(name, {}, { waitTimeoutMs: 3_000, pollMs: 20 }),
+        client.call(name, {}, { timeoutMs: 3_000, pollMs: 20 }),
       );
       expect(err).toBeInstanceOf(TaskFailed);
       expect(err.code).toBe("unserializable_result");
@@ -74,7 +74,7 @@ describe("edge cases", () => {
     });
     await worker.background(async () => {
       const err = await rejection<TaskFailed>(
-        client.call("bad-details", {}, { waitTimeoutMs: 3_000, pollMs: 20 }),
+        client.call("bad-details", {}, { timeoutMs: 3_000, pollMs: 20 }),
       );
       expect(err).toBeInstanceOf(TaskFailed);
       expect(err.message).toBe("boom");
@@ -93,7 +93,7 @@ describe("edge cases", () => {
     const worker = Worker.sqlite(dbPath, { pollIntervalMs: 20 });
     worker.task(svc.process.bind(svc));
     await worker.background(async () => {
-      await expect(client.call("process", {}, { waitTimeoutMs: 3_000, pollMs: 20 })).resolves.toEqual(
+      await expect(client.call("process", {}, { timeoutMs: 3_000, pollMs: 20 })).resolves.toEqual(
         { ok: true },
       );
     });
@@ -111,7 +111,7 @@ describe("edge cases", () => {
       return { ok: true };
     });
     await worker.background(async () => {
-      await expect(client.call("slow", {}, { waitTimeoutMs: 3_000, pollMs: 20 })).resolves.toEqual({
+      await expect(client.call("slow", {}, { timeoutMs: 3_000, pollMs: 20 })).resolves.toEqual({
         ok: true,
       });
     });
@@ -131,7 +131,7 @@ describe("edge cases", () => {
     // a silently different meaning than the number says. The others silently
     // matched nothing or purged nothing.
     await expect(client.submit("job", {}, { maxAttempts: 0 })).rejects.toThrow("maxAttempts");
-    await expect(client.submit("job", {}, { runAtDelayMs: -1 })).rejects.toThrow("runAtDelayMs");
+    await expect(client.submit("job", {}, { delayMs: -1 })).rejects.toThrow("delayMs");
     await expect(client.list({ limit: -1 })).rejects.toThrow("limit/offset");
     await expect(client.list({ offset: -1 })).rejects.toThrow("limit/offset");
     await expect(client.purge({ olderThanMs: -1 })).rejects.toThrow("olderThanMs");

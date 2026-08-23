@@ -69,7 +69,7 @@ describe("worker resilience", () => {
     worker.task("job", async () => ({ ok: true }));
 
     const result = await worker.background(() =>
-      client.call("job", {}, { waitTimeoutMs: 5_000, pollMs: 20 }),
+      client.call("job", {}, { timeoutMs: 5_000, pollMs: 20 }),
     );
     await store.close();
 
@@ -130,8 +130,8 @@ describe("worker resilience", () => {
     const worker = Worker.sqlite(dbPath, {
       queues: ["default"],
       pollIntervalMs: 20,
-      leaseMs: 5_000,
-      heartbeatIntervalMs: 30,
+      // The beat runs at lease/3, and it is the beat that notices the takeover.
+      leaseMs: 300,
     });
     let observed = false;
     let aborted = false;
@@ -202,7 +202,7 @@ describe("worker resilience", () => {
 
     await client.submit("hang", {}, { maxAttempts: 1 });
     await worker.background(async () => {
-      await expect(client.call("quick", {}, { waitTimeoutMs: 3_000, pollMs: 20 })).resolves.toEqual(
+      await expect(client.call("quick", {}, { timeoutMs: 3_000, pollMs: 20 })).resolves.toEqual(
         { ok: true },
       );
     });

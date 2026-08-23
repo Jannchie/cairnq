@@ -11,7 +11,8 @@
 
 import { beforeEach, expect, it } from "vitest";
 
-import { type CairnQ, isRunning, LostLease, TaskError } from "../src/index.js";
+import { type CairnQ, LostLease, TaskError } from "../src/index.js";
+import { isRunning } from "../src/models.js";
 import type { Task } from "../src/index.js";
 import { describeBackends } from "./backends.js";
 import { allTerminal, sleep, waitFor } from "./helpers.js";
@@ -258,15 +259,14 @@ describeBackends("batch delivery", (backend) => {
     // A handler outliving its lease must not have its tasks recovered under it —
     // and one beat has to cover the whole batch, not one task at a time.
     // Margins, not luck: the point is that ONE beat covers the whole batch, and
-    // the handler outlives its lease several times over. A loaded CI runner can
-    // delay a beat past a 200ms lease without anything being wrong with the
-    // worker, which fails this for a reason it is not testing. Longer lease, same
-    // beat-to-lease ratio, same number of lifetimes slept.
+    // the handler outlives its lease several times over. The beat runs at
+    // lease/3, so a loaded CI runner can delay one past a short lease without
+    // anything being wrong with the worker, which fails this for a reason it is
+    // not testing. A second-long lease keeps the ratio and the slack.
     const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
       leaseMs: 1_000,
-      heartbeatIntervalMs: 200,
     });
 
     worker.task("slow", { batch: 4 }, async (items) => {
@@ -286,12 +286,11 @@ describeBackends("batch delivery", (backend) => {
     // Renewing a lease on a terminal row is a write against something nobody
     // owns; the beat has to drop tasks the handler already finished.
     // Same margin reasoning as the case above: what is under test is which
-    // tasks a beat covers, not whether a beat lands inside 200ms on a busy host.
+    // tasks a beat covers, not whether a beat lands on time on a busy host.
     const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
       leaseMs: 1_000,
-      heartbeatIntervalMs: 200,
     });
 
     worker.task("half", { batch: 4 }, async (items) => {
@@ -395,46 +394,6 @@ describeBackends("batch delivery", (backend) => {
     expect([...tasks.values()].map((t) => t.status)).toEqual(Array(8).fill("succeeded"));
   });
 
-  it("caps calls per name with a per-name concurrency", async () => {
-    // The worker budget allows 6 calls; `embed` may only ever run 2 of them, so
-    // one expensive name cannot take the whole worker.
-    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 6 });
-    let live = 0;
-    let peak = 0;
-
-    worker.task("embed", { batch: 2, concurrency: 2 }, async () => {
-      live++;
-      peak = Math.max(peak, live);
-      await sleep(30);
-      live--;
-    });
-
-    const ids = await submitMany("embed", 20, () => ({}));
-    const tasks = await drain(ids, worker);
-
-    expect(peak).toBeLessThanOrEqual(2);
-    expect([...tasks.values()].map((t) => t.status)).toEqual(Array(20).fill("succeeded"));
-  });
-
-  it("applies a per-name concurrency without batching", async () => {
-    const worker = backend.worker({ pollIntervalMs: 20, concurrency: 8 });
-    let live = 0;
-    let peak = 0;
-
-    worker.task("slow", { concurrency: 1 }, async () => {
-      live++;
-      peak = Math.max(peak, live);
-      await sleep(20);
-      live--;
-    });
-
-    const ids = await submitMany("slow", 10, () => ({}));
-    const tasks = await drain(ids, worker);
-
-    expect(peak).toBe(1);
-    expect([...tasks.values()].map((t) => t.status)).toEqual(Array(10).fill("succeeded"));
-  });
-
   it("does not starve a name behind another name's backlog", async () => {
     // One slot, two backlogs. The claim serves groups in the order given, so
     // without rotating that order `embed` would hold the slot until its 40 tasks
@@ -470,8 +429,7 @@ describeBackends("batch delivery", (backend) => {
     const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
-      leaseMs: 300,
-      heartbeatIntervalMs: 10,
+      leaseMs: 150,
     });
     let flagged: boolean[] | undefined;
 
@@ -494,8 +452,7 @@ describeBackends("batch delivery", (backend) => {
     // to heartbeat a terminal row every beat and flag the context on the first.
     const worker = backend.worker({
       pollIntervalMs: 20,
-      leaseMs: 300,
-      heartbeatIntervalMs: 10,
+      leaseMs: 150,
     });
     let flagged: boolean | undefined;
 
@@ -582,8 +539,7 @@ describeBackends("batch delivery", (backend) => {
     const worker = backend.worker({
       pollIntervalMs: 20,
       concurrency: 4,
-      leaseMs: 400,
-      heartbeatIntervalMs: 30,
+      leaseMs: 150,
     });
     let observed: boolean | undefined;
 

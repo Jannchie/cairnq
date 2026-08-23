@@ -1,11 +1,12 @@
 /**
  * Resources: a call ceiling several names draw from.
  *
- * `concurrency` caps one name against itself, which cannot express the
+ * The worker's own `concurrency` caps calls in total, which cannot express the
  * constraint that actually binds a worker doing heavy local work — several
  * *different* handlers contending for one scarce thing (a GPU, an index with a
- * single writer). A resource is that same ceiling with more than one name
- * drawing on it; at capacity 1 it is mutual exclusion across those names.
+ * single writer). A resource is a ceiling with more than one name drawing on
+ * it; at capacity 1 it is mutual exclusion across those names. A name that only
+ * needs to cap itself declares a resource of its own.
  *
  * The gate is at claim, not inside the handler: a semaphore around the body
  * would let the task be claimed first, so it would hold a lease, burn a
@@ -200,39 +201,30 @@ describe("resources", () => {
     expect([...tasks.values()].every((t) => t.status === "succeeded")).toBe(true);
   });
 
-  it("binds on the tighter of a name's own limit and its resource", async () => {
+  it("caps a single name against itself with a resource of its own", async () => {
+    // The migration path for a per-name limit: one name, one resource, capacity
+    // N. The worker budget allows 6 calls; `embed` may only ever run 2 of them,
+    // so one expensive name cannot take the whole worker.
     const worker = Worker.sqlite(dbPath, {
       pollIntervalMs: 20,
-      concurrency: 8,
-      resources: { gpu: 3 },
+      concurrency: 6,
+      resources: { embed: 2 },
     });
-    let renderLive = 0;
-    let renderPeak = 0;
-    let totalLive = 0;
-    let totalPeak = 0;
+    let live = 0;
+    let peak = 0;
 
-    worker.task("render", { concurrency: 1, resource: "gpu" }, async () => {
-      renderLive++;
-      renderPeak = Math.max(renderPeak, renderLive);
-      totalLive++;
-      totalPeak = Math.max(totalPeak, totalLive);
+    worker.task("embed", { batch: 2, resource: "embed" }, async () => {
+      live++;
+      peak = Math.max(peak, live);
       await sleep(30);
-      totalLive--;
-      renderLive--;
-    });
-    worker.task("compare", { resource: "gpu" }, async () => {
-      totalLive++;
-      totalPeak = Math.max(totalPeak, totalLive);
-      await sleep(30);
-      totalLive--;
+      live--;
     });
 
-    const ids = [...(await submitMany("render", 4)), ...(await submitMany("compare", 6))];
+    const ids = await submitMany("embed", 20);
     const tasks = await drain(ids, worker);
 
-    expect(renderPeak, `render caps itself at 1 but ran ${renderPeak}`).toBe(1);
-    expect(totalPeak, `gpu capacity is 3 but the peak was ${totalPeak}`).toBeLessThanOrEqual(3);
-    expect([...tasks.values()].every((t) => t.status === "succeeded")).toBe(true);
+    expect(peak, `embed is capped at 2 but ${peak} calls ran at once`).toBeLessThanOrEqual(2);
+    expect([...tasks.values()].map((t) => t.status)).toEqual(Array(20).fill("succeeded"));
   });
 
   it("gives the units back when a call fails", async () => {

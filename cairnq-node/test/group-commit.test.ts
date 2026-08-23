@@ -197,7 +197,7 @@ describe("group commit", () => {
       // read-only claim probe.
       expect(await client.get("absent")).toBeNull();
       expect(await client.list({ limit: 1 })).toEqual([]);
-      expect(await client.stats()).toBeDefined();
+      expect(await client.queueDepth("default", 5)).toBe(5);
     } finally {
       blocker.exec("ROLLBACK");
       blocker.close();

@@ -1,41 +1,57 @@
-import type { BackpressureOptions } from "./backpressure.js";
-import { type RetentionOptions, RetentionSweeper } from "./retention.js";
+import { RetentionSweeper } from "./retention.js";
 import { TaskCanceled, TaskFailed } from "./errors.js";
-import { isFailed, isSucceeded, type Task, type TaskRef, type TaskStatus } from "./models.js";
+import { isFailed, isSucceeded, type Task } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
 import type { PgExecutor } from "./store/pg-executor.js";
-import type {
-  ListInput,
-  PurgeInput,
-  SubmitInput,
-  TaskStore,
-  WatchOptions,
-  WatchSignal,
-} from "./store/base.js";
+import type { Conflict, ListInput, PurgeInput, TaskStore } from "./store/base.js";
 import { type TaskDef, taskName } from "./task.js";
 import { DEFAULT_WAIT_TIMEOUT_MS, type PollOptions, pollWait, pollWaitByKey } from "./wait.js";
 
-export type SubmitOptions = Omit<SubmitInput, "name" | "payload">;
+/** Per-task options a submit may carry. Everything else about a task — how it
+ * is delivered, retried, batched — is declared once, on the worker. */
+export interface SubmitOptions {
+  queue?: string;
+  /** Business-stable idempotency key; see `conflict` for what a duplicate means. */
+  key?: string | null;
+  conflict?: Conflict;
+  maxAttempts?: number;
+  priority?: number;
+  metadata?: unknown;
+  /** Run no earlier than this many ms from now. */
+  delayMs?: number;
+}
+
 /** The wait loop's knobs with the timeout optional (default 30s) — the public
  * face of PollOptions, whose comments document each knob. */
 export type WaitOptions = Partial<PollOptions>;
-export interface CallOptions extends SubmitOptions, Omit<WaitOptions, "timeoutMs"> {
-  waitTimeoutMs?: number;
-}
+
+/** submit + wait in one call: the submit's options and the wait's, together.
+ * `timeoutMs` bounds the wait, not the task. */
+export interface CallOptions extends SubmitOptions, WaitOptions {}
 
 /** Options this handle configures on the store it wraps, rather than the
  * store's own constructor arguments. */
-export type ClientOptions = Partial<BackpressureOptions> & {
-  /** Delete terminal tasks older than a cutoff, on a schedule, for as long as
-   * this handle is open. Off unless set — and off means rows accumulate forever,
-   * because nothing else in CairnQ removes them. */
-  retention?: RetentionOptions;
-};
+export interface ClientOptions {
+  /** Queued tasks a queue may hold before `submit` blocks — a number for every
+   * queue, or a per-queue record that leaves unnamed queues unbounded. `submit`
+   * raises QueueFull if the queue stays full for `maxQueueWaitMs`. */
+  maxQueueDepth?: number | Record<string, number>;
+  /** How long a blocked submit waits before raising QueueFull. Default 600_000. */
+  maxQueueWaitMs?: number;
+  /**
+   * Delete terminal tasks this many ms after they finished, on a schedule, for
+   * as long as this handle is open. Off unless set — and off means rows
+   * accumulate forever, because nothing else in CairnQ removes them. Tiered
+   * retention (per queue, per status) is `purge()` with filters, from your own
+   * scheduler.
+   */
+  retentionMs?: number;
+}
 
 /** API-side handle. Thin wrapper over a TaskStore + SDK-orchestrated wait/call. */
 export class CairnQ {
-  /** null unless `retention` was configured. */
+  /** null unless `retentionMs` was configured. */
   private readonly sweeper: RetentionSweeper | null;
 
   constructor(
@@ -45,14 +61,17 @@ export class CairnQ {
     // Installed on the store, not held here: every submit path goes through the
     // store, including TaskContext.submit, which this handle never sees.
     if (opts.maxQueueDepth != null) {
-      _store.useBackpressure(opts as BackpressureOptions);
+      _store.useBackpressure({
+        maxQueueDepth: opts.maxQueueDepth,
+        maxQueueWaitMs: opts.maxQueueWaitMs,
+      });
     }
     // Retention is the opposite case: it belongs to the handle, because a worker
     // sharing the store must not also be deleting rows behind the API's back.
     // Started here rather than in connect(), which is optional — every other
     // path connects lazily, and retention that silently depends on an optional
     // call is retention that silently does not happen.
-    this.sweeper = opts.retention ? new RetentionSweeper(_store, opts.retention) : null;
+    this.sweeper = opts.retentionMs != null ? new RetentionSweeper(_store, opts.retentionMs) : null;
     this.sweeper?.start();
   }
 
@@ -90,18 +109,30 @@ export class CairnQ {
 
   /** Enqueue a task. With `maxQueueDepth` configured this blocks while the
    * target queue is at its limit, and raises QueueFull if it stays there for
-   * `maxQueueWaitMs` — see QueueDepthGate for why that bound is approximate
-   * across several producers. */
+   * `maxQueueWaitMs` — a soft limit across several producers. */
   submit(name: string, payload?: unknown, opts?: SubmitOptions): Promise<Task>;
   submit<P, R>(task: TaskDef<P, R>, payload?: P, opts?: SubmitOptions): Promise<Task>;
   submit(task: string | TaskDef, payload?: unknown, opts: SubmitOptions = {}): Promise<Task> {
-    return this._store.submit({ name: taskName(task), payload, ...opts });
+    // Fields picked explicitly rather than spread, so the type is the truth:
+    // store-level SubmitInput accepts more (parentId and friends, which
+    // TaskContext.submit wires), and a spread would silently keep honoring them.
+    return this._store.submit({
+      name: taskName(task),
+      payload,
+      queue: opts.queue,
+      key: opts.key,
+      conflict: opts.conflict,
+      maxAttempts: opts.maxAttempts,
+      priority: opts.priority,
+      metadata: opts.metadata,
+      delayMs: opts.delayMs,
+    });
   }
 
   /** How many more tasks fit on `queue` under `maxDepth` — 0 once it is full.
    * The non-blocking read behind `maxQueueDepth`, for a producer that would
-   * rather shed load or pick another queue than wait. Cheaper than `stats()`:
-   * bounded at `maxDepth` index entries instead of aggregating the table. */
+   * rather shed load or pick another queue than wait. Bounded at `maxDepth`
+   * index entries, so it stays cheap to ask on every enqueue. */
   queueDepth(queue: string, maxDepth: number): Promise<number> {
     return this._store.queueDepth(queue, maxDepth);
   }
@@ -112,17 +143,6 @@ export class CairnQ {
 
   getByKey(key: string): Promise<Task | null> {
     return this._store.getByKey(key);
-  }
-
-  /** The status-only probe wait polls on: id + status, no payload. Public for
-   * the same reason it exists — a dashboard or poller that only asks "is it
-   * finished yet" should not drag the payload back per ask. */
-  getStatus(taskId: string): Promise<TaskRef | null> {
-    return this._store.getStatus(taskId);
-  }
-
-  getStatusByKey(key: string): Promise<TaskRef | null> {
-    return this._store.getStatusByKey(key);
   }
 
   list(input?: ListInput): Promise<Task[]> {
@@ -147,39 +167,14 @@ export class CairnQ {
 
   /** Delete terminal tasks that finished more than `olderThanMs` ago and return
    * their ids. Nothing else in CairnQ removes rows, so a long-lived database
-   * needs this on a schedule. Each call is bounded by `limit` to keep the write
-   * short; loop until it returns fewer than `limit`.
+   * needs this on a schedule — `retentionMs` is this call on a timer. Each call
+   * is bounded by `limit` to keep the write short; loop until it returns fewer
+   * than `limit`.
    *
    * `queue` / `status` / `name` narrow the sweep — one installation carrying two
    * workloads needs a retention per workload, not one for the whole database. */
   purge(input?: PurgeInput): Promise<string[]> {
     return this._store.purge(input);
-  }
-
-  /** Task counts per queue, keyed by status and zero-filled across all statuses
-   * — `(await stats()).default.queued` is the backlog of a queue. `queue` narrows
-   * the aggregate to one queue, which is also what keeps a caller from paying for
-   * the other workloads sharing the installation; a named queue is always
-   * present, zero-filled if it has no rows.
-   *
-   * This counts rows, so it costs what it counts — use it for a dashboard, and
-   * poll `queueDepth()` instead, which is bounded. */
-  stats(queue?: string): Promise<Record<string, Record<TaskStatus, number>>> {
-    return this._store.stats(queue);
-  }
-
-  /**
-   * Call `onSignal` when the tasks on `queues` may have changed. Returns an
-   * unsubscribe.
-   *
-   * Notify-accelerated polling, not an event log: a signal means "re-read now",
-   * and `stats()` / `list()` / `get()` are where the truth is. On Postgres an
-   * idle watch costs nothing and signals land in milliseconds; everywhere else
-   * the timer alone still delivers, so the same consumer code is correct either
-   * way. See TaskStore.watch for the full contract.
-   */
-  watch(opts: WatchOptions, onSignal: (signal: WatchSignal) => void): () => void {
-    return this._store.watch(opts, onSignal);
   }
 
   /** Wait for a task to finish. Resolves with the terminal Task (any status);
@@ -210,15 +205,15 @@ export class CairnQ {
    * TaskFailed / TaskCanceled / TaskTimeout otherwise. Pass a TaskDef and the
    * resolved value is typed as its Result.
    *
-   * `waitTimeoutMs` bounds the wait, not the task: on timeout the task runs on,
+   * `timeoutMs` bounds the wait, not the task: on timeout the task runs on,
    * and `wait(err.taskId)` — or `waitByKey`, from a process that only has the
    * key — resumes the wait rather than starting the work over. */
   async call(name: string, payload?: unknown, opts?: CallOptions): Promise<unknown>;
   async call<P, R>(task: TaskDef<P, R>, payload?: P, opts?: CallOptions): Promise<R>;
   async call(task: string | TaskDef, payload?: unknown, opts: CallOptions = {}): Promise<unknown> {
-    const { waitTimeoutMs, pollMs, maxPollMs, ...submit } = opts;
+    const { timeoutMs, pollMs, maxPollMs, ...submit } = opts;
     const created = await this.submit(taskName(task), payload, submit);
-    const final = await this.wait(created.id, { timeoutMs: waitTimeoutMs, pollMs, maxPollMs });
+    const final = await this.wait(created.id, { timeoutMs, pollMs, maxPollMs });
     if (isSucceeded(final)) return final.result;
     if (isFailed(final)) throw new TaskFailed(final.error);
     throw new TaskCanceled(final.id);

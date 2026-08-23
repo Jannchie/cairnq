@@ -180,7 +180,8 @@ export interface SubmitInput {
   parentId?: string | null;
   rootId?: string | null;
   correlationId?: string | null;
-  runAtDelayMs?: number;
+  /** Run no earlier than this many ms from now. */
+  delayMs?: number;
 }
 
 export interface ListInput {
@@ -334,35 +335,6 @@ export function statementParams(sql: string): readonly string[] {
  * them in one place is what stops SQLite and Postgres from drifting apart in
  * behavior; the shared SQL already stops them from drifting in wording.
  */
-/**
- * Why `watch` is calling back.
- *
- * `queued` / `done` come from the store's push channel and name what moved;
- * `poll` is the timer saying the watch cannot rule out a change. None of them
- * carries state — the row is the truth.
- */
-export interface WatchSignal {
-  reason: "queued" | "done" | "poll";
-  /** The queue a task was queued on. Only on `queued`. */
-  queue?: string;
-  /** The task that reached a terminal status. Only on `done`. */
-  taskId?: string;
-}
-
-export interface WatchOptions {
-  /** Restrict `queued` signals to these queues. Unset watches every queue. */
-  queues?: string[];
-  /**
-   * How often to signal in the absence of a push channel — and, where there is
-   * one, how long a dropped listener can go unnoticed. The default trades a
-   * dashboard's idle query rate against how stale it may look.
-   */
-  pollMs?: number;
-}
-
-/** See WatchOptions.pollMs. */
-export const DEFAULT_WATCH_POLL_MS = 2_000;
-
 export abstract class TaskStore {
   /** Set by useBackpressure; null means submit is ungated. */
   private gate: QueueDepthGate | null = null;
@@ -401,26 +373,11 @@ export abstract class TaskStore {
   protected txWithSession?<T>(fn: (fetch: Fetch, session: unknown) => Promise<T>): Promise<T>;
 
   /**
-   * Register for this store's push channel, if it has one; returns an
-   * unsubscribe. A store without a push channel does not implement this, and
-   * `watch` degrades to its timer alone.
-   */
-  protected subscribePush?(onSignal: (signal: WatchSignal) => void): () => void;
-
-  /**
    * Tell a store with a push channel which queues this process will wait on, so
    * it can buffer their notifications and ignore everyone else's. Optional: a
    * store without a push channel has nothing to buffer.
    */
   protected registerWakeable?(queues: string[]): void;
-
-  /**
-   * Nudge the push channel back up if it has dropped. Called from `watch`'s
-   * timer, which is the only thing keeping a client-side subscriber alive: a
-   * process that never claims never calls claimWake, so without this a listener
-   * that died once would never come back there.
-   */
-  protected warmPush?(): void;
 
   /**
    * Whether it is worth opening the claim transaction at all — the read-only
@@ -526,7 +483,7 @@ export abstract class TaskStore {
       metadata: dumpJson(input.metadata ?? {}),
       max_attempts: input.maxAttempts ?? 3,
       priority: input.priority ?? 0,
-      delay_ms: input.runAtDelayMs ?? 0,
+      delay_ms: input.delayMs ?? 0,
       parent_id: input.parentId ?? null,
       root_id: input.rootId ?? id,
       correlation_id: input.correlationId ?? null,
@@ -545,8 +502,8 @@ export abstract class TaskStore {
     if (input.maxAttempts != null && input.maxAttempts < 1) {
       throw new Error(`maxAttempts must be >= 1, got ${input.maxAttempts}`);
     }
-    if (input.runAtDelayMs != null && input.runAtDelayMs < 0) {
-      throw new Error(`runAtDelayMs must be >= 0, got ${input.runAtDelayMs}`);
+    if (input.delayMs != null && input.delayMs < 0) {
+      throw new Error(`delayMs must be >= 0, got ${input.delayMs}`);
     }
     // After validation and before the first write: bad arguments should fail
     // now, not after waiting out a full queue. Reads the resolved queue, so the
@@ -681,103 +638,11 @@ export abstract class TaskStore {
   }
 
   /**
-   * Task counts per queue, keyed by status and zero-filled across all statuses —
-   * `(await stats()).default.queued` is the backlog of a queue. A queue appears
-   * only while it has rows; terminal tasks keep counting until `purge` removes
-   * them.
-   *
-   * `queue` restricts the aggregate to one queue, which is also what stops the
-   * caller paying for every other queue's rows: one installation carrying two
-   * workloads is the coordination this project recommends, and the unfiltered
-   * form reads the whole table. A named queue is always present in the result,
-   * zero-filled if it has no rows at all — asking about a specific queue and
-   * getting `undefined` back would make every caller write the same fallback.
-   *
-   * Filtered or not, this COUNTS, so it costs what it counts: a whole queue,
-   * terminal rows included. Right for a dashboard, wrong on an interval — poll
-   * `queueDepth`, which is bounded, and keep this for when the real numbers are
-   * the point.
-   */
-  async stats(queue?: string): Promise<Record<string, Record<TaskStatus, number>>> {
-    const zeros = (): Record<TaskStatus, number> =>
-      Object.fromEntries(STATUSES.map((s) => [s, 0])) as Record<TaskStatus, number>;
-    const out: Record<string, Record<TaskStatus, number>> = {};
-    // Seed before the query, not after: a named queue with no rows returns no
-    // rows to seed from, and that is exactly the case the promise is about.
-    if (queue != null) out[queue] = zeros();
-    for (const row of await this.fetch("stats", { queue: queue ?? null })) {
-      const per = (out[row.queue] ??= zeros());
-      per[row.status as TaskStatus] = Number(row.count);
-    }
-    return out;
-  }
-
-  /**
-   * Call `onSignal` when the tasks on `queues` may have changed — something was
-   * queued, or something finished.
-   *
-   * This is notify-ACCELERATED POLLING, not an event log, and the difference is
-   * the whole contract. Where a push channel is available (Postgres LISTEN) an
-   * idle watch costs nothing and a signal arrives within milliseconds of the
-   * event. Where it is not — a transaction-mode pooler refuses LISTEN, SQLite has
-   * no channel at all — the timer alone still delivers `poll` signals, so a
-   * consumer that re-reads on every signal is correct in both cases and merely
-   * less prompt in one.
-   *
-   * What it will NOT do is promise that a signal means something happened, or
-   * that every event produces its own signal. Treat a signal as "re-read now"
-   * and take the truth from `stats()` / `list()` / `get()`, which is where it
-   * lives. `reason` is a hint for reading less: a `done` signal names the task,
-   * so a dashboard can refresh that row instead of the list.
-   *
-   * Returns an unsubscribe. The timer is unref'd — watching does not hold a
-   * process open.
-   */
-  watch(opts: WatchOptions, onSignal: (signal: WatchSignal) => void): () => void {
-    const pollMs = Math.max(1, opts.pollMs ?? DEFAULT_WATCH_POLL_MS);
-    const queues = opts.queues ?? null;
-    let live = true;
-    const emit = (signal: WatchSignal): void => {
-      // A signal delivered after unsubscribe would have the consumer re-reading
-      // a store it has stopped caring about, possibly a closed one.
-      if (live) onSignal(signal);
-    };
-    const unsubscribe = this.subscribePush?.((signal) => {
-      // A queued signal names its queue, so a watch scoped to some queues can
-      // drop the rest. A done signal names only the task — which queue it was on
-      // is not in the notification, so it is never filtered out.
-      if (signal.reason === "queued" && queues && signal.queue && !queues.includes(signal.queue)) {
-        return;
-      }
-      emit(signal);
-    });
-    const timer = setInterval(() => {
-      this.warmPush?.();
-      // Guarded for the same reason PostgresStore guards its push fan-out: a
-      // consumer that throws must not take the timer down with it. Losing the
-      // timer would silently retire the fallback that makes watch correct
-      // where there is no push channel at all.
-      try {
-        emit({ reason: "poll" });
-      } catch {
-        // The consumer's problem, not the watch's.
-      }
-    }, pollMs);
-    timer.unref?.();
-    return () => {
-      live = false;
-      unsubscribe?.();
-      clearInterval(timer);
-    };
-  }
-
-  /**
    * How many more tasks fit on `queue` under `maxDepth` — 0 once it is full.
    *
-   * The cheap half of backpressure: bounded at `maxDepth` index entries, unlike
-   * `stats()`, which aggregates the whole table (terminal rows included) and so
-   * costs more the longer a database has been running. Use it directly to shed
-   * load or shape a producer; `QueueDepthGate` builds the blocking form on top.
+   * The cheap half of backpressure: bounded at `maxDepth` index entries, so it
+   * stays cheap to ask on every enqueue. Use it directly to shed load or shape
+   * a producer; `QueueDepthGate` builds the blocking form on top.
    */
   async queueDepth(queue: string, maxDepth: number): Promise<number> {
     if (!Number.isInteger(maxDepth) || maxDepth < 0) {

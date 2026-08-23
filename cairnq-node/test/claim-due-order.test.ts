@@ -65,7 +65,7 @@ describe("claim order follows run_at_ms", () => {
         limit: 5,
       });
       expect(claimed.map((t) => t.id)).toEqual(["due"]);
-      expect((await client.stats()).default.queued).toBe(1);
+      expect((await client.get("not_due"))!.status).toBe("queued");
     } finally {
       await client.close();
     }

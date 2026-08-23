@@ -7,10 +7,6 @@ import Database from "better-sqlite3";
 import {
   CairnQ,
   defineTask,
-  isFailed,
-  isQueued,
-  isSucceeded,
-  isTerminal,
   LostLease,
   ProtocolVersionMismatch,
   TaskError,
@@ -34,15 +30,9 @@ afterEach(async () => {
 });
 
 describe("client/worker", () => {
-  it("stats is {} on an empty database", async () => {
-    // No rows, no queues — {} rather than a zero-filled "default" that would
-    // imply the store knows which queues exist before anything is submitted.
-    expect(await client.stats()).toEqual({});
-  });
-
   it("call times out and leaves the task running", async () => {
     const err = await client
-      .call("unhandled", {}, { waitTimeoutMs: 300, pollMs: 50 })
+      .call("unhandled", {}, { timeoutMs: 300, pollMs: 50 })
       .catch((e: unknown) => e as TaskTimeout);
     expect(err).toBeInstanceOf(TaskTimeout);
     // The message diagnoses the classic first-run failure, and the last observed
@@ -63,7 +53,7 @@ describe("client/worker", () => {
       return { sum: payload.a + payload.b };
     });
     const result = await worker.background(
-      () => client.call("sum", { a: 2, b: 3 }, { waitTimeoutMs: 5000, pollMs: 20 }),
+      () => client.call("sum", { a: 2, b: 3 }, { timeoutMs: 5000, pollMs: 20 }),
     );
     expect(result).toEqual({ sum: 5 });
     expect(seenAttempt).toBe(1);
@@ -84,7 +74,7 @@ describe("client/worker", () => {
       return { ok: true };
     });
     const result = await worker.background(
-      () => client.call("flaky", {}, { maxAttempts: 3, waitTimeoutMs: 5000, pollMs: 20 }),
+      () => client.call("flaky", {}, { maxAttempts: 3, timeoutMs: 5000, pollMs: 20 }),
     );
     expect(result).toEqual({ ok: true });
     expect(seen).toEqual([1, 2]);
@@ -154,7 +144,7 @@ describe("client/worker", () => {
       throw new TaskError("bad input", { code: "bad_input", retryable: false });
     });
     const err = await worker
-      .background(() => client.call("bad", {}, { maxAttempts: 3, waitTimeoutMs: 3000, pollMs: 20 }))
+      .background(() => client.call("bad", {}, { maxAttempts: 3, timeoutMs: 3000, pollMs: 20 }))
       .catch((e) => e as TaskFailed);
     expect(err).toBeInstanceOf(TaskFailed);
     expect(err.code).toBe("bad_input"); // unpacked accessors, not err.error["code"]
@@ -169,25 +159,9 @@ describe("client/worker", () => {
       return { pong: true };
     });
     const result = await worker.background(() =>
-      client.call("ping", undefined, { waitTimeoutMs: 3000, pollMs: 20 }),
+      client.call("ping", undefined, { timeoutMs: 3000, pollMs: 20 }),
     );
     expect(result).toEqual({ pong: true });
-  });
-
-  it("exposes status predicates on a task", async () => {
-    const worker = Worker.sqlite(dbPath, { queues: ["default"], pollIntervalMs: 20 });
-    worker.task(async function ok(_ctx) {
-      return { done: true };
-    });
-    const t = await client.submit("ok", {});
-    expect(isQueued(t)).toBe(true);
-    expect(isTerminal(t)).toBe(false);
-    const final = await worker.background(() =>
-      client.wait(t.id, { timeoutMs: 3000, pollMs: 20 }),
-    );
-    expect(isSucceeded(final)).toBe(true);
-    expect(isTerminal(final)).toBe(true);
-    expect(isFailed(final)).toBe(false);
   });
 
   it("shares a typed task definition across worker and client", async () => {
@@ -196,7 +170,7 @@ describe("client/worker", () => {
     // payload is typed { a; b } from the def; no string repeated on either end.
     worker.task(sum, async (_ctx, payload) => ({ sum: payload.a + payload.b }));
     const result = await worker.background(() =>
-      client.call(sum, { a: 2, b: 3 }, { waitTimeoutMs: 3000, pollMs: 20 }),
+      client.call(sum, { a: 2, b: 3 }, { timeoutMs: 3000, pollMs: 20 }),
     );
     // `result` is inferred as { sum: number } via the TaskDef — this typed binding
     // would fail to compile if call() fell back to unknown.

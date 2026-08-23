@@ -30,8 +30,6 @@ export interface BackpressureOptions {
   maxQueueDepth: QueueDepthLimit;
   /** How long a blocked submit waits before raising QueueFull. Default 600_000. */
   maxQueueWaitMs?: number;
-  /** First backoff between depth probes; doubles to a 5s ceiling. Default 250. */
-  queuePollIntervalMs?: number;
 }
 
 /**
@@ -60,7 +58,6 @@ export class QueueDepthGate {
   private readonly probing = new Map<string, Promise<void>>();
   private readonly limits: QueueDepthLimit;
   private readonly maxWaitMs: number;
-  private readonly initialProbeMs: number;
 
   constructor(
     private readonly store: TaskStore,
@@ -68,7 +65,6 @@ export class QueueDepthGate {
   ) {
     this.limits = opts.maxQueueDepth;
     this.maxWaitMs = opts.maxQueueWaitMs ?? DEFAULT_MAX_WAIT_MS;
-    this.initialProbeMs = opts.queuePollIntervalMs ?? INITIAL_PROBE_INTERVAL_MS;
     if (typeof this.limits === "number") this.validate("*", this.limits);
     else for (const [q, v] of Object.entries(this.limits)) this.validate(q, v);
   }
@@ -98,7 +94,7 @@ export class QueueDepthGate {
     if (limit == null) return;
 
     const startedAt = Date.now();
-    let waitMs = this.initialProbeMs;
+    let waitMs = INITIAL_PROBE_INTERVAL_MS;
     for (;;) {
       const left = this.headroom.get(queue) ?? 0;
       if (left > 0) {

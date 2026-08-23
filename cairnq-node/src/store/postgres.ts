@@ -9,7 +9,6 @@ import {
   specialize,
   statementParams,
   TaskStore,
-  type WatchSignal,
 } from "./base.js";
 import { ListenUnavailable, type PgExecutor, type PgSession } from "./pg-executor.js";
 import { createPoolExecutor } from "./pg-pool.js";
@@ -144,9 +143,6 @@ export class PostgresStore extends TaskStore {
   private readonly wakeableQueues = new Set<string>();
   /** Wake callbacks by key: "queued" (broadcast) or "done:<task id>". */
   private readonly waiters = new Map<string, Set<() => void>>();
-  /** watch() subscribers. Separate from `waiters`: a waiter is one-shot and
-   * consumes the notification, a subscriber is standing and only observes. */
-  private readonly subscribers = new Set<(signal: WatchSignal) => void>();
 
   /**
    * `source` is either a libpq connection string — this store then owns a `pg`
@@ -377,16 +373,6 @@ export class PostgresStore extends TaskStore {
     }
   }
 
-  protected subscribePush(onSignal: (signal: WatchSignal) => void): () => void {
-    this.subscribers.add(onSignal);
-    this.listenerReady(); // an API-side watcher is often the only thing asking
-    return () => void this.subscribers.delete(onSignal);
-  }
-
-  protected warmPush(): void {
-    if (this.subscribers.size > 0) this.listenerReady();
-  }
-
   taskDoneWake(taskId: string, timeoutMs: number): Promise<void> {
     if (!this.listenerReady()) return super.taskDoneWake(taskId, timeoutMs);
     return this.wakeOn(`done:${taskId}`, timeoutMs);
@@ -475,29 +461,14 @@ export class PostgresStore extends TaskStore {
       // Buffered only for a queue someone waits on — see wakeableQueues.
       if (this.wakeableQueues.has(payload)) this.pendingQueues.add(payload);
       key = "queued";
-      this.publish({ reason: "queued", queue: payload });
     } else if (channel === DONE_CHANNEL && payload) {
       key = `done:${payload}`;
-      this.publish({ reason: "done", taskId: payload });
     } else {
       return;
     }
     const set = this.waiters.get(key);
     // A waiter only deletes itself, which Set iteration tolerates — no copy.
     if (set) for (const w of set) w();
-  }
-
-  /** Hand a notification to every watch() subscriber. A throwing subscriber is
-   * its own problem: it must not cost the others their signal, nor take down the
-   * listener connection that delivered it. */
-  private publish(signal: WatchSignal): void {
-    for (const s of [...this.subscribers]) {
-      try {
-        s(signal);
-      } catch {
-        // Deliberately swallowed — see above.
-      }
-    }
   }
 
   private dropListener(): void {

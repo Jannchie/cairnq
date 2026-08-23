@@ -87,7 +87,12 @@ export class Runner {
     const s = this.store;
     switch (op) {
       case "submit":
-        return c.submit(a.name, a.payload ?? {}, {
+        // Through the store rather than the client: scenarios set
+        // correlation_id, which the public SubmitOptions no longer carries —
+        // there it is wired by ctx.submit, from the parent task.
+        return s.submit({
+          name: a.name,
+          payload: a.payload ?? {},
           key: a.key,
           queue: a.queue,
           conflict: a.conflict,
@@ -95,16 +100,16 @@ export class Runner {
           priority: a.priority,
           metadata: a.metadata,
           correlationId: a.correlation_id,
-          runAtDelayMs: a.run_at_delay_ms,
+          delayMs: a.run_at_delay_ms,
         });
       case "get":
         return c.get(a.id);
       case "get_by_key":
         return c.getByKey(a.key);
       case "get_status":
-        return c.getStatus(a.id);
+        return s.getStatus(a.id);
       case "get_status_by_key":
-        return c.getStatusByKey(a.key);
+        return s.getStatusByKey(a.key);
       case "list":
         return c.list({
           status: a.status,
@@ -176,8 +181,6 @@ export class Runner {
           name: a.name,
           limit: a.limit,
         });
-      case "stats":
-        return c.stats(a.queue);
       case "queue_depth":
         return c.queueDepth(a.queue, a.max_depth);
       case "sleep":

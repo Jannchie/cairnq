@@ -43,7 +43,7 @@ async function callLatencies(tasks: CairnQ, callOpts: { pollMs?: number } = {}) 
   const lat: number[] = [];
   for (let i = 0; i < N_CALL; i++) {
     const t0 = performance.now();
-    await tasks.call(noop, {}, { waitTimeoutMs: 15_000, ...callOpts });
+    await tasks.call(noop, {}, { timeoutMs: 15_000, ...callOpts });
     lat.push(performance.now() - t0);
   }
   return lat.sort((a, b) => a - b);

@@ -1,6 +1,6 @@
 // Picking a wait back up after it timed out.
 //
-// `waitTimeoutMs` bounds the wait, not the task — the task runs on. Getting at
+// `timeoutMs` bounds the wait, not the task — the task runs on. Getting at
 // that result afterwards used to mean submitting again under the key and hoping
 // the conflict strategy handed the finished task back, which is a re-submit
 // dressed as a read. `wait(err.taskId)` and `waitByKey(key)` make it a read.
@@ -33,7 +33,7 @@ describeBackends("waiting again after a timeout", (backend) => {
 
   it("re-attaches by id, without re-running the task", async () => {
     const err = await client
-      .call("job", {}, { key: "A", waitTimeoutMs: 50 })
+      .call("job", {}, { key: "A", timeoutMs: 50 })
       .then(() => null)
       .catch((e) => e);
     expect(err).toBeInstanceOf(TaskTimeout);

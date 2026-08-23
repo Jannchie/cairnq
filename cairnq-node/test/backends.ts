@@ -18,12 +18,10 @@
  * conversion left half-done. A suite earns a Postgres arm only if it has dialect
  * exposure nothing else covers, and most do not: `resources` and `wait-backoff`
  * are worker-side accounting that never reaches SQL; `retry-backoff` is mostly
- * the jitter maths; the claim order, `queue_depth` and `stats` statements have
- * conformance scenarios that already run on both dialects; lease recovery on the
- * DB clock is in postgres.live; and `watch` exercises the LISTEN state machine
- * through a stub — which is the point, since a stub can drop the connection and
- * a real server cannot — with real NOTIFY delivery covered by postgres.live too.
- * Adding arms there would buy runtime, not coverage.
+ * the jitter maths; the claim order and the `queue_depth` statement have
+ * conformance scenarios that already run on both dialects; and lease recovery on
+ * the DB clock, like real NOTIFY delivery, is in postgres.live. Adding arms
+ * there would buy runtime, not coverage.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe } from "vitest";
 import pg from "pg";
@@ -61,7 +59,7 @@ function dbNameFor(title: string): string {
  * truncate deleting another file's rows mid-test. A database of its own also
  * keeps NOTIFY out of it: channel names are database-scoped (see PROTOCOL.md
  * "Push wakeups"), so suites sharing one database would wake each other's
- * workers and a watch test could not tell a real signal from a neighbour's.
+ * workers.
  */
 class PostgresBackend implements Backend {
   readonly name = "postgres" as const;

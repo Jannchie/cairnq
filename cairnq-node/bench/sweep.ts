@@ -328,7 +328,7 @@ async function finalizeBatching(backend: Backend) {
 }
 
 // ------------------------------------------------------------------- sweep C
-// The counterpart to B, for the knob that already exists (claimBatch).
+// The counterpart to B, at the store level: how claim cost scales with limit.
 async function claimBatchSize(backend: Backend) {
   console.log(`\nC  claim batch size — moving ${N_BATCH} tasks into 'running', median of ${REPEATS}`);
   for (const limit of CLAIM_LIMITS) {
