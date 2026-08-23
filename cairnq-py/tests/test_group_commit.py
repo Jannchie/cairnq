@@ -23,7 +23,7 @@ import sqlite3
 
 import pytest
 
-from cairnq import CairnQ, LostLease, SQLiteStore
+from cairnq import CairnQ, LostLease, SQLiteStore, StoreClosed
 
 WORKER = "w1"
 
@@ -222,3 +222,63 @@ async def test_uncontended_writes_stay_one_transaction_each(db_path, n: int):
     finally:
         await client.close()
         await store.close()
+
+
+async def test_lands_the_writes_already_queued_before_closing(db_path):
+    """close() must not drop the connection while a group commit still holds
+    writes their callers are awaiting. This SDK already waited for the flusher;
+    the TypeScript twin did not, and lost the write to a TypeError about a
+    connection that had gone away. Both wait now, and both also wait out an open
+    transaction by taking the store lock."""
+    client = CairnQ.sqlite(db_path)
+    await client.connect()
+    # Scheduled without awaiting, so they are still pending when close lands.
+    in_flight = [asyncio.create_task(client.submit("a", {"i": i})) for i in range(3)]
+    await asyncio.sleep(0)
+    await client.close()
+    landed = await asyncio.gather(*in_flight)
+    assert len(landed) == 3
+
+    # Durable, not merely resolved: a fresh handle sees all three.
+    reader = CairnQ.sqlite(db_path)
+    try:
+        rows = await reader.list(name="a")
+        assert sorted(r.payload["i"] for r in rows) == [0, 1, 2]
+    finally:
+        await reader.close()
+
+
+async def test_turns_away_work_that_arrives_while_closing(db_path):
+    """The drain has to be finite: without a barrier a write landing between the
+    flusher finishing and the connection closing starts a fresh flusher against a
+    connection about to go away. Anything arriving now gets a typed StoreClosed.
+
+    Driven through the store rather than CairnQ, whose close() awaits its
+    retention sweeper first — that yields a turn, long enough for a submit issued
+    "during" close to actually arrive before it and be drained by the case
+    above. The barrier is the store's, so it is tested there."""
+    store = SQLiteStore(db_path)
+    await store.connect()
+    closing = asyncio.create_task(store.close())
+    await asyncio.sleep(0)
+    with pytest.raises(StoreClosed):
+        await store.submit(name="a", payload={})
+    await closing
+    # Closing does not retire the store: a file-backed one reopens on next use.
+    assert (await store.submit(name="a", payload={})).id
+    await store.close()
+
+
+async def test_refuses_to_reopen_an_in_memory_database_it_closed():
+    """A file store reopens onto its tasks; an in-memory one would reopen onto
+    nothing, because its contents lived in the connection. That used to succeed
+    silently — every task gone, get() answering None as if the id had never
+    existed."""
+    mem = CairnQ.sqlite(":memory:")
+    task = await mem.submit("a", {})
+    assert await mem.get(task.id) is not None
+    await mem.close()
+    with pytest.raises(StoreClosed):
+        await mem.submit("b", {})
+    with pytest.raises(StoreClosed, match="silently start"):
+        await mem.get(task.id)

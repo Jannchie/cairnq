@@ -50,6 +50,7 @@ import aiosqlite
 
 from .._ids import now_ms
 from .._sql import load_migrations, load_statements
+from ..errors import StoreClosed
 from .base import (
     COMMENT,
     Fetch,
@@ -253,6 +254,14 @@ class SQLiteStore(TaskStore):
         self._flushing = False
         # Held so the fire-and-forget flusher cannot be garbage collected mid-batch.
         self._flusher: asyncio.Task[None] | None = None
+        # Set for the duration of close(), so the drain it waits on is finite.
+        self._closing = False
+        # The close in progress, so a second caller waits for it rather than
+        # returning while the connection is still open.
+        self._closed: asyncio.Task[None] | None = None
+        # Whether a connection was ever opened — see connect() on reopening an
+        # in-memory database.
+        self._ever_opened = False
         # Bumped by close(). A connect() that started before the bump must not
         # publish what it opened: close() does not take the init lock, so an
         # in-flight connect outlives it and would otherwise install a live
@@ -263,6 +272,12 @@ class SQLiteStore(TaskStore):
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
+        # A store mid-close is about to drop the connection this would hand back.
+        # Refusing keeps close()'s drain finite, and gives the caller a typed
+        # error instead of whatever aiosqlite says about a connection pulled out
+        # from under it.
+        if self._closing:
+            raise StoreClosed
         if self._conn is not None:
             return
         async with self._init_lock:
@@ -270,6 +285,20 @@ class SQLiteStore(TaskStore):
                 return
             generation = self._generation
             memory = _is_memory(self._path)
+            # Reopening is how a store used again after close() carries on, and
+            # for a file that is exactly right — the tasks are in the file. An
+            # in-memory database lives in the connection, so the same path would
+            # hand back an EMPTY store: every task the caller submitted gone, no
+            # error, and a get() answering None as if the id had never existed.
+            # Say so instead.
+            if memory and self._ever_opened:
+                raise StoreClosed(
+                    f"in-memory database {self._path!r} was closed — its contents "
+                    f"went with the connection, so reopening would silently start "
+                    f"from empty. Use a file path if the store needs to outlive a close.",
+                    # No amount of waiting brings this database back.
+                    permanent=True,
+                )
             if not memory:
                 Path(self._path).parent.mkdir(parents=True, exist_ok=True)
             conn = await aiosqlite.connect(self._path, isolation_level=None)
@@ -314,6 +343,7 @@ class SQLiteStore(TaskStore):
                 await conn.close()
                 raise RuntimeError("store was closed while connecting")
             self._conn = conn
+            self._ever_opened = True
             check_protocol_version(await self.protocol_version())
         # Outside the init lock, and after the version check: retention is a
         # background writer, so it must not start against a store this SDK is
@@ -355,19 +385,60 @@ class SQLiteStore(TaskStore):
                 await conn.execute("COMMIT")
 
     async def close(self) -> None:
+        """Close the connection, once everything already accepted has landed.
+
+        Two things can be in flight, and cutting off either loses a write a
+        caller is still awaiting: a group commit holding a batch (_flush), and a
+        transaction with a BEGIN IMMEDIATE open on this same connection (a keyed
+        submit, a claim). The first is awaited directly; the second is waited out
+        by taking the store lock, which is what serializes them in the first
+        place.
+
+        Neither wait can be stretched indefinitely: `_closing` turns away
+        everything that arrives from now on, so the queue this drains is the one
+        that existed when close() was called.
+
+        Closing does not retire the store — connecting is lazy, so a store used
+        again afterwards reopens, and `_closing` is cleared for exactly that
+        reason. See connect() for the one database that cannot mean."""
+        # Set here rather than in _do_close: the barrier has to be up from the
+        # turn close() is first awaited, not from the turn the task it spawns
+        # gets scheduled — a write slipping into that gap is the whole point.
+        self._closing = True
+        if self._closed is None:
+            self._closed = asyncio.ensure_future(self._do_close())
+        try:
+            await asyncio.shield(self._closed)
+        finally:
+            if self._closed is not None and self._closed.done():
+                self._closed = None
+
+    async def _do_close(self) -> None:
         self._generation += 1  # disown any connect still in flight
-        # Let an in-flight group commit finish first: it is holding writes whose
-        # callers are still awaiting them, and closing the connection underneath it
-        # would turn those into connection errors for work that was about to land.
-        flusher, self._flusher = self._flusher, None
-        if flusher is not None:
-            with contextlib.suppress(BaseException):
-                await flusher
-        if self._conn is not None:
-            conn, self._conn = self._conn, None
-            await conn.close()
+        try:
+            # Let an in-flight group commit finish first: it is holding writes whose
+            # callers are still awaiting them, and closing the connection underneath it
+            # would turn those into connection errors for work that was about to land.
+            flusher, self._flusher = self._flusher, None
+            if flusher is not None:
+                with contextlib.suppress(BaseException):
+                    await flusher
+            if self._conn is not None:
+                # Behind whatever holds the lock — a transaction mid-await, a
+                # read — so no statement lands on a connection already closed.
+                async with self._lock:
+                    conn, self._conn = self._conn, None
+                    await conn.close()
+        finally:
+            self._closing = False
 
     async def _ensure(self) -> aiosqlite.Connection:
+        # Here as well as in connect(), and this is the arm that matters: during
+        # a close the connection is still live until _do_close reaches it, so a
+        # short-circuit on `_conn is not None` would hand it out and never reach
+        # connect()'s guard at all.
+        if self._closing:
+            raise StoreClosed
         if self._conn is None:
             await self.connect()
         assert self._conn is not None

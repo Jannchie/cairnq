@@ -222,12 +222,43 @@ class SchemaMismatch(CairnQError):
     """
 
 
+class StoreClosed(CairnQError):
+    """The store was closing when this operation asked for it.
+
+    ``close()`` waits for the work already accepted — a group commit still
+    holding writes whose callers are awaiting them, a transaction with a BEGIN
+    IMMEDIATE open — and turns away everything that arrives after, so that wait
+    cannot be extended indefinitely by a producer that keeps submitting. An
+    operation landing in that window gets this rather than a driver error about
+    a connection that vanished underneath it.
+
+    It does not mean the store is finished for good: connecting is lazy, so a
+    store used again after ``close()`` has returned simply reopens. The one
+    exception is an in-memory database, whose contents live in the connection —
+    reopening one would silently start from empty, so it raises this instead.
+    The TypeScript SDK raises the same named error.
+    """
+
+    def __init__(self, message: str = "store is closing", *, permanent: bool = False):
+        # Whether this store is gone for good, or merely busy closing. The two
+        # need to be told apart without matching the message, because they call
+        # for opposite handling: the barrier a close in progress raises clears as
+        # soon as that close finishes, so waiting and retrying is right; an
+        # in-memory database that has been closed is never coming back, and the
+        # same retry is an infinite loop. False is the default because that is
+        # the common case and the safer thing to get wrong.
+        super().__init__(message)
+        self.permanent = permanent
+
+
 class SerializationError(CairnQError):
     """A value could not be encoded for a protocol JSON column (non-finite
-    number, set, datetime, …). Raised at the boundary — submit raises it, and a
-    worker records a handler result that triggers it as a permanent
+    number, set, datetime, bytes, …). Raised at the boundary — submit raises it,
+    and a worker records a handler result that triggers it as a permanent
     `unserializable_result` failure. The TypeScript SDK raises the same named
-    error."""
+    error, and rejects the same classes of value (it needs an explicit
+    deny-list for the opaque built-ins this encoder already refuses; see
+    dump_json)."""
 
 
 class TaskError(CairnQError):

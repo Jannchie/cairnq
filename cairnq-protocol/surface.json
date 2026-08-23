@@ -122,6 +122,7 @@
       "STATUSES",
       "SchemaMismatch",
       "SerializationError",
+      "StoreClosed",
       "Task",
       "TaskCanceled",
       "TaskContext",

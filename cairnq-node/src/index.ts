@@ -51,5 +51,6 @@ export {
   SchemaMismatch,
   UnsupportedBackend,
   SerializationError,
+  StoreClosed,
 } from "./errors.js";
 export type { FailReason } from "./errors.js";

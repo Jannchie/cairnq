@@ -244,10 +244,44 @@ export class SchemaMismatch extends CairnQError {
   }
 }
 
+/**
+ * The store was closing when this operation asked for it.
+ *
+ * `close()` waits for the work already accepted — a group commit still holding
+ * writes, a transaction with a BEGIN IMMEDIATE open — and turns away everything
+ * that arrives after, so that wait cannot be extended indefinitely by a producer
+ * that keeps submitting. An operation that lands in that window gets this rather
+ * than a driver error about a connection that vanished underneath it.
+ *
+ * It does not mean the store is finished for good: connecting is lazy, so a
+ * store used again after `close()` has returned simply reopens. The Python SDK
+ * raises the same named error.
+ */
+export class StoreClosed extends CairnQError {
+  /**
+   * Whether this store is gone for good, or merely busy closing.
+   *
+   * The two need to be told apart without matching the message, because they
+   * call for opposite handling: the barrier a close in progress raises clears as
+   * soon as that close finishes, so waiting and retrying is right; an in-memory
+   * database that has been closed is never coming back, and the same retry is an
+   * infinite loop. False (transient) is the default because that is the common
+   * case and the safer thing to get wrong.
+   */
+  constructor(
+    message = "store is closing",
+    readonly permanent = false,
+  ) {
+    super(message);
+    this.name = "StoreClosed";
+  }
+}
+
 /** A value could not be encoded for a protocol JSON column (non-finite number,
- * BigInt, circular structure, …). Raised at the boundary — submit rejects with
- * it, and a worker records a handler result that triggers it as a permanent
- * `unserializable_result` failure. The Python SDK raises the same named error. */
+ * BigInt, circular structure, an opaque built-in like Map or Set, …). Raised at
+ * the boundary — submit rejects with it, and a worker records a handler result
+ * that triggers it as a permanent `unserializable_result` failure. The Python
+ * SDK raises the same named error. */
 export class SerializationError extends CairnQError {
   constructor(message: string) {
     super(message);

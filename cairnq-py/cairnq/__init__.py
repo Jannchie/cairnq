@@ -21,6 +21,7 @@ from .errors import (
     UnsupportedBackend,
     QueueFull,
     SerializationError,
+    StoreClosed,
     TaskCanceled,
     TaskError,
     TaskFailed,
@@ -76,4 +77,5 @@ __all__ = [
     "DEFAULT_WATCH_POLL_MS",
     "WatchSignal",
     "SerializationError",
+    "StoreClosed",
 ]

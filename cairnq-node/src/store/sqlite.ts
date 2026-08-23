@@ -7,6 +7,7 @@ import type Database from "better-sqlite3";
 
 import { nowMs } from "../ids.js";
 import { loadMigrations, loadStatements } from "../sql.js";
+import { StoreClosed } from "../errors.js";
 import {
   checkProtocolVersion,
   COMMENT,
@@ -251,8 +252,20 @@ export class SQLiteStore extends TaskStore {
   private readonly writes: Record<string, boolean>;
   /** Writes waiting to be group-committed — see flush(). */
   private pending: Pending[] = [];
-  /** Whether a flusher is already queued to drain `pending`. */
-  private flushing = false;
+  /**
+   * The flusher draining `pending`, or null when none is running — both the
+   * "is one already going" guard and the handle `close()` waits on, which are
+   * the same question. The Python twin keeps two fields only because its
+   * _do_close hands the flusher off before awaiting it.
+   */
+  private flusher: Promise<void> | null = null;
+  /** Set for the duration of close(), so the drain it waits on is finite. */
+  private closing = false;
+  /** The close in progress, so a second caller waits for it rather than
+   * returning while the connection is still open. */
+  private closed: Promise<void> | null = null;
+  /** Whether a connection was ever opened — see ensure() on in-memory reopen. */
+  private everOpened = false;
 
   constructor(
     private readonly path: string,
@@ -278,17 +291,75 @@ export class SQLiteStore extends TaskStore {
     this.ensure();
   }
 
+  /**
+   * Close the connection, once everything already accepted has landed.
+   *
+   * Two things can be in flight, and cutting off either loses a write that a
+   * caller is still awaiting: a group commit holding a batch (`flush`), and a
+   * transaction with a BEGIN IMMEDIATE open on this same connection (a keyed
+   * submit, a claim). The first is awaited directly. The second is waited out by
+   * queuing an empty operation behind it on the file lock — the lock is what
+   * serializes them in the first place, so anything already queued there runs
+   * before this does.
+   *
+   * Neither wait can be stretched indefinitely: `closing` turns away everything
+   * that arrives from now on, so the queue this drains is the one that existed
+   * when close() was called. Without that barrier a write landing between the
+   * flusher finishing and the connection closing would start a fresh flusher
+   * against a `db` already null — the TypeError that used to surface here.
+   *
+   * Closing does not retire the store. Connecting is lazy, so a store used again
+   * afterwards reopens; `closing` is cleared for exactly that reason. The one
+   * case where reopening cannot mean what the caller wants is an in-memory
+   * database, whose contents live in the connection — see ensure().
+   */
   async close(): Promise<void> {
-    if (this.db) {
-      this.db.close();
-      this.db = null;
-      this.stmts.clear();
+    return (this.closed ??= this.doClose().finally(() => {
+      this.closed = null;
+    }));
+  }
+
+  private async doClose(): Promise<void> {
+    this.closing = true;
+    try {
+      // Errors belong to the writes that carry them, and the flusher has already
+      // delivered each one to its own waiter; close() only needs it finished.
+      await this.flusher?.catch(() => {});
+      // Runs behind every operation currently on the lock, including a
+      // transaction mid-await. Reads are queued there too, so this also waits
+      // out a statement that would otherwise land on a closed connection.
+      await this.enqueue(() => {}).catch(() => {});
+      if (this.db) {
+        this.db.close();
+        this.db = null;
+        this.stmts.clear();
+      }
+    } finally {
+      this.closing = false;
     }
   }
 
   private ensure(): DB {
+    // A store mid-close is about to drop the connection this would hand back.
+    // Refusing keeps close()'s drain finite, and gives the caller a typed error
+    // instead of whatever the driver says about a connection pulled out from
+    // under it.
+    if (this.closing) throw new StoreClosed();
     if (this.db) return this.db;
     const memory = isMemory(this.path);
+    // Reopening is how a store used again after close() carries on, and for a
+    // file that is exactly right — the tasks are in the file. An in-memory
+    // database lives in the connection, so the same path would hand back an
+    // EMPTY store: every task the caller submitted gone, no error, and a `get`
+    // that answers null as if the id had never existed. Say so instead.
+    if (memory && this.everOpened) {
+      throw new StoreClosed(
+        `in-memory database ${JSON.stringify(this.path)} was closed — its contents ` +
+          `went with the connection, so reopening would silently start from empty. ` +
+          `Use a file path if the store needs to outlive a close.`,
+        true, // permanent: no amount of waiting brings this database back
+      );
+    }
     if (!memory) mkdirSync(dirname(this.path), { recursive: true });
     const db = new (loadSqlite())(this.path);
     // Only the synchronous part of the open path gets a real busy_timeout: the WAL
@@ -318,6 +389,7 @@ export class SQLiteStore extends TaskStore {
       this.stmts.set(sql, db.prepare(sql));
     }
     this.db = db;
+    this.everOpened = true;
     checkProtocolVersion(this.readProtocolVersion());
     return db;
   }
@@ -594,29 +666,32 @@ export class SQLiteStore extends TaskStore {
    * and one that arrives after sees the flag down and starts a new flusher.
    */
   private scheduleFlush(db: DB): void {
-    if (this.flushing) return;
-    this.flushing = true;
-    void (async () => {
+    if (this.flusher) return;
+    // Assigned before the `.finally` can possibly run — a finally callback is a
+    // microtask at the earliest — so the field is never cleared before it is
+    // set, however little `drain` does before returning.
+    this.flusher = this.drain(db).finally(() => {
+      this.flusher = null;
+    });
+  }
+
+  /** The flusher's body; see scheduleFlush for why it is a separate method. */
+  private async drain(db: DB): Promise<void> {
+    while (this.pending.length) {
       try {
-        while (this.pending.length) {
-          try {
-            await this.withLock(() => this.flush(db));
-          } catch (err) {
-            // flush only throws on a lost write lock, and only after putting its
-            // batch back — so reaching here means withLock spent the whole budget
-            // and those writes are still queued with nobody else coming for them.
-            // Anything that arrived behind them is failed with the same error
-            // rather than left hanging: this store cannot write at all right now,
-            // which is what a lone write would have been told too.
-            const stranded = this.pending;
-            this.pending = [];
-            for (const w of stranded) w.reject(err);
-          }
-        }
-      } finally {
-        this.flushing = false;
+        await this.withLock(() => this.flush(db));
+      } catch (err) {
+        // flush only throws on a lost write lock, and only after putting its
+        // batch back — so reaching here means withLock spent the whole budget
+        // and those writes are still queued with nobody else coming for them.
+        // Anything that arrived behind them is failed with the same error
+        // rather than left hanging: this store cannot write at all right now,
+        // which is what a lone write would have been told too.
+        const stranded = this.pending;
+        this.pending = [];
+        for (const w of stranded) w.reject(err);
       }
-    })();
+    }
   }
 
   protected async fetch(name: string, params: Params): Promise<any[]> {

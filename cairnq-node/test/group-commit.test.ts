@@ -16,7 +16,7 @@ import { describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { statSync } from "node:fs";
 
-import { CairnQ, SQLiteStore } from "../src/index.js";
+import { CairnQ, SQLiteStore, StoreClosed } from "../src/index.js";
 import { freshDbPath } from "./helpers.js";
 
 const WORKER = "w1";
@@ -203,5 +203,74 @@ describe("group commit", () => {
       blocker.close();
       await client.close();
     }
+  });
+
+  it("lands the writes already queued before closing the connection", async () => {
+    // close() used to drop the connection while a group commit still held
+    // writes their callers were awaiting: the flusher's next prepare ran against
+    // a null `db` and the submit rejected with a TypeError about
+    // `Cannot read properties of null`, losing a write that had been accepted.
+    // It now waits for the flusher — as the Python twin already did.
+    const path = freshDbPath();
+    const client = CairnQ.sqlite(path);
+    await client.connect();
+    // Issued without awaiting, so they are still in `pending` when close lands.
+    const inFlight = [
+      client.submit("a", { i: 0 }),
+      client.submit("a", { i: 1 }),
+      client.submit("a", { i: 2 }),
+    ];
+    await client.close();
+    const landed = await Promise.all(inFlight);
+    expect(landed).toHaveLength(3);
+
+    // And they are durable, not merely resolved: a fresh handle sees all three.
+    const reader = CairnQ.sqlite(path);
+    try {
+      const rows = await reader.list({ name: "a" });
+      expect(rows.map((r) => (r.payload as { i: number }).i).sort()).toEqual([0, 1, 2]);
+    } finally {
+      await reader.close();
+    }
+  });
+
+  it("turns away work that arrives while it is closing", async () => {
+    // The drain has to be finite: without a barrier a write landing between the
+    // flusher finishing and the connection closing starts a fresh flusher
+    // against a connection about to go away. Anything arriving now gets a typed
+    // StoreClosed instead.
+    // Driven through the store rather than CairnQ: the handle awaits its
+    // retention sweeper first, which yields a turn — long enough for a submit
+    // issued "during" close to actually arrive before it, and be drained by the
+    // case above. The barrier is the store's, so test it there.
+    const store = new SQLiteStore(freshDbPath());
+    await store.connect();
+    const closing = store.close();
+    await expect(store.submit({ name: "a", payload: {} })).rejects.toThrow(StoreClosed);
+    await closing;
+    // Closing does not retire the store: a file-backed one reopens on next use.
+    const t = await store.submit({ name: "a", payload: {} });
+    expect(t.id).toBeTruthy();
+    await store.close();
+  });
+
+  it("refuses to reopen an in-memory database it already closed", async () => {
+    // A file store reopens onto its tasks; an in-memory one would reopen onto
+    // nothing, because its contents lived in the connection. That used to
+    // succeed silently — every task gone, get() answering null as if the id had
+    // never existed.
+    const mem = CairnQ.sqlite(":memory:");
+    const t = await mem.submit("a", {});
+    expect(await mem.get(t.id)).not.toBeNull();
+    await mem.close();
+    const err = await mem.submit("b", {}).then(
+      () => null,
+      (e: unknown) => e as StoreClosed,
+    );
+    expect(err).toBeInstanceOf(StoreClosed);
+    // Permanent, unlike the barrier a close in progress raises: no amount of
+    // waiting brings an in-memory database back, so a caller that retries on
+    // StoreClosed has to be able to tell the two apart without matching prose.
+    expect(err?.permanent).toBe(true);
   });
 });
