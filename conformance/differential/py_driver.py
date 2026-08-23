@@ -9,7 +9,7 @@ workload, not from the random ULIDs. See dump.mjs."""
 import asyncio
 import sys
 
-from cairnq import CairnQ, Retention, RetentionSweeper, Worker
+from cairnq import CairnQ, Worker
 
 async def background_failure_is_reported(db: str) -> None:
     """A worker that cannot start, and whether the SDK says so.

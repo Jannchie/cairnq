@@ -13,7 +13,7 @@ async def main() -> None:
     await tasks.connect()
     try:
         result = await tasks.call(
-            name, json.loads(payload_json), wait_timeout_ms=15_000, poll_ms=50
+            name, json.loads(payload_json), timeout_ms=15_000, poll_ms=50
         )
         print("RESULT " + json.dumps(result), flush=True)
     finally:

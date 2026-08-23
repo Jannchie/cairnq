@@ -6,7 +6,7 @@ const tasks = CairnQ.sqlite(db);
 await tasks.connect();
 try {
   const result = await tasks.call(name, JSON.parse(payloadJson), {
-    waitTimeoutMs: 15_000,
+    timeoutMs: 15_000,
     pollMs: 50,
   });
   console.log("RESULT " + JSON.stringify(result));
