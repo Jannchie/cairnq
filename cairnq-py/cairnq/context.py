@@ -129,17 +129,25 @@ class TaskContext:
         if cancel_requested:
             self._cancel_seen = True
 
+    def _require_lease(self) -> None:
+        """The half of the gate that asks only "is this attempt still mine?".
+
+        Checked locally, not just via the store's ownership check — after an
+        abandoned (timed-out) attempt the same worker may re-claim this task
+        under the same worker_id, and a zombie handler's write would then pass
+        ownership against the NEW attempt.
+
+        `_owned` layers the settled check on top for writes to this task;
+        `submit` takes this half alone, because a handler may legitimately settle
+        a task and then fan out from it."""
+        if self._lease_lost.is_set():
+            raise LostLease(self._task.id)
+
     async def _owned(self, write: Callable[[], Awaitable[Task]]) -> Task:
         # One gate for every write through this context, so "may I still write?"
         # is answered in one place rather than at each call site.
         #
-        # Lease lost: nothing this context writes may be recorded any more.
-        # Checked locally, not just via the store's ownership check — after an
-        # abandoned (timed-out) attempt the same worker may re-claim this task
-        # under the same worker_id, and a zombie handler's write would then pass
-        # ownership against the NEW attempt.
-        if self._lease_lost.is_set():
-            raise LostLease(self._task.id)
+        self._require_lease()
         # Settled: the task is terminal, so the statement would match no row and
         # come back as a lost lease — telling the handler "another worker took
         # this" when the truth is "you already finished it", and flipping
@@ -275,7 +283,15 @@ class TaskContext:
         self, name: str | TaskDef[Any, Any], payload: dict[str, Any] | None = None, **kwargs: Any
     ) -> Task:
         """Submit a child task. parent/root/correlation are wired automatically
-        so the whole chain is queryable via list(root_id=...)."""
+        so the whole chain is queryable via list(root_id=...).
+
+        Refused once the lease is gone. Not the full `_owned` gate — a handler
+        may legitimately settle a task and then fan out from it, so `settled` is
+        no bar — but a context whose lease was lost is an attempt that has been
+        abandoned: it is being retried elsewhere, and every child it creates now
+        will be created again by that retry. Creating work is the one side effect
+        cairnq can actually stop a zombie handler from repeating."""
+        self._require_lease()
         return await self._store.submit(
             name=task_name(name),
             payload=payload,

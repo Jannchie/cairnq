@@ -126,16 +126,27 @@ export class TaskContext {
     if (cancelRequested) this.cancelSeen = true;
   }
 
+  /**
+   * The half of the gate that asks only "is this attempt still mine?".
+   *
+   * Checked locally, not just via the store's ownership check — after an
+   * abandoned (timed-out) attempt the same worker may re-claim this task under
+   * the same workerId, and a zombie handler's write would then pass ownership
+   * against the NEW attempt.
+   *
+   * `owned` layers the settled check on top for writes to this task; `submit`
+   * takes this half alone, because a handler may legitimately settle a task and
+   * then fan out from it.
+   */
+  private requireLease(): void {
+    if (this.leaseLost) throw new LostLease(this.task.id);
+  }
+
   private async owned(write: () => Promise<Task>): Promise<Task> {
     // One gate for every write through this context, so "may I still write?" is
     // answered in one place rather than at each call site.
     //
-    // Lease lost: nothing this context writes may be recorded any more. Checked
-    // locally, not just via the store's ownership check — after an abandoned
-    // (timed-out) attempt the same worker may re-claim this task under the same
-    // workerId, and a zombie handler's write would then pass ownership against
-    // the NEW attempt.
-    if (this.leaseLost) throw new LostLease(this.task.id);
+    this.requireLease();
     // Settled: the task is terminal, so the statement would match no row and come
     // back as a lost lease — telling the handler "another worker took this" when
     // the truth is "you already finished it", and flipping lostLease on the way.
@@ -267,10 +278,20 @@ export class TaskContext {
     return task;
   }
 
-  /** Submit a child task; parent/root/correlation are wired automatically. */
+  /**
+   * Submit a child task; parent/root/correlation are wired automatically.
+   *
+   * Refused once the lease is gone. Not the full `owned` gate — a handler may
+   * legitimately settle a task and then fan out from it, so `settled` is no bar
+   * — but a context whose lease was lost is an attempt that has been abandoned:
+   * it is being retried elsewhere, and every child it creates now will be
+   * created again by that retry. Creating work is the one side effect cairnq can
+   * actually stop a zombie handler from repeating.
+   */
   submit(name: string, payload?: unknown, opts?: SubmitOptions): Promise<Task>;
   submit<P, R>(task: TaskDef<P, R>, payload?: P, opts?: SubmitOptions): Promise<Task>;
   async submit(task: string | TaskDef, payload?: unknown, opts: SubmitOptions = {}): Promise<Task> {
+    this.requireLease();
     return this.store.submit({
       name: taskName(task),
       payload,

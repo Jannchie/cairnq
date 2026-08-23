@@ -83,7 +83,7 @@
         "metadata", "name", "payload", "progress", "queue", "root_id", "settled",
         "submit", "succeed", "succeed_in", "task_id", "wait", "worker_id"
       ],
-      "internal": ["mark_lease_lost", "mark_settled", "observe", "observe_cancel", "owned"],
+      "internal": ["mark_lease_lost", "mark_settled", "observe", "observe_cancel", "owned", "require_lease"],
       "only_node": [
         {
           "member": "signal",
