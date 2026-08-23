@@ -160,6 +160,20 @@ export async function createPoolExecutor(
       // its connection for its whole life, and a pooled one would be a slot the
       // store never gives back. If `opts` ever grows connection-level settings
       // (ssl, application_name), the listener must receive them too.
+      //
+      // `schema` is deliberately NOT forwarded, and it is the exception worth
+      // stating rather than the omission it looks like: a NOTIFY channel name is
+      // scoped to the database, never to a schema, so a search_path would change
+      // nothing about what arrives here. The consequence is real but bounded —
+      // two cairnq installations in different schemas of ONE database hear each
+      // other's notifications, and a queue name they happen to share wakes the
+      // wrong workers. Correctness is unaffected (a wake is only ever a hint;
+      // the claim that follows re-reads the rows and finds none of them), so the
+      // cost is one wasted poll per foreign submit. Fixing it properly means
+      // putting the schema in the channel name, which is a migration and a
+      // mixed-version-fleet hazard: a worker still listening on the old channel
+      // would hear nothing and fall back to polling for the length of the
+      // rollout.
       const client = new pg.Client({ connectionString: dsn });
       await client.connect(); // failure here is transient: caller retries with backoff
       client.on("notification", (msg) => onNotify(msg.channel, msg.payload));

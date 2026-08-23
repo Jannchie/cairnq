@@ -495,6 +495,15 @@ retryable fail / retry / lease recovery — and **`cairnq_done`** (payload: task
 id) when a task reaches a terminal status. The trigger lives in the database, so
 every writer wakes listeners, whichever SDK or version wrote the row.
 
+Both channel names are **database-scoped**, not schema-scoped — that is how
+Postgres NOTIFY works, and no `search_path` changes it. So two cairnq
+installations in different schemas of ONE database hear each other: a queue name
+they happen to share (`default`, most likely) wakes the other's workers. Nothing
+breaks, because a wakeup is only ever a hint — the claim that follows re-reads
+the rows and finds none of its own — but each foreign submit costs the other
+installation one wasted poll. Give the two installations distinct queue names, or
+separate databases, if that traffic matters.
+
 SDKs use it strictly as an **accelerator**: the worker's idle sleep and
 `wait`/`call`'s poll sleep end early when a matching notification arrives, and
 that is the entire contract. NOTIFY reaches only currently connected listeners
