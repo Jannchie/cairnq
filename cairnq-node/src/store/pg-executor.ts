@@ -44,6 +44,17 @@
  * The reference implementation happens not to be affected — `pg` uses the
  * extended protocol by default — which is why this is stated here rather than
  * left to be discovered.
+ *
+ * A second thing, smaller but just as easy to get wrong: whatever this executor
+ * does with json/jsonb, it must do CONSISTENTLY. The store measures the wire
+ * form once at connect, with a `select '"cairnq"'::jsonb` probe, and maps every
+ * row it later reads according to the answer — so an executor that decodes
+ * jsonb for one statement and hands back text for another (or answers the probe
+ * differently from how it returns task rows) will have its payloads read the
+ * wrong way. Decoding or not are both fine; disagreeing with yourself is not.
+ * The probe exists because the two forms cannot be told apart from a value: a
+ * JSON string arrives as a string either way, so a guess parses the decoded one
+ * twice — `"s3://…"` throws and `"42"` silently becomes the number 42.
  */
 
 /** A row as the driver hands it back: column name -> value. */

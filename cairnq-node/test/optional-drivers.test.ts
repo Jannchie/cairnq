@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { JSON_COLUMNS, MS_COLUMNS, rowToTask } from "../src/models.js";
 import { findProtocolRoot } from "../src/sql.js";
+import { taskRow } from "./helpers.js";
 
 // Both backends are optional dependencies, and the point of that is wasted if
 // importing the package loads them anyway. A Postgres-only deployment — which is
@@ -53,19 +54,14 @@ describe("optional native drivers", () => {
 // come back. So the normalization lives at the row boundary, beside the one the
 // JSON columns already get.
 describe("row normalization", () => {
-  const base = {
-    id: "t1", name: "n", queue: "default", status: "queued",
-    payload: "{}", metadata: "{}", result: null, error: null,
-    progress: null, message: null, attempt: 0, max_attempts: 3, priority: 0,
-    worker_id: null,
-  };
-
   it("accepts epoch-ms columns as text or as numbers, and keeps null null", () => {
-    const asText = rowToTask({
-      ...base,
+    const asText = rowToTask(
+      taskRow({
       lease_until_ms: null, run_at_ms: "1700000000000", cancel_requested_at_ms: null,
-      created_at_ms: "1700000000000", updated_at_ms: "1700000000001", completed_at_ms: null,
-    });
+        created_at_ms: "1700000000000", updated_at_ms: "1700000000001", completed_at_ms: null,
+      }),
+      true,
+    );
     expect(asText.run_at_ms).toBe(1_700_000_000_000);
     expect(asText.updated_at_ms).toBe(1_700_000_000_001);
     // Null is a fact about the task (not started, not canceled, not finished),
@@ -73,11 +69,13 @@ describe("row normalization", () => {
     expect(asText.completed_at_ms).toBeNull();
     expect(asText.cancel_requested_at_ms).toBeNull();
 
-    const asNumbers = rowToTask({
-      ...base,
+    const asNumbers = rowToTask(
+      taskRow({
       lease_until_ms: null, run_at_ms: 1_700_000_000_000, cancel_requested_at_ms: null,
-      created_at_ms: 1_700_000_000_000, updated_at_ms: 1_700_000_000_001, completed_at_ms: null,
-    });
+        created_at_ms: 1_700_000_000_000, updated_at_ms: 1_700_000_000_001, completed_at_ms: null,
+      }),
+      true,
+    );
     expect(asNumbers).toEqual(asText);
   });
 
@@ -86,7 +84,7 @@ describe("row normalization", () => {
     // Number.MAX_SAFE_INTEGER until the year 287396.
     const ms = "8640000000000000"; // JS's own maximum Date, well inside the range
     expect(Number(ms)).toBeLessThan(Number.MAX_SAFE_INTEGER);
-    expect(rowToTask({ ...base, created_at_ms: ms }).created_at_ms).toBe(8_640_000_000_000_000);
+    expect(rowToTask(taskRow({ created_at_ms: ms }), true).created_at_ms).toBe(8_640_000_000_000_000);
   });
 });
 

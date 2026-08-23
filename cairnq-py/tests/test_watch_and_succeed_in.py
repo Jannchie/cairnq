@@ -14,7 +14,7 @@ import pytest
 from cairnq import CairnQ, LostLease, WatchSignal
 from cairnq.context import TaskContext
 from cairnq.models import Task
-from .conftest import FakeExecutor
+from .conftest import FakeExecutor, task_row
 
 pytest.importorskip("asyncpg")
 
@@ -22,16 +22,9 @@ from cairnq.store.postgres import PostgresStore  # noqa: E402
 
 
 def _row(status: str = "succeeded") -> dict:
-    now = 1_700_000_000_000
-    return {
-        "id": "t1", "name": "render", "queue": "default", "status": status,
-        "payload": {}, "metadata": {}, "result": None, "error": None,
-        "progress": None, "message": None, "attempt": 1, "max_attempts": 3,
-        "priority": 0, "worker_id": "w1", "lease_until_ms": None,
-        "run_at_ms": now, "cancel_requested_at_ms": None, "parent_id": None,
-        "root_id": None, "correlation_id": None, "created_at_ms": now,
-        "updated_at_ms": now, "completed_at_ms": now,
-    }
+    # json_is_text=False: this fake's driver delivers decoded JSON columns, which
+    # is also what its answer to the store's wire-form probe says (see conftest).
+    return task_row(json_is_text=False, status=status)
 
 
 def _executor(**kwargs) -> FakeExecutor:
@@ -64,7 +57,9 @@ async def _settled(store: PostgresStore):
 
 
 def _context(store: PostgresStore) -> TaskContext:
-    return TaskContext(store, Task.from_row(_row("running")), "w1", 30_000)
+    # json_is_text=False: _row() is already decoded, as this fake's driver would
+    # deliver it — the same answer the store gets from its wire-form probe.
+    return TaskContext(store, Task.from_row(_row("running"), json_is_text=False), "w1", 30_000)
 
 
 # ------------------------------------------------------------- succeed_in

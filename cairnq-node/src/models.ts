@@ -67,14 +67,26 @@ export function rowToRef(row: Record<string, unknown>): TaskRef {
   return { id: row.id as string, status: row.status as TaskStatus };
 }
 
-export function rowToTask(row: Record<string, unknown>): Task {
+/**
+ * Map a row to a Task.
+ *
+ * `jsonIsText` says how this driver delivers a JSON column, and it has to be
+ * told rather than inferred. SQLite (TEXT) hands back the JSON text to parse; a
+ * jsonb-aware driver (`pg`) hands back an already-decoded value. Those two are
+ * distinguishable for an object or an array — but not for a JSON *string*, where
+ * the text form (`"hello"`, quotes included) and the decoded form (`hello`) are
+ * both, simply, strings. Guessing from the value used to double-parse the
+ * decoded one: `"s3://…"` threw a SyntaxError, and `"42"` came back as the
+ * NUMBER 42 — silent corruption for any payload or result that is a top-level
+ * string. The store knows which driver it has; models does not, so it asks.
+ */
+export function rowToTask(row: Record<string, unknown>, jsonIsText: boolean): Task {
   const t: Record<string, unknown> = { ...row };
   for (const col of JSON_COLUMNS) {
     const v = row[col];
-    // The driver decides a JSON column's wire form: SQLite (TEXT) hands back a
-    // string to parse; a jsonb-aware driver (Postgres `pg`) hands back an
-    // already-decoded object. Parse only a string — never assume one backend.
-    t[col] = typeof v === "string" ? JSON.parse(v) : (v ?? null);
+    // A SQL NULL and a decoded JSON `null` both arrive as null and both mean
+    // "no value"; only a real text form is parsed.
+    t[col] = v == null ? null : jsonIsText ? JSON.parse(v as string) : v;
   }
   for (const col of MS_COLUMNS) {
     const v = row[col];

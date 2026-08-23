@@ -94,7 +94,19 @@ _ENCODER = json.JSONEncoder(allow_nan=False, separators=(",", ":"))
 
 def dump_json(value: Any) -> str:
     """Encode a value for a protocol JSON column, raising SerializationError on
-    anything JSON cannot represent (non-finite number, set, datetime, …)."""
+    anything JSON cannot represent (non-finite number, set, datetime, bytes,
+    Decimal, UUID, …). Nothing whose content JSON cannot carry gets through: this
+    encoder raises where the TypeScript twin needs an explicit deny-list to stop
+    ``JSON.stringify`` from quietly emptying a Map or a Set into ``{}``.
+
+    Two conversions are deliberately left alone, because JSON has no other form
+    for them and both keep the value intact — only its type is narrowed. A tuple
+    is written as an array (and reads back as a list), and a non-str dict key is
+    written as its literal spelling: ``{1: "a"}`` is stored as ``{"1": "a"}`` and
+    reads back under ``"1"``. Rejecting those would mean walking every value
+    before encoding it, which measures at 55-150% on top of the encode itself —
+    paid by every submit, to forbid what every JSON binding in every language
+    does. See PROTOCOL.md "JSON"."""
     try:
         return _ENCODER.encode(value)
     except (TypeError, ValueError) as exc:
@@ -267,6 +279,25 @@ class TaskStore(ABC):
             self._sweeper.start()
 
     # ------------------------------------------------------------ dialect seam
+    # Whether this store's driver hands JSON columns back as text.
+    #
+    # Declared by the store rather than sniffed per value, because for a JSON
+    # *string* the two wire forms are indistinguishable: the text form of
+    # ``"hello"`` and the decoded form of ``"hello"`` are both ``str``, and
+    # treating the decoded one as text parses it twice — ``"s3://…"`` raises,
+    # ``"42"`` comes back as the int 42. See Task.from_row.
+    #
+    # True is the SQLite answer, and asyncpg's: both hand back JSON text.
+    # PostgresStore replaces it with what its driver actually does, which it
+    # measures rather than assumes — an injected executor's driver is the
+    # application's choice, not cairnq's.
+    _json_is_text: bool = True
+
+    def _to_task(self, row: Any) -> Task:
+        """Task.from_row, told this store's wire form. Every row in this class
+        goes through here so no call site has to remember to pass it."""
+        return Task.from_row(row, self._json_is_text)
+
     @abstractmethod
     async def connect(self) -> None: ...
 
@@ -347,11 +378,12 @@ class TaskStore(ABC):
         rows = await self._fetch(name, params)
         if not rows:
             raise LostLease(task_id)
-        return Task.from_row(rows[0])
+        return self._to_task(rows[0])
 
-    @staticmethod
-    def _one(rows: list[Any]) -> Task | None:
-        return Task.from_row(rows[0]) if rows else None
+    # An instance method, unlike _one_ref: mapping a Task reads this store's JSON
+    # wire form, and a TaskRef has no JSON column to read.
+    def _one(self, rows: list[Any]) -> Task | None:
+        return self._to_task(rows[0]) if rows else None
 
     @staticmethod
     def _one_ref(rows: list[Any]) -> TaskRef | None:
@@ -404,7 +436,7 @@ class TaskStore(ABC):
             "correlation_id": correlation_id,
         }
         if key is None:
-            return Task.from_row((await self._fetch("insert_task", ins))[0])
+            return self._to_task((await self._fetch("insert_task", ins))[0])
 
         # A key makes submit a read-then-write, so it has to be one transaction —
         # opened by taking the key's lock, because on Postgres the transaction
@@ -423,7 +455,7 @@ class TaskStore(ABC):
                     if conflict == "reject":
                         raise AlreadyExists(key)
                     if _reusable(conflict, rows[0]["status"]):
-                        return Task.from_row(rows[0])
+                        return self._to_task(rows[0])
                     # The strategy declined the recorded task, so the key repoints
                     # to the fresh one inserted below. Cancel only what is still
                     # live: a terminal task has nothing to stop, and cancelling it
@@ -433,7 +465,7 @@ class TaskStore(ABC):
                         await fetch("cancel", {"id": existing[0]["task_id"]})
             rows = await fetch("insert_task", ins)
             await fetch("upsert_key", {"key": key, "task_id": task_id})
-            return Task.from_row(rows[0])
+            return self._to_task(rows[0])
 
     async def get(self, task_id: str) -> Task | None:
         return self._one(await self._fetch("get", {"id": task_id}))
@@ -481,7 +513,7 @@ class TaskStore(ABC):
                 "offset": offset,
             },
         )
-        return [Task.from_row(r) for r in rows]
+        return [self._to_task(r) for r in rows]
 
     async def cancel(self, task_id: str) -> Task | None:
         return self._one(await self._fetch("cancel", {"id": task_id}))
@@ -766,7 +798,7 @@ class TaskStore(ABC):
                         "limit": limit,
                     },
                 )
-                return [Task.from_row(r) for r in rows]
+                return [self._to_task(r) for r in rows]
 
             return await plan(claim)
 
@@ -895,7 +927,7 @@ class TaskStore(ABC):
             # land.
             if not rows:
                 raise LostLease(task_id)
-            return Task.from_row(rows[0]), value
+            return self._to_task(rows[0]), value
 
     async def fail(
         self,

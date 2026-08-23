@@ -220,6 +220,9 @@ export class PostgresStore extends TaskStore {
       await this.checkSchema(executor);
       await this.applyMigrations(executor);
       checkProtocolVersion(await this.readProtocolVersion(executor));
+      // Before publishing the executor, so no row is ever mapped against an
+      // unmeasured wire form.
+      this.jsonIsText = await this.detectJsonWireForm(executor);
     } catch (e) {
       // Never leak an executor we created; never close one we were handed.
       if (!this.provided) await executor.close().catch(() => {});
@@ -319,6 +322,25 @@ export class PostgresStore extends TaskStore {
         }
       });
     }
+  }
+
+  /**
+   * Whether this driver hands json/jsonb back as text, measured rather than
+   * assumed.
+   *
+   * `pg` decodes jsonb by default; asyncpg hands back the text; an application's
+   * own driver — or a `pg` with a type parser the application installed — may do
+   * either, and an injected executor is exactly that case. The two are
+   * indistinguishable from a value once it arrives (see rowToTask), so the
+   * answer has to come from the driver itself.
+   *
+   * A JSON string is the probe because it is the only value whose two forms
+   * differ: as text it arrives with its quotes (`"cairnq"`, 8 characters), as a
+   * decoded value without them (`cairnq`, 6). One statement, once per connect.
+   */
+  private async detectJsonWireForm(s: PgSession): Promise<boolean> {
+    const rows = await s.query(`select '"cairnq"'::jsonb as probe`, []);
+    return rows[0]?.probe === '"cairnq"';
   }
 
   // Takes an explicit session: during doConnect the executor is not published

@@ -1,0 +1,105 @@
+{
+  "name": "json_scalar_roundtrip",
+  "description": "a TOP-LEVEL scalar payload and result survive the round-trip with their type intact. The object case (json_roundtrip) cannot catch this: a jsonb-aware driver hands an object back as an object, which is distinguishable from JSON text, but hands a JSON string back as a bare string, which is not — so a store that guesses the wire form from the value parses it twice. 's3://...' then raises, and '42' comes back as the NUMBER 42. Guards every backend against that, and pins that a string stays a string.",
+  "steps": [
+    {
+      "op": "submit",
+      "args": {
+        "name": "job",
+        "payload": "s3://bucket/a cat.png"
+      },
+      "save": "t"
+    },
+    {
+      "op": "get",
+      "args": {
+        "id": "$t.id"
+      },
+      "save": "g"
+    },
+    {
+      "op": "expect",
+      "target": "$g.payload",
+      "equalsRef": "s3://bucket/a cat.png"
+    },
+    {
+      "op": "claim",
+      "args": {
+        "queues": [
+          "default"
+        ],
+        "worker_id": "w1",
+        "lease_ms": 5000
+      },
+      "expect": {
+        "length": 1
+      }
+    },
+    {
+      "op": "succeed",
+      "args": {
+        "id": "$t.id",
+        "worker_id": "w1",
+        "result": "42"
+      }
+    },
+    {
+      "op": "get",
+      "args": {
+        "id": "$t.id"
+      },
+      "save": "g2"
+    },
+    {
+      "op": "expect",
+      "target": "$g2.result",
+      "equalsRef": "42"
+    },
+    {
+      "op": "submit",
+      "args": {
+        "name": "job",
+        "payload": "true",
+        "metadata": "null"
+      },
+      "save": "t2"
+    },
+    {
+      "op": "get",
+      "args": {
+        "id": "$t2.id"
+      },
+      "save": "g3"
+    },
+    {
+      "op": "expect",
+      "target": "$g3.payload",
+      "equalsRef": "true"
+    },
+    {
+      "op": "expect",
+      "target": "$g3.metadata",
+      "equalsRef": "null"
+    },
+    {
+      "op": "submit",
+      "args": {
+        "name": "job",
+        "payload": 42
+      },
+      "save": "t3"
+    },
+    {
+      "op": "get",
+      "args": {
+        "id": "$t3.id"
+      },
+      "save": "g4"
+    },
+    {
+      "op": "expect",
+      "target": "$g4.payload",
+      "equalsRef": 42
+    }
+  ]
+}

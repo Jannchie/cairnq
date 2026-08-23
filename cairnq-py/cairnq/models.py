@@ -102,14 +102,26 @@ class Task:
     completed_at_ms: int | None = None
 
     @classmethod
-    def from_row(cls, row: Any) -> "Task":
+    def from_row(cls, row: Any, json_is_text: bool = True) -> "Task":
+        """Map a row to a Task.
+
+        ``json_is_text`` says how this driver delivers a JSON column, and it has
+        to be told rather than inferred. SQLite (TEXT) and asyncpg both hand back
+        the JSON text to parse; a driver configured to decode json/jsonb hands
+        back the value itself. Those two are distinguishable for an object or a
+        list — but not for a JSON *string*, where the text form (``'"hello"'``,
+        quotes included) and the decoded form (``'hello'``) are both ``str``.
+        Guessing from the value parses the decoded one twice: ``"s3://…"`` raises,
+        and ``"42"`` comes back as the int 42 — silent corruption for any payload
+        or result that is a top-level string. The store knows its driver; models
+        does not, so it asks. Defaults to the SQLite/asyncpg answer.
+        """
         d = dict(row)
         for col in _JSON_COLUMNS:
             v = d.get(col)
-            # The driver decides a JSON column's wire form: SQLite (TEXT) hands
-            # back a str to parse; a jsonb-aware driver hands back a decoded
-            # object. Parse only a str — never assume one backend.
-            d[col] = json.loads(v) if isinstance(v, str) else v
+            # A SQL NULL and a decoded JSON `null` both arrive as None and both
+            # mean "no value"; only a real text form is parsed.
+            d[col] = None if v is None else (json.loads(v) if json_is_text else v)
         for col in _MS_COLUMNS:
             v = d.get(col)
             # Same argument, for the other column type the drivers disagree

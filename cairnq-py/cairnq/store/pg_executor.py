@@ -45,6 +45,17 @@ The reference implementation happens not to be affected — asyncpg prepares and
 caches by default — which is why this is stated here rather than left to be
 discovered.
 
+A second thing, smaller but just as easy to get wrong: whatever this executor
+does with json/jsonb, it must do CONSISTENTLY. The store measures the wire form
+once at connect, with a ``select '"cairnq"'::jsonb`` probe, and maps every row it
+later reads according to the answer — so an executor that decodes jsonb for one
+statement and hands back text for another, or that answers the probe differently
+from how it returns task rows, has its payloads read the wrong way. Decoding or
+not are both fine; disagreeing with yourself is not. The probe exists because the
+two forms cannot be told apart from a value: a JSON string arrives as a ``str``
+either way, so a guess parses the decoded one twice — ``"s3://…"`` raises, and
+``"42"`` silently becomes the int 42.
+
 Mirrors ``PgExecutor`` in the TypeScript SDK, method for method.
 """
 

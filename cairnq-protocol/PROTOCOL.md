@@ -43,15 +43,39 @@ one implementation of each operation serve both backends.
   parse on read — parsing only when the driver returns text (a `jsonb` driver may
   return already-decoded objects). No language-private types cross the boundary (no
   pickle, no class instances, no Buffer). Large blobs go by reference (e.g.
-  `{"image_url": "s3://..."}`). Values JSON cannot represent are **rejected at the
-  boundary**, never coerced or written leniently: Python's encoder would emit bare
-  `NaN`/`Infinity` (which `JSON.parse` throws on) and JavaScript's would silently
-  turn them into `null` — both SDKs instead raise `SerializationError`, and a
-  worker records a result it cannot serialize as a permanent
-  `unserializable_result` failure rather than stranding the task. The TypeScript
-  SDK likewise rejects `undefined` / functions / symbols *inside arrays*, which
-  `JSON.stringify` would silently write as `null`; an undefined object property
-  is merely omitted — the JS idiom for "absent" — and stays allowed. One residual
+  `{"image_url": "s3://..."}`). Values whose *content* JSON cannot carry are
+  **rejected at the boundary**, never written leniently: Python's encoder would
+  emit bare `NaN`/`Infinity` (which `JSON.parse` throws on) and JavaScript's
+  would silently turn them into `null` — both SDKs instead raise
+  `SerializationError`, and a worker records a result it cannot serialize as a
+  permanent `unserializable_result` failure rather than stranding the task. The
+  TypeScript SDK likewise rejects `undefined` / functions / symbols *inside
+  arrays*, which `JSON.stringify` would silently write as `null`, and any object
+  it would write as an EMPTY one — a non-plain object with no own enumerable
+  properties (`Map`, `Set`, `Promise`, `RegExp`, `Error`, `Blob`, a class whose
+  state is all private fields, …), plus any `ArrayBuffer` view, which would come
+  back as an index-keyed object rather than an array. That is a rule rather than
+  a list of type names on purpose: a list is only ever as current as the day it
+  was written, and cannot express the private-field case at all. The Python SDK
+  needs no equivalent — its encoder already raises on `set`, `datetime`, `bytes`,
+  `Decimal`, `UUID` and every other type it cannot represent.
+
+  Three JS shapes deliberately still cross, because nothing is lost: an
+  undefined object property is omitted (the idiom for "absent"), a `Date` becomes
+  its ISO string via `toJSON` — which is also the escape hatch for any type that
+  wants to define its own JSON form — and a class instance carrying ordinary
+  properties is written as those properties. The "no class instances" advice
+  above is about identity, not about objects: what must not cross is a value
+  whose meaning depends on its class being reconstructed on the other side.
+
+  Two **value-preserving** conversions are deliberately NOT rejected, because
+  JSON has no other form for them and Python performs them inside its C encoder,
+  where policing them would cost more than the encode itself: a `tuple` becomes
+  an array (and reads back as a `list`), and a non-string `dict` key becomes its
+  literal spelling (`{1: "a"}` is stored as `{"1": "a"}` and reads back under
+  `"1"`). Nothing is lost, but the type is narrowed — so a Python producer that
+  keys a payload by anything other than `str` should expect string keys on the
+  way back, in either SDK. One residual
   dialect gap: Postgres `jsonb` rejects `\u0000` inside strings while SQLite
   accepts it, so avoid NUL characters in values that need backend portability.
 - **Null means "leave it alone"** on `progress`: both `progress` and `message` are

@@ -18,6 +18,47 @@ import {
 } from "../models.js";
 import { type BackpressureOptions, QueueDepthGate } from "../backpressure.js";
 
+/**
+ * Whether `JSON.stringify` would write this object without its contents.
+ *
+ * Every such value serializes to `{}` — or, for a typed array, to an object
+ * keyed by index — with everything it actually held silently gone. A handler
+ * that returns a `Map` would otherwise record `{}` as the task's result:
+ * succeeded, no error, and nothing left to recover the value from. That is the
+ * same class of silent mangle as `NaN` becoming `null`, so it is refused the
+ * same way.
+ *
+ * Structural rather than a list of built-in names, because a list is only ever
+ * as current as the day it was written. An enumeration of `Map`/`Set`/`Promise`/
+ * the typed arrays already missed `Float16Array` (ES2025, and `engines` here is
+ * node >=22), `Blob`, `Headers`, `URLSearchParams`, and — unfixably, since its
+ * tag is plain `[object Object]` — a class whose state is all private fields.
+ * The rule below catches those, and whatever the platform adds next, with
+ * nothing to maintain:
+ *
+ * - **A non-plain object with no own enumerable properties.** Its state lives
+ *   somewhere `JSON.stringify` cannot reach (internal slots, private fields, a
+ *   host binding), so `{}` is all that would be written. A *plain* `{}` is
+ *   deliberately exempt: an empty object is a value, not a loss.
+ * - **Any `ArrayBuffer` view.** A typed array writes its indices as string keys
+ *   and reads back as an object, not an array — non-empty, so the first rule
+ *   does not see it.
+ *
+ * A class instance that carries ordinary properties still crosses: those
+ * properties are exactly what gets written, and nothing is lost. `Date` never
+ * reaches here at all — `toJSON` has already replaced it with its ISO string by
+ * the time a replacer is called, which is also why `toJSON` remains the escape
+ * hatch for anything that wants to define its own JSON form.
+ */
+function emptiesItselfOut(v: object): boolean {
+  if (ArrayBuffer.isView(v)) return true;
+  const proto = Object.getPrototypeOf(v);
+  // Plain and null-prototype objects are the two shapes whose own enumerable
+  // properties ARE their contents, so an empty one is honestly empty.
+  if (proto === Object.prototype || proto === null) return false;
+  return Object.keys(v).length === 0;
+}
+
 const rejectMangled = function (this: unknown, _key: string, v: unknown): unknown {
   if (typeof v === "number" && !Number.isFinite(v)) {
     throw new SerializationError(`non-finite number ${v} is not JSON-serializable`);
@@ -28,15 +69,22 @@ const rejectMangled = function (this: unknown, _key: string, v: unknown): unknow
   if (Array.isArray(this) && (v === undefined || typeof v === "function" || typeof v === "symbol")) {
     throw new SerializationError(`${typeof v} inside an array is not JSON-serializable`);
   }
+  if (v !== null && typeof v === "object" && !Array.isArray(v) && emptiesItselfOut(v)) {
+    const name = (v as { constructor?: { name?: string } }).constructor?.name ?? "object";
+    throw new SerializationError(
+      `${name} carries nothing JSON.stringify can see and would be written as an empty object`,
+    );
+  }
   return v;
 };
 
 /** Encode a value for a protocol JSON column, raising SerializationError on
  * anything JSON cannot represent. Refuses what JSON.stringify would silently
- * mangle into `null`: NaN/Infinity anywhere, undefined/function/symbol inside an
- * array, and a top-level undefined that disappears entirely — either way the
- * twin SDK reads back something other than what the caller meant (the Python
- * SDK rejects the same values, via allow_nan=False). */
+ * mangle: NaN/Infinity anywhere, undefined/function/symbol inside an array, a
+ * top-level undefined that disappears entirely, and the objects that would be
+ * written as an empty one (see emptiesItselfOut) — either way the twin SDK
+ * reads back something other than what the caller meant. The Python SDK rejects
+ * the same classes of value; see its dump_json. */
 export function dumpJson(value: unknown): string {
   let text: string | undefined;
   try {
@@ -48,10 +96,18 @@ export function dumpJson(value: unknown): string {
   if (text === undefined) {
     throw new SerializationError(`value of type ${typeof value} is not JSON-serializable`);
   }
-  // Every mangled value reaches the output as the literal `null`, so a
-  // null-free result needs no strict pass — this keeps the replacer (which
-  // forfeits V8's native stringifier) off the hot path.
-  if (text.includes("null")) JSON.stringify(value, rejectMangled);
+  // Every mangled value betrays itself in the output, so the strict pass — which
+  // forfeits V8's native stringifier — runs only when one of its traces is
+  // there: `null` for a mangled scalar, `{}` for an opaque container emptied
+  // out, `{"0":` for a typed array rewritten as an index-keyed object. Each is a
+  // superset (a payload carrying an empty object, or a literal "0" key, merely
+  // pays for a second pass that then finds nothing), and together they are
+  // exhaustive over everything rejectMangled rejects. Measured on a null-free
+  // payload the three checks cost ~20% of the encode, against ~130% for running
+  // the replacer unconditionally.
+  if (text.includes("null") || text.includes("{}") || text.includes('{"0":')) {
+    JSON.stringify(value, rejectMangled);
+  }
   return text;
 }
 
@@ -385,6 +441,28 @@ export abstract class TaskStore {
 
   // --------------------------------------------------------------- internals
   /**
+   * Whether this store's driver hands JSON columns back as text.
+   *
+   * Declared by the store rather than sniffed per value, because for a JSON
+   * *string* the two wire forms are indistinguishable: the text form of
+   * `"hello"` and the decoded form of `"hello"` are both strings, and treating
+   * the decoded one as text parses it twice — `"s3://…"` threw, `"42"` came back
+   * as the number 42. See rowToTask.
+   *
+   * True is the SQLite answer and the safe default: its JSON columns are TEXT,
+   * always. PostgresStore replaces it with what its driver actually does, which
+   * it measures rather than assumes — an injected executor's driver is the
+   * application's choice, not cairnq's.
+   */
+  protected jsonIsText = true;
+
+  /** rowToTask, told this store's wire form. Every row in this class goes
+   * through here so no call site has to remember to pass it. */
+  private toTask(row: any): Task {
+    return rowToTask(row, this.jsonIsText);
+  }
+
+  /**
    * An ownership-checked worker write (heartbeat/progress/succeed/complete/fail).
    * Each statement's WHERE pins worker_id + a live lease, so 0 rows back means
    * the lease was lost — every such write reports it the same way.
@@ -392,11 +470,13 @@ export abstract class TaskStore {
   private async ownedWrite(name: string, taskId: string, params: Params): Promise<Task> {
     const rows = await this.fetch(name, params);
     if (!rows.length) throw new LostLease(taskId);
-    return rowToTask(rows[0]);
+    return this.toTask(rows[0]);
   }
 
-  private static one(rows: any[]): Task | null {
-    return rows.length ? rowToTask(rows[0]) : null;
+  // An instance method, unlike oneRef: mapping a Task reads this store's JSON
+  // wire form, and a TaskRef has no JSON column to read.
+  private one(rows: any[]): Task | null {
+    return rows.length ? this.toTask(rows[0]) : null;
   }
 
   private static oneRef(rows: any[]): TaskRef | null {
@@ -452,7 +532,7 @@ export abstract class TaskStore {
     // now, not after waiting out a full queue. Reads the resolved queue, so the
     // gate cannot throttle one queue while the row lands on another.
     if (this.gate) await this.gate.acquire(ins.queue as string);
-    if (key === null) return rowToTask((await this.fetch("insert_task", ins))[0]);
+    if (key === null) return this.toTask((await this.fetch("insert_task", ins))[0]);
 
     // A key makes submit a read-then-write, so it has to be one transaction —
     // opened by taking the key's lock, because on Postgres the transaction alone
@@ -469,7 +549,7 @@ export abstract class TaskStore {
         const current = (await fetch("get", { id: existing[0].task_id }))[0];
         if (current) {
           if (conflict === "reject") throw new AlreadyExists(key);
-          if (reusable(conflict, current.status as TaskStatus)) return rowToTask(current);
+          if (reusable(conflict, current.status as TaskStatus)) return this.toTask(current);
           // The strategy declined the recorded task, so the key repoints to the
           // fresh one inserted below. Cancel only what is still live: a terminal
           // task has nothing to stop, and cancelling it would rewrite a settled
@@ -481,16 +561,16 @@ export abstract class TaskStore {
       }
       const row = (await fetch("insert_task", ins))[0];
       await fetch("upsert_key", { key, task_id: id });
-      return rowToTask(row);
+      return this.toTask(row);
     });
   }
 
   async get(taskId: string): Promise<Task | null> {
-    return TaskStore.one(await this.fetch("get", { id: taskId }));
+    return this.one(await this.fetch("get", { id: taskId }));
   }
 
   async getByKey(key: string): Promise<Task | null> {
-    return TaskStore.one(await this.fetch("get_by_key", { key }));
+    return this.one(await this.fetch("get_by_key", { key }));
   }
 
   /** The wait loop's probe: id + status alone, so polling a task with a large
@@ -523,15 +603,15 @@ export abstract class TaskStore {
       limit: input.limit ?? 100,
       offset: input.offset ?? 0,
     });
-    return rows.map(rowToTask);
+    return rows.map((r) => this.toTask(r));
   }
 
   async cancel(taskId: string): Promise<Task | null> {
-    return TaskStore.one(await this.fetch("cancel", { id: taskId }));
+    return this.one(await this.fetch("cancel", { id: taskId }));
   }
 
   async retry(taskId: string, opts: { resetAttempt?: boolean } = {}): Promise<Task | null> {
-    return TaskStore.one(
+    return this.one(
       await this.fetch("retry", { id: taskId, reset_attempt: opts.resetAttempt ?? false }),
     );
   }
@@ -555,7 +635,7 @@ export abstract class TaskStore {
       await fetch("lock_key", { key });
       const existing = (await fetch("get_key", { key })) as { task_id: string }[];
       if (!existing.length) return null;
-      return TaskStore.one(await fetch(name, { id: existing[0].task_id, ...params }));
+      return this.one(await fetch(name, { id: existing[0].task_id, ...params }));
     });
   }
 
@@ -782,7 +862,7 @@ export abstract class TaskStore {
           name: oneName ? names![0] : null,
           limit,
         });
-        return rows.map(rowToTask);
+        return rows.map((r) => this.toTask(r));
       });
     });
   }
@@ -888,7 +968,7 @@ export abstract class TaskStore {
       });
       // Rolls back `fn`'s writes along with the settlement that did not land.
       if (!rows.length) throw new LostLease(input.taskId);
-      return { task: rowToTask(rows[0]), value };
+      return { task: this.toTask(rows[0]), value };
     });
   }
 

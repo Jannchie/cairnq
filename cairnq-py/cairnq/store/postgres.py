@@ -168,6 +168,9 @@ class PostgresStore(TaskStore):
                 await self._check_schema(executor)
                 await self._apply_migrations(executor)
                 check_protocol_version(await self._read_protocol_version(executor))
+                # Before publishing the executor, so no row is ever mapped
+                # against an unmeasured wire form.
+                self._json_is_text = await self._detect_json_wire_form(executor)
             except BaseException:
                 # Never leak an executor we created; never close one we were handed.
                 if self._provided is None:
@@ -441,6 +444,23 @@ class PostgresStore(TaskStore):
         for waiters in list(self._done_waiters.values()):
             for event in waiters:
                 event.set()
+
+    async def _detect_json_wire_form(self, session: PgSession) -> bool:
+        """Whether this driver hands json/jsonb back as text, measured rather
+        than assumed.
+
+        asyncpg returns json/jsonb as ``str`` by default, but a caller may have
+        registered a decoding codec, and an injected executor may be over an
+        entirely different driver. The two forms are indistinguishable from a
+        value once it arrives (see Task.from_row), so the answer has to come from
+        the driver itself.
+
+        A JSON string is the probe because it is the only value whose two forms
+        differ: as text it arrives with its quotes (``'"cairnq"'``, 8 characters),
+        as a decoded value without them (``'cairnq'``, 6). One statement, once per
+        connect."""
+        rows = await session.query("""select '"cairnq"'::jsonb as probe""", [])
+        return bool(rows) and dict(rows[0])["probe"] == '"cairnq"'
 
     async def _read_protocol_version(self, session: PgSession) -> int:
         # Takes an explicit session: during connect the executor is not published

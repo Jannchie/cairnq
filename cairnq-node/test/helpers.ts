@@ -77,3 +77,32 @@ export async function failOne(
   });
   return task.id;
 }
+
+/**
+ * A cairnq_tasks row, for the tests that exercise row mapping directly.
+ *
+ * One fixture rather than one per file: the shape is a fact about the SCHEMA, so
+ * three copies meant a migration adding a column had three places to reach — and
+ * a signature change to rowToTask had three call sites to find, which is exactly
+ * how one of them was left on the old signature, silently taking the wrong branch
+ * while its assertions stayed green.
+ *
+ * `jsonIsText` picks which wire form the JSON columns are written in, so a caller
+ * can hand the result to rowToTask with the matching flag and have the two agree
+ * by construction.
+ */
+export function taskRow(
+  overrides: Record<string, unknown> = {},
+  jsonIsText = true,
+): Record<string, unknown> {
+  const empty = jsonIsText ? "{}" : {};
+  return {
+    id: "t1", name: "n", queue: "default", status: "queued",
+    payload: empty, metadata: empty, result: null, error: null,
+    progress: null, message: null, attempt: 0, max_attempts: 3, priority: 0,
+    worker_id: null, lease_until_ms: null, run_at_ms: 0,
+    cancel_requested_at_ms: null, parent_id: null, root_id: null,
+    correlation_id: null, created_at_ms: 0, updated_at_ms: 0, completed_at_ms: 0,
+    ...overrides,
+  };
+}

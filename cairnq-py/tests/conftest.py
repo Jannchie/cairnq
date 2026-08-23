@@ -54,6 +54,13 @@ class FakeSession:
             return self._installations
         if "protocol_version" in text and "select" in text:
             return [{"value": "1"}]
+        if "::jsonb as probe" in text:
+            # This fake hands rows back with their JSON columns already decoded
+            # (see the dict-valued `payload` in the test rows), so it answers the
+            # wire-form probe the way a decoding driver would: the value without
+            # its quotes. Stated rather than left to the fall-through, so the
+            # harness says which driver it is emulating.
+            return [{"probe": "cairnq"}]
         if "update cairnq_tasks" in text and "succeeded" in text:
             self.calls.append("complete")
             return [self._completed_row] if self._complete_matches else []
@@ -101,3 +108,28 @@ class FakeExecutor:
 
     async def close(self) -> None:
         pass
+
+
+def task_row(json_is_text: bool = True, **overrides) -> dict:
+    """A cairnq_tasks row, for the tests that exercise row mapping directly.
+
+    Here rather than per file for the reason FakeExecutor is: the shape is a fact
+    about the SCHEMA, so a copy per file means a migration adding a column has
+    several places to reach, and only whichever file happens to exercise it
+    notices when one is missed.
+
+    ``json_is_text`` picks which wire form the JSON columns are written in, so a
+    caller can hand the result to ``Task.from_row`` with the matching flag and
+    have the two agree by construction."""
+    now = 1_700_000_000_000
+    empty = "{}" if json_is_text else {}
+    return {
+        "id": "t1", "name": "render", "queue": "default", "status": "succeeded",
+        "payload": empty, "metadata": empty, "result": None, "error": None,
+        "progress": None, "message": None, "attempt": 1, "max_attempts": 3,
+        "priority": 0, "worker_id": "w1", "lease_until_ms": None,
+        "run_at_ms": now, "cancel_requested_at_ms": None, "parent_id": None,
+        "root_id": None, "correlation_id": None, "created_at_ms": now,
+        "updated_at_ms": now, "completed_at_ms": now,
+        **overrides,
+    }
