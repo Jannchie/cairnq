@@ -145,8 +145,10 @@ Python exposes status checks as properties: `t.succeeded` / `.failed` /
 `.canceled` / `.running` / `.queued` / `.is_terminal`.
 
 **Full surface**, each by `task_id` or business `key`: `submit`, `get` / `getByKey`,
+`getStatus` / `getStatusByKey` (id + status only, no payload — the poll read),
 `list`, `wait` / `waitByKey`, `call`, `cancel` / `cancelByKey`, `retry` /
-`retryByKey`, `purge`, `queueDepth`.
+`retryByKey`, `purge`, `stats` (counts per queue × status — the dashboard read),
+`queueDepth` (bounded headroom — the backpressure read).
 
 - **`submit`:** `key`, `queue` (`"default"`), `conflict` (`reuse` |
   `reuse-succeeded` | `reject` | `replace`), `maxAttempts` (3), `priority`,
@@ -155,9 +157,10 @@ Python exposes status checks as properties: `t.succeeded` / `.failed` /
   `offset`.
 - **`retry(id, {resetAttempt: true})`** restarts from attempt 0 rather than
   spending the remaining `maxAttempts` budget.
-- **`retentionMs` / `retention_ms`** on the client sweeps terminal tasks on a
-  schedule for as long as the handle is open. Without it nothing removes rows,
-  ever; tiered retention is `purge()` with filters from your own scheduler.
+- **`retention`** on the client sweeps terminal tasks on a schedule for as long
+  as the handle is open. Without it nothing removes rows, ever. A number is a
+  single cutoff; the same option takes a per-status map or a list of
+  `RetentionRule` (queue/status/name filters) for tiered retention.
 
 ## The non-obvious rules — where people go wrong
 
@@ -191,7 +194,7 @@ Python exposes status checks as properties: `t.succeeded` / `.failed` /
   keep them, so a failed task still shows how far it got.
 - **Nothing is deleted unless you configure it.** Terminal tasks stay forever
   otherwise, which with large payloads is a disk leak, not just clutter. Set
-  `retentionMs` on the client and the sweep runs itself; `purge(olderThanMs=…)`
+  `retention` on the client and the sweep runs itself; `purge(olderThanMs=…)`
   stays available for an external scheduler (bounded by `limit`, 1000 per call —
   loop until it returns fewer than `limit`).
 - **Blocking work must leave the loop.** The heartbeat renews leases on the

@@ -30,6 +30,12 @@ afterEach(async () => {
 });
 
 describe("client/worker", () => {
+  it("stats is {} on an empty database", async () => {
+    // No rows, no queues — {} rather than a zero-filled "default" that would
+    // imply the store knows which queues exist before anything is submitted.
+    expect(await client.stats()).toEqual({});
+  });
+
   it("call times out and leaves the task running", async () => {
     const err = await client
       .call("unhandled", {}, { timeoutMs: 300, pollMs: 50 })

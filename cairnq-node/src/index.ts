@@ -1,5 +1,6 @@
 export { CairnQ } from "./client.js";
 export type { CallOptions, ClientOptions, SubmitOptions, WaitOptions } from "./client.js";
+export type { RetentionCutoffs, RetentionOptions, RetentionRule } from "./retention.js";
 export { Worker } from "./worker.js";
 export type { BatchHandler, Handler, TypedHandler, WorkerOptions } from "./worker.js";
 export { TaskContext } from "./context.js";

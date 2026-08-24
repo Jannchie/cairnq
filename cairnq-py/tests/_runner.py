@@ -111,9 +111,9 @@ class Runner:
         if op == "get_by_key":
             return await c.get_by_key(a["key"])
         if op == "get_status":
-            return await s.get_status(a["id"])
+            return await c.get_status(a["id"])
         if op == "get_status_by_key":
-            return await s.get_status_by_key(a["key"])
+            return await c.get_status_by_key(a["key"])
         if op == "list":
             return await c.list(**a)
         if op == "cancel":
@@ -168,6 +168,8 @@ class Runner:
                 name=a.get("name"),
                 limit=a.get("limit", 1000),
             )
+        if op == "stats":
+            return await c.stats(a.get("queue"))
         if op == "queue_depth":
             return await c.queue_depth(a["queue"], a["max_depth"])
         if op == "sleep":

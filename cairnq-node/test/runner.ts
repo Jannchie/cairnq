@@ -107,9 +107,9 @@ export class Runner {
       case "get_by_key":
         return c.getByKey(a.key);
       case "get_status":
-        return s.getStatus(a.id);
+        return c.getStatus(a.id);
       case "get_status_by_key":
-        return s.getStatusByKey(a.key);
+        return c.getStatusByKey(a.key);
       case "list":
         return c.list({
           status: a.status,
@@ -181,6 +181,8 @@ export class Runner {
           name: a.name,
           limit: a.limit,
         });
+      case "stats":
+        return c.stats(a.queue);
       case "queue_depth":
         return c.queueDepth(a.queue, a.max_depth);
       case "sleep":

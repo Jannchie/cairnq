@@ -11,8 +11,8 @@ from ._wait import (
 )
 from .backpressure import DEFAULT_MAX_WAIT_MS, QueueDepthLimit
 from .errors import TaskCanceled, TaskFailed
-from .models import Task, TaskDef, TaskStatus, task_name
-from .retention import RetentionSweeper
+from .models import Task, TaskDef, TaskRef, TaskStatus, task_name
+from .retention import Retention, RetentionSweeper
 from .store.pg_executor import PgExecutor
 from .store.base import Conflict, TaskStore
 from .store.postgres import PostgresStore
@@ -29,13 +29,15 @@ class CairnQ:
         *,
         max_queue_depth: QueueDepthLimit | None = None,
         max_queue_wait_ms: int = DEFAULT_MAX_WAIT_MS,
-        retention_ms: int | None = None,
+        retention: int | Retention | None = None,
     ):
-        """`retention_ms` deletes terminal tasks that many ms after they
-        finished, on a schedule, for as long as this handle is open. Off unless
-        set — and off means rows accumulate forever, because nothing else in
-        CairnQ removes them. Tiered retention (per queue, per status) is
-        `purge()` with filters, from your own scheduler."""
+        """`retention` deletes terminal tasks on a schedule, for as long as this
+        handle is open. Off unless set — and off means rows accumulate forever,
+        because nothing else in CairnQ removes them.
+
+        An int keeps every terminal row that many ms. A `Retention` is the same
+        cutoff in its tiered shapes — per status, or per anything `purge` can
+        filter on — plus the sweep's own knobs; see its docstring."""
         self._store = store
         # Installed on the store, not held here: every submit path goes through
         # the store, including TaskContext.submit, which this handle never sees.
@@ -47,7 +49,12 @@ class CairnQ:
         # operation can skip, since `connect()` is optional and everything
         # connects lazily through it. See TaskStore.use_retention.
         self._sweeper = (
-            RetentionSweeper(store, retention_ms) if retention_ms is not None else None
+            RetentionSweeper(
+                store,
+                Retention(older_than_ms=retention) if isinstance(retention, int) else retention,
+            )
+            if retention is not None
+            else None
         )
         if self._sweeper is not None:
             store.use_retention(self._sweeper)
@@ -135,6 +142,15 @@ class CairnQ:
     async def get_by_key(self, key: str) -> Task | None:
         return await self._store.get_by_key(key)
 
+    async def get_status(self, task_id: str) -> TaskRef | None:
+        """The status-only probe wait polls on: id + status, no payload. Public
+        for the same reason it exists — a dashboard or poller that only asks
+        "is it finished yet" should not drag the payload back per ask."""
+        return await self._store.get_status(task_id)
+
+    async def get_status_by_key(self, key: str) -> TaskRef | None:
+        return await self._store.get_status_by_key(key)
+
     async def list(
         self,
         *,
@@ -179,7 +195,7 @@ class CairnQ:
     ) -> list[str]:
         """Delete terminal tasks that finished more than `older_than_ms` ago and
         return their ids. Nothing else in CairnQ removes rows, so a long-lived
-        database needs this on a schedule — `retention_ms` is this call on a
+        database needs this on a schedule — `retention` is this call on a
         timer. Each call is bounded by `limit` to keep the write short; loop
         until it returns fewer than `limit`.
 
@@ -190,6 +206,17 @@ class CairnQ:
         return await self._store.purge(
             older_than_ms=older_than_ms, queue=queue, status=status, name=name, limit=limit
         )
+
+    async def stats(self, queue: str | None = None) -> dict[str, dict[TaskStatus, int]]:
+        """Task counts per queue, keyed by status and zero-filled across all
+        statuses — `stats()["default"]["queued"]` is the backlog of a queue.
+        `queue` narrows the aggregate to one queue, which is also what keeps a
+        caller from paying for the other workloads sharing the installation; a
+        named queue is always present, zero-filled if it has no rows.
+
+        This counts rows, so it costs what it counts — use it for a dashboard,
+        and poll `queue_depth()` instead, which is bounded."""
+        return await self._store.stats(queue)
 
     async def queue_depth(self, queue: str, max_depth: int) -> int:
         """How many more tasks fit on `queue` under `max_depth` — 0 once it is

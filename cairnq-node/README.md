@@ -78,9 +78,9 @@ const worker = Worker.sqlite("tasks.db", {
 
 // Nothing else deletes rows, so give the client a retention cutoff — it sweeps
 // terminal tasks in bounded batches for as long as the handle is open. Tiered
-// retention (per queue, per status) is purge() with filters, from your own
-// scheduler.
-const tasks = CairnQ.sqlite("tasks.db", { retentionMs: 7 * 24 * 3600_000 });
+// retention is the same option in its wider forms: a per-status map, or a list
+// of RetentionRule filtering by anything purge() can (queue, status, name).
+const tasks = CairnQ.sqlite("tasks.db", { retention: 7 * 24 * 3600_000 });
 ```
 
 A handler that does real side effects should bail out when it loses its lease —

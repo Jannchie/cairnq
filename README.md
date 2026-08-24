@@ -232,19 +232,22 @@ and a JSON protocol.
   for as long as the handle is open:
 
   ```python
-  tasks = CairnQ.sqlite("tasks.db", retention_ms=7 * 86_400_000)
+  tasks = CairnQ.sqlite("tasks.db", retention=7 * 86_400_000)
   ```
 
   Tiered retention — a succeeded row is spent once its result is consumed, a
-  failed one is worth keeping for diagnosis — is
-  `purge(older_than_ms=..., queue=..., status=..., name=..., limit=...)` with
-  filters, from your own scheduler or a one-off drain.
+  failed one is worth keeping for diagnosis — is the same option in its wider
+  forms: a per-status map (`Retention(older_than_ms={"succeeded": 300_000,
+  "failed": 7 * 86_400_000})`), or a list of rules filtering by anything
+  `purge` can (queue, status, name). A one-off drain is `purge()` with the same
+  filters.
 
 - **Operational visibility**: an `on_error` / `onError` hook on the worker
   reports what the run loop survived (a failed claim, a store write that blew up
   while finalizing) — without it those are silent. `queue_depth(queue,
   max_depth)` reads a queue's remaining headroom, bounded so it stays cheap to
-  ask on every enqueue.
+  ask on every enqueue; `stats()` counts tasks per queue × status — the
+  dashboard read, priced accordingly.
 
 - **Backpressure**, so a producer that outruns its workers is bounded by
   something other than disk. Give the client a depth limit and `submit` blocks

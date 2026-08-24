@@ -1,6 +1,6 @@
-import { RetentionSweeper } from "./retention.js";
+import { type RetentionOptions, RetentionSweeper } from "./retention.js";
 import { TaskCanceled, TaskFailed } from "./errors.js";
-import { isFailed, isSucceeded, type Task } from "./models.js";
+import { isFailed, isSucceeded, type Task, type TaskRef, type TaskStatus } from "./models.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { PostgresStore } from "./store/postgres.js";
 import type { PgExecutor } from "./store/pg-executor.js";
@@ -40,18 +40,20 @@ export interface ClientOptions {
   /** How long a blocked submit waits before raising QueueFull. Default 600_000. */
   maxQueueWaitMs?: number;
   /**
-   * Delete terminal tasks this many ms after they finished, on a schedule, for
-   * as long as this handle is open. Off unless set — and off means rows
-   * accumulate forever, because nothing else in CairnQ removes them. Tiered
-   * retention (per queue, per status) is `purge()` with filters, from your own
-   * scheduler.
+   * Delete terminal tasks on a schedule, for as long as this handle is open.
+   * Off unless set — and off means rows accumulate forever, because nothing
+   * else in CairnQ removes them.
+   *
+   * A number keeps every terminal row that many ms. The option form is the
+   * same cutoff in its tiered shapes — per status, or per anything `purge`
+   * can filter on — plus the sweep's own knobs; see RetentionOptions.
    */
-  retentionMs?: number;
+  retention?: number | RetentionOptions;
 }
 
 /** API-side handle. Thin wrapper over a TaskStore + SDK-orchestrated wait/call. */
 export class CairnQ {
-  /** null unless `retentionMs` was configured. */
+  /** null unless `retention` was configured. */
   private readonly sweeper: RetentionSweeper | null;
 
   constructor(
@@ -71,7 +73,13 @@ export class CairnQ {
     // Started here rather than in connect(), which is optional — every other
     // path connects lazily, and retention that silently depends on an optional
     // call is retention that silently does not happen.
-    this.sweeper = opts.retentionMs != null ? new RetentionSweeper(_store, opts.retentionMs) : null;
+    this.sweeper =
+      opts.retention != null
+        ? new RetentionSweeper(
+            _store,
+            typeof opts.retention === "number" ? { olderThanMs: opts.retention } : opts.retention,
+          )
+        : null;
     this.sweeper?.start();
   }
 
@@ -145,6 +153,17 @@ export class CairnQ {
     return this._store.getByKey(key);
   }
 
+  /** The status-only probe wait polls on: id + status, no payload. Public for
+   * the same reason it exists — a dashboard or poller that only asks "is it
+   * finished yet" should not drag the payload back per ask. */
+  getStatus(taskId: string): Promise<TaskRef | null> {
+    return this._store.getStatus(taskId);
+  }
+
+  getStatusByKey(key: string): Promise<TaskRef | null> {
+    return this._store.getStatusByKey(key);
+  }
+
   list(input?: ListInput): Promise<Task[]> {
     return this._store.list(input);
   }
@@ -167,7 +186,7 @@ export class CairnQ {
 
   /** Delete terminal tasks that finished more than `olderThanMs` ago and return
    * their ids. Nothing else in CairnQ removes rows, so a long-lived database
-   * needs this on a schedule — `retentionMs` is this call on a timer. Each call
+   * needs this on a schedule — `retention` is this call on a timer. Each call
    * is bounded by `limit` to keep the write short; loop until it returns fewer
    * than `limit`.
    *
@@ -175,6 +194,18 @@ export class CairnQ {
    * workloads needs a retention per workload, not one for the whole database. */
   purge(input?: PurgeInput): Promise<string[]> {
     return this._store.purge(input);
+  }
+
+  /** Task counts per queue, keyed by status and zero-filled across all statuses
+   * — `(await stats()).default.queued` is the backlog of a queue. `queue` narrows
+   * the aggregate to one queue, which is also what keeps a caller from paying for
+   * the other workloads sharing the installation; a named queue is always
+   * present, zero-filled if it has no rows.
+   *
+   * This counts rows, so it costs what it counts — use it for a dashboard, and
+   * poll `queueDepth()` instead, which is bounded. */
+  stats(queue?: string): Promise<Record<string, Record<TaskStatus, number>>> {
+    return this._store.stats(queue);
   }
 
   /** Wait for a task to finish. Resolves with the terminal Task (any status);

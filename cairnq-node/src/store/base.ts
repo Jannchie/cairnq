@@ -652,6 +652,38 @@ export abstract class TaskStore {
     return Number(rows[0]?.headroom ?? 0);
   }
 
+  /**
+   * Task counts grouped by queue, keyed by status and zero-filled —
+   * `(await stats()).default.queued` is the backlog of a queue. A queue appears
+   * only while it has rows; terminal tasks keep counting until `purge` removes
+   * them.
+   *
+   * `queue` restricts the aggregate to one queue, which is also what stops the
+   * caller paying for every other queue's rows: one installation carrying two
+   * workloads is the coordination this project recommends, and the unfiltered
+   * form reads the whole table. A named queue is always present in the result,
+   * zero-filled if it has no rows at all — asking about a specific queue and
+   * getting `undefined` back would make every caller write the same fallback.
+   *
+   * Filtered or not, this COUNTS, so it costs what it counts: a whole queue,
+   * terminal rows included. Right for a dashboard, wrong on an interval — poll
+   * `queueDepth`, which is bounded, and keep this for when the real numbers are
+   * the point.
+   */
+  async stats(queue?: string): Promise<Record<string, Record<TaskStatus, number>>> {
+    const zeros = (): Record<TaskStatus, number> =>
+      Object.fromEntries(STATUSES.map((s) => [s, 0])) as Record<TaskStatus, number>;
+    const out: Record<string, Record<TaskStatus, number>> = {};
+    // Seed before the query, not after: a named queue with no rows returns no
+    // rows to seed from, and that is exactly the case the promise is about.
+    if (queue != null) out[queue] = zeros();
+    for (const row of await this.fetch("stats", { queue: queue ?? null })) {
+      const per = (out[row.queue] ??= zeros());
+      per[row.status as TaskStatus] = Number(row.count);
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------- worker side
   /**
    * Take up to `limit` claimable tasks. `names` restricts the claim to task names

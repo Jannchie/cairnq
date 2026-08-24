@@ -46,8 +46,9 @@
     "CairnQ": {
       "shared": [
         "call", "cancel", "cancel_by_key", "close", "connect", "get", "get_by_key",
-        "list", "postgres", "purge", "queue_depth", "retry", "retry_by_key",
-        "sqlite", "store", "submit", "wait", "wait_by_key"
+        "get_status", "get_status_by_key", "list", "postgres", "purge",
+        "queue_depth", "retry", "retry_by_key", "sqlite", "stats", "store",
+        "submit", "wait", "wait_by_key"
       ],
       "internal": [],
       "only_node": [],
@@ -109,6 +110,7 @@
       "PostgresStore",
       "ProtocolVersionMismatch",
       "QueueFull",
+      "RetentionRule",
       "SQLiteStore",
       "STATUSES",
       "SchemaMismatch",
@@ -159,6 +161,18 @@
       },
       {
         "members": [
+          "RetentionCutoffs"
+        ],
+        "reason": "The per-status cutoff map as a named type. Python spells the same argument Mapping[TaskStatus, int] inline on Retention.older_than_ms."
+      },
+      {
+        "members": [
+          "RetentionOptions"
+        ],
+        "reason": "The TypeScript half of the retention option bundle; Python's mirror is the Retention dataclass listed under only_py, which is the same fields validated in __post_init__ instead of in the sweeper's constructor."
+      },
+      {
+        "members": [
           "Row"
         ],
         "reason": "The row shape an executor hands back. Python's PgSession protocol types it inline as dict[str, Any], so there is no separate name to export."
@@ -176,6 +190,13 @@
         "reason": "Python's TaskDef is a dataclass, so TaskDef(\"name\") constructs one directly. TypeScript's is an interface carrying phantom type parameters, which need a function call for the compiler to infer them."
       }
     ],
-    "only_py": []
+    "only_py": [
+      {
+        "members": [
+          "Retention"
+        ],
+        "reason": "The mirror of TypeScript's RetentionOptions: Python states option bundles as frozen dataclasses so they can validate in __post_init__, TypeScript states them as interfaces and validates where they are consumed."
+      }
+    ]
   }
 }

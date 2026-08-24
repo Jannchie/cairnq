@@ -546,6 +546,34 @@ class TaskStore(ABC):
         rows = await self._fetch("queue_depth", {"queue": queue, "max_depth": max_depth})
         return int(rows[0]["headroom"]) if rows else 0
 
+    async def stats(self, queue: str | None = None) -> dict[str, dict[TaskStatus, int]]:
+        """Task counts per queue, keyed by status and zero-filled across all
+        statuses — `stats()["default"]["queued"]` is the backlog of a queue.
+        A queue appears only while it has rows; terminal tasks keep counting
+        until `purge` removes them.
+
+        `queue` restricts the aggregate to one queue, which is also what stops
+        the caller paying for every other queue's rows: one installation carrying
+        two workloads is the coordination this project recommends, and the
+        unfiltered form reads the whole table. A named queue is always present in
+        the result, zero-filled if it has no rows at all — asking about a
+        specific queue and getting a KeyError would make every caller write the
+        same fallback.
+
+        Filtered or not, this COUNTS, so it costs what it counts: a whole queue,
+        terminal rows included. Right for a dashboard, wrong on an interval —
+        poll `queue_depth`, which is bounded, and keep this for when the real
+        numbers are the point."""
+        out: dict[str, dict[TaskStatus, int]] = {}
+        # Seed before the query, not after: a named queue with no rows returns no
+        # rows to seed from, and that is exactly the case the promise is about.
+        if queue is not None:
+            out[queue] = dict.fromkeys(STATUSES, 0)
+        for row in await self._fetch("stats", {"queue": queue}):
+            per = out.setdefault(row["queue"], dict.fromkeys(STATUSES, 0))
+            per[row["status"]] = int(row["count"])
+        return out
+
     # ------------------------------------------------------------- worker side
     async def claim(
         self,
