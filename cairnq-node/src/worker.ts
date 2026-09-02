@@ -281,6 +281,13 @@ export class Worker {
   private readonly backoffMaxMs: number;
   private stopped = false;
   private stopWake!: () => void;
+  // Re-armed before each claim, resolved when a call gives a resource unit
+  // back. A claim can come back empty because a resource is at capacity rather
+  // than the queue, and that release is local — no store notification covers
+  // it, so the idle sleep waits on this too. Armed before the claim, so a
+  // release landing *during* it still shortens the sleep that follows.
+  private freed$ = Promise.resolve();
+  private freedWake: () => void = () => {};
   // Resolved once by stop(); every sleep races against it. A stopped worker
   // never restarts, so one promise serves the instance's lifetime.
   private readonly stopped$ = new Promise<void>((r) => (this.stopWake = r));
@@ -519,6 +526,7 @@ export class Worker {
         await this.idle(pollMs);
         continue;
       }
+      this.freed$ = new Promise<void>((r) => (this.freedWake = r));
       let drawn: Draw[] | undefined;
       try {
         drawn = await this.store.claimSession(
@@ -536,7 +544,7 @@ export class Worker {
         continue;
       }
       if (!drawn?.length) {
-        await this.idle(pollMs);
+        await this.idle(pollMs, this.freed$);
         continue;
       }
       for (const { src, calls } of drawn) {
@@ -552,6 +560,7 @@ export class Worker {
           const p = call.finally(() => {
             this.planner.release(resource);
             running.delete(p);
+            if (resource != null) this.freedWake();
           });
           running.add(p);
         }
@@ -929,9 +938,14 @@ export class Worker {
    * cuts it short when a task on this worker's queues becomes claimable;
    * stop() interrupts it either way, and sleepOrStop bounds it at `ms` so the
    * poll fallback — which also drives lease recovery — never stretches.
+   *
+   * `freed` is the third way out: a resource unit coming back frees a claim the
+   * store has no reason to announce (see `freed$`).
    */
-  private idle(ms: number): Promise<void> {
-    return Promise.race([this.sleepOrStop(ms), this.store.claimWake(this.queues, ms)]);
+  private idle(ms: number, freed?: Promise<void>): Promise<void> {
+    const racers = [this.sleepOrStop(ms), this.store.claimWake(this.queues, ms)];
+    if (freed) racers.push(freed);
+    return Promise.race(racers);
   }
 
   private sleepOrStop(ms: number): Promise<void> {

@@ -257,3 +257,23 @@ async def test_an_undeclared_resource_is_rejected_at_registration(db_path):
 async def test_a_resource_capacity_below_one_is_rejected(db_path):
     with pytest.raises(ValueError, match="must be >= 1"):
         Worker.sqlite(db_path, resources={"gpu": 0})
+
+
+async def test_release_wakes_the_worker_before_the_next_poll(client, db_path):
+    """A resource freeing up is a local event no store notification covers, so
+    the worker has to notice it itself: with a 5s poll interval, two calls
+    through a capacity-1 resource must still hand over immediately."""
+    worker = Worker.sqlite(
+        db_path, poll_interval_ms=5_000, concurrency=4, resources={"gpu": 1}
+    )
+
+    @worker.task("render", resource="gpu")
+    async def render(ctx, payload):
+        await asyncio.sleep(0.02)
+
+    ids = [(await client.submit("render", {})).id for _ in range(2)]
+    started = asyncio.get_running_loop().time()
+    await _drain(client, ids, worker)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 1.0, f"handover waited for the poll interval ({elapsed:.2f}s)"

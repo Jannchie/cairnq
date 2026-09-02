@@ -256,6 +256,26 @@ describe("resources", () => {
     }
   });
 
+  it("wakes on a release instead of waiting for the next poll", async () => {
+    // A resource freeing up is a local event no store notification covers, so
+    // the worker has to notice it itself: with a 5s poll interval, two calls
+    // through a capacity-1 resource must still hand over immediately.
+    const worker = Worker.sqlite(dbPath, {
+      pollIntervalMs: 5_000,
+      concurrency: 4,
+      resources: { gpu: 1 },
+    });
+    worker.task("render", { resource: "gpu" }, async () => {
+      await sleep(20);
+    });
+
+    const ids = await submitMany("render", 2);
+    const started = Date.now();
+    await drain(ids, worker);
+
+    expect(Date.now() - started, "handover waited for the poll interval").toBeLessThan(1_000);
+  });
+
   it("rejects an undeclared resource at registration", () => {
     // A typo would otherwise read as an unbounded resource — silently removing
     // the ceiling the caller asked for, which is the whole point of the option.

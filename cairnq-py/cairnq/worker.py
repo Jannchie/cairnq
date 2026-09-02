@@ -355,6 +355,10 @@ class Worker:
         self._handlers: dict[str, _Registration] = {}
         self._worker_id = new_id("worker")
         self._stop = asyncio.Event()
+        #: Set when a call gives a resource unit back. Cleared before each claim
+        #: and awaited by the idle sleep, so a release that lands *during* the
+        #: claim still shortens the sleep that follows it.
+        self._freed = asyncio.Event()
         # True only when this worker created its own store (via .sqlite); an
         # injected store may be shared, so serve()/background() must not close it.
         self._owns_store = False
@@ -542,6 +546,7 @@ class Worker:
                 if self._planner.empty:
                     await self._idle(self._poll)
                     continue
+                self._freed.clear()
                 try:
                     claimed = await self._store.claim_session(
                         queues=self._queues,
@@ -564,7 +569,7 @@ class Worker:
                     await self._sleep_or_stop(CLAIM_ERROR_BACKOFF_S)
                     continue
                 if not claimed:
-                    await self._idle(self._poll)
+                    await self._idle(self._poll, self._freed)
                     continue
                 for src, calls in claimed:
                     for reg, group in calls:
@@ -578,6 +583,8 @@ class Worker:
                         ) -> None:
                             running.discard(fut)
                             self._planner.release(resource)
+                            if resource is not None:
+                                self._freed.set()
 
                         # An unregistered name has nothing to run, so it never
                         # starts a handler or a heartbeat; everything else is one
@@ -882,16 +889,22 @@ class Worker:
         except LostLease:
             pass
 
-    async def _idle(self, poll_ms: int) -> None:
+    async def _idle(self, poll_ms: int, freed: asyncio.Event | None = None) -> None:
         """The empty-poll sleep. A store with a push channel (Postgres
         LISTEN/NOTIFY) cuts it short when a task on this worker's queues
         becomes claimable; stop() interrupts it either way. Both sides bound
         themselves at the poll interval, so the poll fallback — which also
-        drives lease recovery — never stretches."""
+        drives lease recovery — never stretches.
+
+        `freed` is the third way out: a claim can come back empty because a
+        resource is at capacity, not because the queue is — and the release that
+        reopens it is local, so nothing on the store announces it."""
         racers = {
             asyncio.create_task(self._store.claim_wake(self._queues, poll_ms)),
             asyncio.create_task(self._sleep_or_stop(poll_ms / 1000)),
         }
+        if freed is not None:
+            racers.add(asyncio.create_task(freed.wait()))
         _, pending = await asyncio.wait(racers, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
